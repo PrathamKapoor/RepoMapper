@@ -131,12 +131,12 @@ Analysing this repository with the CLI:
 
 ```
 Repository       RepoMapper
-Files            91 discovered, 85 analyzable, 8 skipped
-Languages        typescript=55, json=19, unknown=6, markdown=6, yaml=2,
+Commit           23301a0  branch=main
+Files            92 discovered, 86 analyzable, 8 skipped
+Languages        typescript=55, json=19, markdown=7, unknown=6, yaml=2,
                  javascript=2, dockerfile=1
-Graph            1686 nodes, 2839 edges, 3791 evidence records
-Explicit share   nodes 100.0%, edges 67.9%
-Duration         5526 ms
+Graph            1689 nodes, 2842 edges, 3793 evidence records
+Explicit share   nodes 100.0%, edges 68.0%
 
 Artifacts
   dependency-graph   82 nodes / 164 edges

@@ -91,40 +91,38 @@ covered by the CI `image` job rather than a unit test:
 node packages/server/dist/cli.js .
 ```
 
-Output against this repository:
+Output against this repository, run **after the initial commit** so that git history was
+available:
 
 ```
 Repository       RepoMapper  (C:\Projects\RepoMapper)
-Commit           <none>      branch=<none>
-Files            91 discovered, 85 analyzable, 8 skipped
-Languages        typescript=55, json=19, unknown=6, markdown=6, yaml=2,
+Commit           23301a072c125e6c39a011a3f268d39db48186f2  branch=main
+Files            92 discovered, 86 analyzable, 8 skipped
+Languages        typescript=55, json=19, markdown=7, unknown=6, yaml=2,
                  javascript=2, dockerfile=1
-Graph            1686 nodes, 2839 edges, 3791 evidence records
-Explicit share   nodes 100.0%, edges 67.9%
-Duration         5526 ms
+Graph            1689 nodes, 2842 edges, 3793 evidence records
+Explicit share   nodes 100.0%, edges 68.0%
+Duration         6571 ms
 
-Node kinds  constant=783, function=285, test=259, configuration=126, module=85,
+Node kinds  constant=783, function=285, test=259, configuration=126, module=86,
             interface=73, package=25, type=18, class=14, api_endpoint=13,
-            deployment_component=4, repository=1
-Edge kinds  contains=1609, calls=904, configures=126, depends_on=71, imports=63,
+            deployment_component=4, repository=1, commit=1, contributor=1
+Edge kinds  contains=1611, calls=904, configures=126, depends_on=71, imports=63,
             re_exports=30, exposes=13, declared_in=13, deploys=4,
-            extends=3, implements=3
-
-Artifacts
-  dependency-graph   82 nodes / 164 edges
-  module-graph       1482 nodes / 1502 edges
-  class-diagram      105 nodes / 6 edges
-      ! types with no in-repository heritage relationship (95)
-  er-diagram         INSUFFICIENT EVIDENCE
+            extends=3, implements=3, authored_by=1
 ```
 
 Findings that demonstrate real extraction rather than hard-coded output:
 
-- **13 API endpoints** recovered from Fastify route registrations in `packages/server/src/app.ts`,
-  including `DELETE /api/analyses/:id`.
+- **13 API endpoints** recovered from Fastify route registrations in
+  `packages/server/src/app.ts`, including `DELETE /api/analyses/:id`.
 - **259 test entities** recovered from `describe`/`it` calls across the test suites.
 - **4 deployment components** from `docker-compose.yml` and `Dockerfile`, with `deploys`
   edges — which is why the deployment gap is now `EXPLICIT`.
+- **Git-backed facts confirmed against real history**: `branch=main`, the HEAD commit
+  resolved, and a `commit` node, a `contributor` node and an `authored_by` edge were
+  produced. The commit's changed paths resolved to module nodes, producing `modifies`
+  edges once more than one commit exists.
 - **A genuine inconsistency reported**: the dependency-hygiene gap names `typescript`,
   `vitest`, `eslint` and `@types/node` as declared-but-never-imported, and
   `@repoatlas/core` and friends as imported-but-not-declared in the root manifest. Both are
@@ -132,10 +130,6 @@ Findings that demonstrate real extraction rather than hard-coded output:
   rather than imported.
 - **ER diagram honestly insufficient**: no SQL DDL exists in this repository, so no table
   is drawn, rather than inventing one.
-
-**Honest note on `Commit none / branch=none`:** at the time of this run the repository had
-no commits, so there was no history to read. Git-backed facts (contributors, commits,
-ownership) are therefore **not verified by that run**. See §5.
 
 ### 3b. End-to-end test — VERIFIED
 
@@ -226,7 +220,7 @@ Stated plainly. None of these are claimed as working.
 | Item | Status | Why |
 |---|---|---|
 | **Browser rendering of the UI** | **Unknown** | The API and the built bundle were verified, and the HTML shell is served, but the UI was never opened in a real browser. A React runtime error would not be caught by any current check. Run `npm run dev:web` and open `localhost:5173`. |
-| **Git-backed facts** (commits, contributors, ownership) | **Unknown at time of writing** | The CLI run in §3a executed on a repository with no commits, so the history path produced nothing. The code path is covered by unit tests with synthetic commits and by a test asserting `NOT_FOUND` for a non-repository, but it has **not** been observed against real history. |
+| **Git-backed facts** (commits, contributors, ownership) | **Verified** | Confirmed against real history after the initial commit: `branch=main`, HEAD resolved, and `commit`, `contributor` and `authored_by` entities produced. Only one commit existed at that point, so `modifies` edges from multi-commit history are covered by unit tests rather than observed here. |
 | **C4, sequence, DFD, use-case, activity, deployment diagrams** | **Not implemented** | Each needs graph facts that do not exist yet. Deliberately absent rather than drawn from guesses. |
 | **Requirements extraction and traceability** | **Not implemented** | Needs document-structure parsing. |
 | **Consistency and drift engine** | **Not implemented** | Needs two comparable analyses. Deterministic ids are the prerequisite and are in place. |
@@ -249,9 +243,9 @@ One run, on the machine in §1, warm filesystem cache, `includeGitHistory: false
 
 | Metric | Value |
 |---|---|
-| Files discovered / analyzable | 91 / 85 |
-| Nodes / edges / evidence records | 1686 / 2839 / 3791 |
-| Wall clock | 5526 ms |
+| Files discovered / analyzable | 92 / 86 |
+| Nodes / edges / evidence records | 1689 / 2842 / 3793 |
+| Wall clock | 6571 ms |
 
 This is reported because it is the one number that was actually observed. It is **not** a
 benchmark: it was not repeated, variance was not measured, and it was not taken on a cold
@@ -278,5 +272,4 @@ connection); persistence (single-writer).
 **Not built:** the artifact types listed in §5, requirements, consistency and drift, the
 archive-upload endpoint, CORS, rate limiting, API authentication.
 
-**Unknown:** browser rendering, real git history, performance at scale, memory profile,
-coverage percentage.
+**Unknown:** browser rendering, performance at scale, memory profile, coverage percentage.
