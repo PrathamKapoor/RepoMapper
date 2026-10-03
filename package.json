@@ -1,0 +1,46 @@
+{
+  "name": "repoatlas",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "RepoAtlas reconstructs the software system behind a repository as a canonical, evidence-backed Software Knowledge Graph.",
+  "license": "MIT",
+  "author": "PrathamKapoor <prathamkapoor027@gmail.com>",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "workspaces": [
+    "packages/core",
+    "packages/ingest",
+    "packages/parsers",
+    "packages/artifacts",
+    "packages/server",
+    "packages/web"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @repoatlas/core --workspace @repoatlas/ingest --workspace @repoatlas/parsers --workspace @repoatlas/artifacts --workspace @repoatlas/server && npm run build --workspace @repoatlas/web",
+    "build:libs": "npm run build --workspace @repoatlas/core --workspace @repoatlas/ingest --workspace @repoatlas/parsers --workspace @repoatlas/artifacts",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "dev": "npm run dev --workspace @repoatlas/server",
+    "dev:web": "npm run dev --workspace @repoatlas/web",
+    "start": "node packages/server/dist/main.js",
+    "analyze": "node packages/server/dist/cli.js",
+    "verify": "npm run lint && npm run typecheck && npm run build && npm run test",
+    "clean": "node scripts/clean.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.5",
+    "@types/node": "24.10.1",
+    "@vitest/coverage-v8": "3.2.7",
+    "eslint": "9.39.5",
+    "globals": "16.5.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.71.0",
+    "vitest": "3.2.7"
+  }
+}

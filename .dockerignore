@@ -1,0 +1,22 @@
+node_modules
+**/node_modules
+**/dist
+coverage
+var
+data
+.git
+.github
+*.log
+.env
+.env.*
+!.env.example
+
+# Tests, fixtures and docs are not needed to build or run the image.
+packages/*/test
+e2e
+docs
+*.md
+!README.md
+.vscode
+.idea
+scripts

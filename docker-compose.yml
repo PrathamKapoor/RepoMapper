@@ -1,0 +1,43 @@
+# RepoAtlas — local deployment
+#
+# The allow-list is the important line here. Without REPOATLAS_ALLOWED_ROOTS the API
+# will analyse any path the container can read. With it, only /repos is analysable.
+
+services:
+  repoatlas:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: repoatlas:0.1.0
+    container_name: repoatlas
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4300:4300"
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "4300"
+      REPOATLAS_ALLOWED_ROOTS: /repos
+      REPOATLAS_DB_PATH: /data/repoatlas.sqlite
+      REPOATLAS_LOG_LEVEL: info
+      REPOATLAS_INCLUDE_GIT: "true"
+      REPOATLAS_MAX_ANALYSES: "100"
+      REPOATLAS_CONCURRENCY: "2"
+    volumes:
+      # Persistent analysis database.
+      - repoatlas-data:/data
+      # Repositories to analyse. Replace ./repos with your own paths.
+      - ./repos:/repos:ro
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4300/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  repoatlas-data:

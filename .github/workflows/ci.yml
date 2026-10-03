@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save runner time.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit and integration tests
+        run: npm run test
+
+      - name: Build all packages
+        run: npm run build
+
+  image:
+    name: container image builds and runs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: verify
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Catches the class of failure that only appears in a Linux image: platform
+      # specific module resolution and missing files in the build context.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: repoatlas:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start container and wait for health
+        run: |
+          docker run -d --name repoatlas-ci \
+            -e REPOATLAS_ALLOWED_ROOTS=/repos \
+            -v "$PWD:/repos/target:ro" \
+            -v repoatlas-ci-data:/data \
+            repoatlas:ci
+
+          for i in $(seq 1 30); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' repoatlas-ci 2>/dev/null || echo starting)
+            if [ "$status" = "healthy" ]; then
+              echo "container healthy after ${i} checks"
+              exit 0
+            fi
+            if [ "$status" = "unhealthy" ] || [ "$status" = "exited" ]; then
+              echo "container reached $status"
+              docker logs repoatlas-ci
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "container did not become healthy in time"
+          docker logs repoatlas-ci
+          exit 1
+
+      - name: Health endpoint responds
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error http://127.0.0.1:4300/api/health | tee /tmp/health.json
+          grep -q '"status":"ok"' /tmp/health.json
+          grep -q '"pathAllowListEnforced":true' /tmp/health.json
+
+      - name: Web UI is served
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error http://127.0.0.1:4300/ | grep -q 'id="root"'
+
+      - name: Analyses a real repository
+        run: |
+          set -euo pipefail
+          id=$(curl --fail --silent --show-error \
+            -X POST http://127.0.0.1:4300/api/analyses \
+            -H 'content-type: application/json' \
+            -d '{"repositoryPath":"/repos/target","label":"ci"}' \
+            | tee /tmp/analysis.json \
+            | sed -E 's/.*"id":"([^"]+)".*/\1/')
+
+          nodes=$(curl --fail --silent --show-error \
+            "http://127.0.0.1:4300/api/analyses/$id/graph?limit=5000&edgeLimit=10000" \
+            | sed -E 's/.*"totals":\{"nodes":([0-9]+).*/\1/')
+
+          echo "graph nodes: $nodes"
+          # A non-trivial assertion: this repository must yield real entities.
+          test "$nodes" -gt 100
+
+      - name: Refuses a path outside the allow-list
+        run: |
+          set -euo pipefail
+          status=$(curl --silent --output /tmp/denied.json --write-out '%{http_code}' \
+            -X POST http://127.0.0.1:4300/api/analyses \
+            -H 'content-type: application/json' \
+            -d '{"repositoryPath":"/etc"}')
+          echo "status: $status"
+          cat /tmp/denied.json
+          test "$status" = "403"
+          grep -q 'PATH_NOT_ALLOWED' /tmp/denied.json
+
+      - name: Container logs
+        if: always()
+        run: docker logs repoatlas-ci || true
+
+      - name: Clean up
+        if: always()
+        run: |
+          docker rm -f repoatlas-ci || true
+          docker volume rm repoatlas-ci-data || true

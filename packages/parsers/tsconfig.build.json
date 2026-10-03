@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "//": "Build project: source only, emits JavaScript and declarations to dist.",
+  "compilerOptions": {
+    "rootDir": "./src",
+    "outDir": "./dist",
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"]
+}

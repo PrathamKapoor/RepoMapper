@@ -1,0 +1,27 @@
+{
+  "name": "@repoatlas/artifacts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Projections of the canonical Software Knowledge Graph into engineering artifacts and gap analysis.",
+  "license": "MIT",
+  "author": "PrathamKapoor <prathamkapoor027@gmail.com>",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "@repoatlas/core": "0.1.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}

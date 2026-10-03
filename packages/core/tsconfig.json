@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "//": "Editor and type-aware lint project: covers source and tests, emits nothing.",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}
