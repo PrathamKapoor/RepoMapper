@@ -17,6 +17,18 @@ import type { Confidence, EdgeKind, EvidenceRef, GraphEdge, GraphNode, SoftwareG
  * omits unresolved relationships is indistinguishable from one that found none.
  */
 
+/** C4 abstraction levels, in progressive-disclosure order. */
+export const C4_LEVELS = ['context', 'container', 'component'] as const;
+export type C4Level = (typeof C4_LEVELS)[number];
+
+/** C4 element kinds. Deliberately narrow: only what the graph can evidence. */
+export type C4ElementKind =
+  | 'software_system'
+  | 'container'
+  | 'component'
+  | 'external_system'
+  | 'person';
+
 export interface ArtifactNode {
   id: string;
   label: string;
@@ -26,6 +38,21 @@ export interface ArtifactNode {
   detail?: string;
   path?: string;
   evidence: EvidenceRef[];
+  /** C4 abstraction level, set only by the C4 projections. */
+  c4Level?: C4Level;
+  /** C4 element kind, set only by the C4 projections. */
+  c4Kind?: C4ElementKind;
+  /** Technology named by repository evidence, e.g. an image or language. */
+  technology?: string;
+  /** Graph nodes this element was derived from. Always non-empty for C4 elements. */
+  graphNodeIds?: string[];
+  /**
+   * The explicit rule that produced this element.
+   *
+   * Present so a viewer can answer "why does RepoAtlas believe this exists?" without
+   * reading the projection source. A C4 element without a derivation is not accepted.
+   */
+  derivation?: string;
 }
 
 export interface ArtifactEdge {
@@ -37,6 +64,37 @@ export interface ArtifactEdge {
   label?: string;
   confidence: Confidence;
   evidence: EvidenceRef[];
+  /** C4 abstraction level, set only by the C4 projections. */
+  c4Level?: C4Level;
+  /**
+   * Graph edges that justify this architectural relationship.
+   *
+   * Every relationship must trace to graph facts. A relationship justified only by the
+   * existence of graph nodes — for example "these two are co-declared in one compose
+   * file" — names those nodes in `supportingNodeIds` instead. One of the two sets must be
+   * non-empty; an empty pair would be an invented relationship.
+   */
+  supportingEdgeIds?: string[];
+  /**
+   * Graph nodes that justify this relationship where no edge does.
+   *
+   * Existence-based support is weaker than edge-based support and must be stated as such
+   * by the confidence and derivation on the same record.
+   */
+  supportingNodeIds?: string[];
+  /** The explicit rule that produced this relationship. */
+  derivation?: string;
+}
+
+/**
+ * True when a projected relationship is backed by at least one graph fact.
+ *
+ * The C4 projections use this as a structural gate: a relationship with no support is
+ * dropped rather than rendered, because an unsupported arrow is an invented dependency
+ * wearing the visual authority of an evidenced one.
+ */
+export function hasGraphSupport(edge: ArtifactEdge): boolean {
+  return (edge.supportingEdgeIds?.length ?? 0) > 0 || (edge.supportingNodeIds?.length ?? 0) > 0;
 }
 
 export type ArtifactFormat = 'json' | 'mermaid';

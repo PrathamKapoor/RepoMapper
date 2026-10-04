@@ -1,6 +1,7 @@
 import { computeStats, type SoftwareGraph } from '@repoatlas/core';
 import { buildClassDiagram } from './class-diagram.js';
 import { toMermaid, type Artifact, type ProjectionContext } from './contract.js';
+import { buildC4 } from './c4.js';
 import { buildDependencyGraph, buildModuleGraph } from './dependency-graph.js';
 import { buildErDiagram } from './er-diagram.js';
 import { analyseGaps, type GapReport } from './gaps.js';
@@ -9,6 +10,7 @@ export * from './contract.js';
 export * from './dependency-graph.js';
 export * from './class-diagram.js';
 export * from './er-diagram.js';
+export * from './c4.js';
 export * from './gaps.js';
 
 /**
@@ -54,6 +56,28 @@ export const ARTIFACTS: readonly ArtifactDescriptor[] = [
     title: 'Entity-relationship diagram',
     minEdges: 0,
     build: buildErDiagram,
+  },
+  // C4 levels come after the structural views: they are the most inferential, so they are
+  // read once the reader already knows what the graph actually contains. `minEdges: 0`
+  // because a level with no relationships is still informative — it reports that the
+  // repository does not evidence one, rather than being hidden.
+  {
+    kind: 'c4-context',
+    title: 'C4 — System context',
+    minEdges: 0,
+    build: (context) => buildC4(context, { level: 'context' }),
+  },
+  {
+    kind: 'c4-container',
+    title: 'C4 — Containers',
+    minEdges: 0,
+    build: (context) => buildC4(context, { level: 'container' }),
+  },
+  {
+    kind: 'c4-component',
+    title: 'C4 — Components',
+    minEdges: 0,
+    build: (context) => buildC4(context, { level: 'component' }),
   },
 ];
 

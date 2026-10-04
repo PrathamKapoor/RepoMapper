@@ -6,6 +6,7 @@ import { nodeId, toPosixPath } from './ids.js';
 import type {
   CommitRecord,
   DiscoveredFile,
+  EvidenceRef,
   ExtractedEntity,
   ParsedFile,
   RepositoryRef,
@@ -40,6 +41,14 @@ export interface GraphBuildInput {
   diagnostics: DiagnosticCollector;
   limits: { maxNodes: number; maxEdges: number };
   includeGitHistory: boolean;
+  /**
+   * Content digest per repository-relative path.
+   *
+   * Optional: a caller that does not hash files still gets a valid graph, but rename
+   * detection in the drift engine will then be unable to establish a rename and will
+   * report removed plus added instead.
+   */
+  digestByPath?: ReadonlyMap<string, string>;
 }
 
 /** A resolved symbol: the node it points at, where it was declared, and what it is. */
@@ -124,6 +133,7 @@ export function buildGraph(input: GraphBuildInput): GraphBuildResult {
   // A module exists for every analyzable file. The module id is the extensionless
   // path, which is the name the language itself uses in an import specifier.
   const moduleByPath = new Map<string, string>();
+  const digestByPath = input.digestByPath ?? new Map<string, string>();
   for (const file of input.files) {
     if (!file.analyzable) continue;
     counters.files += 1;
@@ -138,12 +148,16 @@ export function buildGraph(input: GraphBuildInput): GraphBuildResult {
 
     const moduleName = moduleNameFor(file.path);
     const moduleId = nodeId('module', moduleName);
+    const fileDigest = digestByPath.get(file.path);
     builder.addNode({
       kind: 'module',
       name: moduleName,
       qualifiedName: moduleName,
       language: file.language,
       path: file.path,
+      // The content digest is what later lets a rename be established by proof rather
+      // than by name similarity. Absent when ingestion could not supply one.
+      ...(fileDigest ? { digest: fileDigest } : {}),
       evidence: [fileRef],
       confidence: 'EXPLICIT',
     });
@@ -523,7 +537,7 @@ function addMarkerFacts(
         case 'compose.service':
         case 'docker.base_image':
         case 'docker.expose':
-          addDeploymentComponent(builder, evidence, file, moduleId, marker);
+          addDeploymentComponent(builder, evidence, file, moduleId, marker, moduleByPath);
           break;
         default:
           addConfiguration(builder, evidence, file, moduleId, marker);
@@ -736,6 +750,7 @@ function addDeploymentComponent(
   file: ParsedFileRef,
   moduleId: string,
   marker: ParsedFileRef['markers'][number],
+  moduleByPath: ReadonlyMap<string, string>,
 ): void {
   const name = String(marker.attributes.service ?? marker.attributes.image ?? 'unknown');
   const markerEvidence = evidence.add({
@@ -760,6 +775,84 @@ function addDeploymentComponent(
     attributes: { ...marker.attributes },
   });
   builder.addEdge({ from: moduleId, to: componentId, kind: 'deploys', confidence: 'EXPLICIT', evidence: [markerEvidence] });
+
+  attributeBuildContext(builder, file, marker, componentId, markerEvidence, moduleByPath);
+}
+
+/**
+ * Attributes the code inside a declared build context to the container built from it.
+ *
+ * A compose service that names `build: ./api` states that the image is built from the
+ * `api` directory, which is the only statement in a repository that connects source code to
+ * a runtime unit. Without this, no application module can be placed inside any container
+ * and C4 level 3 has nothing to show. It is extraction rather than inference in the
+ * projection, because the relationship belongs in the canonical graph where it can be
+ * compared across snapshots like any other fact.
+ *
+ * Confidence is `STRONGLY_INFERRED`, not `EXPLICIT`: the build context says what is *sent*
+ * to the builder, not what a Dockerfile ends up copying. The caveat travels with the edge
+ * in its attributes, and the C4 projection carries the confidence through unchanged.
+ *
+ * Containment: the context path comes from an untrusted repository file. It is only ever
+ * compared against paths already inside the analysed repository — no filesystem access
+ * happens here — and a context that resolves outside the repository is ignored, because
+ * honouring it would mean attributing code this analysis never read.
+ */
+function attributeBuildContext(
+  builder: SoftwareGraphBuilder,
+  file: ParsedFileRef,
+  marker: ParsedFileRef['markers'][number],
+  componentId: string,
+  markerEvidence: EvidenceRef,
+  moduleByPath: ReadonlyMap<string, string>,
+): void {
+  if (marker.name !== 'compose.service') return;
+
+  const context = buildContextDirectory(file.path, marker.attributes.build);
+  if (context === null) return;
+
+  for (const [path, moduleId] of moduleByPath) {
+    if (!isInsideDirectory(path, context)) continue;
+    // The declaring file's own edge is already EXPLICIT; re-adding it here would merge and
+    // downgrade it (D-007), which would understate a fact the repository states directly.
+    if (path === file.path) continue;
+
+    builder.addEdge({
+      from: moduleId,
+      to: componentId,
+      kind: 'deploys',
+      confidence: 'STRONGLY_INFERRED',
+      evidence: [markerEvidence],
+      attributes: {
+        derivedFrom: 'compose.build_context',
+        buildContext: context,
+        caveat: 'The build context states what is sent to the image builder, not what the Dockerfile copies.',
+      },
+    });
+  }
+}
+
+/**
+ * Resolves a declared build context to a repository-relative directory.
+ *
+ * Returns `null` when the context is absent, absolute, or escapes the repository — all
+ * cases where this analysis cannot know which code is involved.
+ */
+function buildContextDirectory(declaringPath: string, raw: unknown): string | null {
+  if (typeof raw !== 'string' || raw.trim().length === 0) return null;
+  const value = raw.trim();
+  if (posix.isAbsolute(value) || /^[a-z]+:/i.test(value)) return null;
+
+  const baseDir = posix.dirname(toPosixPath(declaringPath));
+  const resolved = posix.normalize(posix.join(baseDir === '.' ? '' : baseDir, value));
+  if (resolved === '..' || resolved.startsWith('../')) return null;
+  return resolved === '.' ? '' : resolved;
+}
+
+/** True when `path` is `directory` itself or inside it. An empty directory matches all. */
+function isInsideDirectory(path: string, directory: string): boolean {
+  if (directory.length === 0) return true;
+  return path === directory || path.startsWith(`${directory}/`);
 }
 
 function addConfiguration(

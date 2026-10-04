@@ -2,6 +2,8 @@ export * from './types.js';
 export * from './ids.js';
 export * from './graph.js';
 export * from './graph-builder.js';
+export * from './snapshot.js';
+export * from './drift.js';
 export * from './evidence.js';
 export * from './redact.js';
 export * from './limits.js';

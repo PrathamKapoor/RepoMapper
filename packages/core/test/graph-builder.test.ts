@@ -390,3 +390,129 @@ describe('graph construction', () => {
     expect(diagnostics.list().some((item) => item.code === 'NODE_LIMIT_REACHED')).toBe(true);
   });
 });
+
+describe('deployment attribution', () => {
+  const compose = (service: string, extra: Record<string, string | null>) =>
+    parsedFile('docker-compose.yml', {
+      language: 'yaml',
+      producer: 'config-scanner',
+      markers: [
+        {
+          name: 'compose.service',
+          line: 3,
+          attributes: { service, image: 'repo/service:latest', build: null, publishedPorts: '', ...extra },
+        },
+      ],
+    });
+
+  it('links the declaring file to the service it declares, as an explicit fact', () => {
+    const { graph } = build([compose('api', { build: null })]);
+    const component = graph.nodes.find((node) => node.kind === 'deployment_component');
+    expect(component?.name).toBe('api');
+    const declares = graph.edges.find((edge) => edge.kind === 'deploys' && edge.to === component?.id);
+    expect(declares?.from).toBe('module:docker-compose');
+    expect(declares?.confidence).toBe('EXPLICIT');
+  });
+
+  it('attributes modules inside a declared build context to that container', () => {
+    const { graph } = build([
+      compose('api', { build: './api' }),
+      parsedFile('api/main.ts'),
+      parsedFile('api/routes/health.ts'),
+      parsedFile('web/main.ts'),
+    ]);
+
+    const component = graph.nodes.find((node) => node.kind === 'deployment_component');
+    const attributed = graph.edges.filter((edge) => edge.kind === 'deploys' && edge.to === component?.id).map((edge) => edge.from);
+    expect(attributed).toContain('module:api/main');
+    expect(attributed).toContain('module:api/routes/health');
+    expect(attributed).not.toContain('module:web/main');
+
+    const inferred = graph.edges.find((edge) => edge.from === 'module:api/main' && edge.kind === 'deploys');
+    // The build context states what is sent to the builder, not what is copied, so the
+    // relationship is an inference and is labelled as one.
+    expect(inferred?.confidence).toBe('STRONGLY_INFERRED');
+    expect(inferred?.attributes?.derivedFrom).toBe('compose.build_context');
+    expect(inferred?.attributes?.caveat).toContain('not what the Dockerfile copies');
+    expect(inferred?.evidence[0]?.path).toBe('docker-compose.yml');
+  });
+
+  it('resolves a build context relative to the file that declares it', () => {
+    const { graph } = build([
+      parsedFile('deploy/compose.yml', {
+        language: 'yaml',
+        producer: 'config-scanner',
+        markers: [
+          {
+            name: 'compose.service',
+            line: 2,
+            attributes: { service: 'worker', image: 'repo/worker', build: '../services/worker', publishedPorts: '' },
+          },
+        ],
+      }),
+      parsedFile('services/worker/main.ts'),
+      parsedFile('services/api/main.ts'),
+    ]);
+
+    const component = graph.nodes.find((node) => node.kind === 'deployment_component');
+    const attributed = graph.edges.filter((edge) => edge.kind === 'deploys' && edge.to === component?.id).map((edge) => edge.from);
+    expect(attributed).toContain('module:services/worker/main');
+    expect(attributed).not.toContain('module:services/api/main');
+  });
+
+  it('ignores a build context that points outside the analysed repository', () => {
+    // The context is attacker-controlled text. Honouring `../..` would mean attributing code
+    // this analysis never read.
+    const { graph } = build([compose('api', { build: '../..' }), parsedFile('src/a.ts')]);
+    const component = graph.nodes.find((node) => node.kind === 'deployment_component');
+    const attributed = graph.edges.filter((edge) => edge.kind === 'deploys' && edge.to === component?.id);
+    expect(attributed.map((edge) => edge.from)).toEqual(['module:docker-compose']);
+  });
+
+  it('ignores an absolute build context', () => {
+    const { graph } = build([compose('api', { build: '/etc' }), parsedFile('src/a.ts')]);
+    const component = graph.nodes.find((node) => node.kind === 'deployment_component');
+    const attributed = graph.edges.filter((edge) => edge.kind === 'deploys' && edge.to === component?.id);
+    expect(attributed.map((edge) => edge.from)).toEqual(['module:docker-compose']);
+  });
+
+  it('does not downgrade the explicit declaration edge when the context covers it', () => {
+    // The compose file lives in its own build context. Re-adding the edge would merge and
+    // downgrade it, understating a fact the repository states directly.
+    const { graph } = build([compose('api', { build: '.' }), parsedFile('src/a.ts')]);
+    const declares = graph.edges.find((edge) => edge.kind === 'deploys' && edge.from === 'module:docker-compose');
+    expect(declares?.confidence).toBe('EXPLICIT');
+  });
+
+  it('attributes nothing when the service declares only an image', () => {
+    const { graph } = build([compose('db', { build: null, image: 'postgres:16' }), parsedFile('src/a.ts')]);
+    const component = graph.nodes.find((node) => node.kind === 'deployment_component');
+    const attributed = graph.edges.filter((edge) => edge.kind === 'deploys' && edge.to === component?.id);
+    expect(attributed.map((edge) => edge.from)).toEqual(['module:docker-compose']);
+  });
+});
+
+describe('module content digests', () => {
+  it('records the digest supplied for a file so a rename can be proved later', () => {
+    const evidence = new EvidenceStore({ maxExcerptChars: 100 });
+    const result = buildGraph({
+      repository: REPOSITORY,
+      files: [{ path: 'src/a.ts', byteSize: 10, language: 'typescript', analyzable: true }],
+      parsed: [parsedFile('src/a.ts')],
+      commits: [],
+      headCommit: null,
+      branch: null,
+      evidence,
+      diagnostics: new DiagnosticCollector(),
+      limits: { maxNodes: 100, maxEdges: 100 },
+      includeGitHistory: false,
+      digestByPath: new Map([['src/a.ts', 'abc123']]),
+    });
+    expect(result.graph.nodes.find((node) => node.id === 'module:src/a')?.digest).toBe('abc123');
+  });
+
+  it('omits the digest entirely when ingestion supplied none', () => {
+    const { graph } = build([parsedFile('src/a.ts')]);
+    expect(graph.nodes.find((node) => node.id === 'module:src/a')?.digest).toBeUndefined();
+  });
+});

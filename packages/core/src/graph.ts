@@ -16,7 +16,7 @@ import {
   type SoftwareGraph,
 } from './types.js';
 
-export const GRAPH_SCHEMA_VERSION = 1;
+export const GRAPH_SCHEMA_VERSION = 2;
 
 export class GraphLimitError extends Error {
   readonly code = 'GRAPH_LIMIT_EXCEEDED';

@@ -1,11 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import {
   AnalysisError,
+  compareSnapshots,
+  createSnapshot,
   describeError,
   type AnalysisRecord,
   type AnalysisRequest,
   type AnalysisResult,
+  type AnalysisSnapshot,
+  type CompareOptions,
   type DiagnosticCollector,
+  type DriftReport,
 } from '@repoatlas/core';
 import { projectAtlas, type AtlasProjection } from '@repoatlas/artifacts';
 import { runAnalysis, type RunAnalysisOutput } from './analyze.js';
@@ -104,10 +109,30 @@ export class AnalysisService {
 
       const record: AnalysisRecord = { ...output.analysis, id, createdAt, status: 'succeeded' };
 
+      const snapshot = createSnapshot({
+        analysisId: record.id,
+        repositoryPath: record.repositoryPath,
+        repositoryName: record.repositoryName,
+        createdAt: record.createdAt,
+        sourceRevision: record.headCommit,
+        branch: record.branch,
+        truncated: output.analysis.summary?.truncated ?? false,
+        graph: output.graph,
+      });
+
+      const stored: AnalysisRecord = {
+        ...record,
+        graphDigest: snapshot.provenance.graphDigest,
+        extractorVersion: snapshot.provenance.extractorVersion,
+        graphSchemaVersion: snapshot.provenance.graphSchemaVersion,
+      };
+
       this.store.saveAnalysis({
-        analysis: record,
+        analysis: stored,
         graph: output.graph,
         diagnostics: output.diagnostics,
+        graphDigest: snapshot.provenance.graphDigest,
+        extractorVersion: snapshot.provenance.extractorVersion,
         artifacts: output.projection.artifacts.map((artifact) => ({
           kind: artifact.kind,
           title: artifact.title,
@@ -116,7 +141,7 @@ export class AnalysisService {
         })),
       });
 
-      return { record, output };
+      return { record: stored, output };
     } catch (error) {
       const described = describeError(error);
       const failed: AnalysisRecord = {
@@ -166,6 +191,53 @@ export class AnalysisService {
 
   remove(id: string): boolean {
     return this.store.deleteAnalysis(id);
+  }
+
+  /**
+   * Rebuilds the snapshot for a stored analysis.
+   *
+   * Derived from the persisted graph rather than cached, so a schema or extractor change
+   * cannot leave a stale identity behind.
+   *
+   * Returns `null` for an unknown analysis **and for one that did not succeed**. A failed
+   * analysis has no graph rows, so loading it would yield an empty graph whose every
+   * comparison reports the whole system as removed. Refusing is the difference between
+   * "this changed" and "this was never read".
+   */
+  getSnapshot(id: string): AnalysisSnapshot | null {
+    const record = this.store.getAnalysis(id);
+    if (!record || record.status !== 'succeeded') return null;
+    const graph = this.store.getGraph(id);
+    if (!graph || graph.nodes.length === 0) return null;
+
+    return createSnapshot({
+      analysisId: record.id,
+      repositoryPath: record.repositoryPath,
+      repositoryName: record.repositoryName,
+      createdAt: record.createdAt,
+      sourceRevision: record.headCommit,
+      branch: record.branch,
+      truncated: record.summary?.truncated ?? false,
+      graph,
+    });
+  }
+
+  /**
+   * Compares two stored analyses.
+   *
+   * The base is the older state and the target the newer one. Ordering is decided by
+   * creation time, not by argument order, so a caller cannot accidentally invert the
+   * direction of a drift report.
+   */
+  compareAnalyses(baseId: string, targetId: string, options?: CompareOptions): DriftReport | null {
+    const base = this.getSnapshot(baseId);
+    const target = this.getSnapshot(targetId);
+    if (!base || !target) return null;
+
+    const [older, newer] =
+      base.provenance.createdAt <= target.provenance.createdAt ? [base, target] : [target, base];
+
+    return compareSnapshots(older, newer, options);
   }
 
   /** Reconstructs the full API-shaped result for a stored analysis. */

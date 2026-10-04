@@ -28,6 +28,22 @@ import { registerStaticUi, spaFallbackHandler, type NotFoundHandler } from './st
  *    redacted at ingest time and are the only source text the API exposes.
  */
 
+/**
+ * Drift query parameters.
+ *
+ * `against` is required: a drift report with only one side has no meaning, and defaulting
+ * it to "the previous analysis" would silently pick whichever row happened to sort first.
+ */
+const driftQuerySchema = z.object({
+  against: z.uuid(),
+  /** Cap on returned change records. Summary counts are always complete. */
+  limit: z.coerce.number().int().min(1).max(5_000).default(500),
+  includeChanges: z
+    .enum(['true', 'false'])
+    .transform((value) => value === 'true')
+    .default(true),
+});
+
 export interface BuildAppOptions {
   config?: ServerConfig;
   store?: Store;
@@ -360,7 +376,50 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     return artifact;
   });
 
-  // ------------------------------------------------------------------- gaps
+  // ------------------------------------------------------------------ drift
+  /**
+   * Compares two analyses.
+   *
+   * `against` names the other analysis; direction is resolved by creation time so the
+   * caller cannot invert a report by swapping arguments.
+   */
+  app.get('/api/analyses/:id/drift', async (request, reply) => {
+    const { id } = parseOrThrow(idParamsSchema, request.params);
+    const { against, limit, includeChanges } = parseOrThrow(driftQuerySchema, request.query ?? {});
+
+    if (!store.getAnalysis(id)) {
+      void reply.status(404);
+      return { error: { code: 'NOT_FOUND', message: `No analysis with id ${id}` } };
+    }
+    if (!store.getAnalysis(against)) {
+      void reply.status(404);
+      return { error: { code: 'NOT_FOUND', message: `No analysis with id ${against}` } };
+    }
+
+    const report = service.compareAnalyses(id, against, {
+      includeChanges,
+      maxChanges: limit,
+    });
+    if (!report) {
+      void reply.status(404);
+      return { error: { code: 'NOT_FOUND', message: 'One or both analyses could not be loaded as snapshots' } };
+    }
+
+    return report;
+  });
+
+  /** Snapshot identity for an analysis, without its whole graph. */
+  app.get('/api/analyses/:id/snapshot', async (request, reply) => {
+    const { id } = parseOrThrow(idParamsSchema, request.params);
+    const snapshot = service.getSnapshot(id);
+    if (!snapshot) {
+      void reply.status(404);
+      return { error: { code: 'NOT_FOUND', message: `No analysis with id ${id}` } };
+    }
+    return { snapshot: snapshot.provenance, stats: snapshot.stats };
+  });
+
+  // ----------------------------------------------------------------- gaps
   app.get('/api/analyses/:id/gaps', async (request, reply) => {
     const { id } = parseOrThrow(idParamsSchema, request.params);
     const result = service.getResult(id);

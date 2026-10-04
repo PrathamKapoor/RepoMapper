@@ -171,6 +171,14 @@ export interface GraphNode {
   path?: string;
   startLine?: number;
   endLine?: number;
+  /**
+   * Content digest of the underlying source, present on module nodes.
+   *
+   * This is what makes a rename provable rather than guessed: two nodes with the same
+   * digest and a different path are the same bytes under a different name. See
+   * `drift.ts` for the rules, which are deliberately narrow.
+   */
+  digest?: string;
   attributes?: Record<string, AttributeValue>;
   evidence: EvidenceRef[];
   confidence: Confidence;
@@ -497,6 +505,17 @@ export interface AnalysisRecord {
   error: { code: string; message: string } | null;
   summary: AnalysisSummary | null;
   warnings: string[];
+  /**
+   * Content digest of the graph this analysis produced. Null for failed analyses.
+   *
+   * Two analyses of unchanged content share this value, which is what makes "nothing
+   * changed" decidable without comparing timestamps.
+   */
+  graphDigest?: string | null;
+  /** Extractor version in force when the analysis ran. Null for failed analyses. */
+  extractorVersion?: string | null;
+  /** Graph schema version the analysis produced. Null for failed analyses. */
+  graphSchemaVersion?: number | null;
 }
 
 export interface AnalysisResult {

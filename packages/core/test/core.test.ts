@@ -20,6 +20,7 @@ import {
   REDACTION_MARKER,
   EvidenceStore,
   SoftwareGraphBuilder,
+  GRAPH_SCHEMA_VERSION,
   computeStats,
   type SoftwareGraph,
 } from '@repoatlas/core';
@@ -210,7 +211,7 @@ describe('SoftwareGraphBuilder', () => {
     const built = graph.build(store);
     expect(built.nodes).toHaveLength(2);
     expect(built.edges).toHaveLength(1);
-    expect(built.schemaVersion).toBe(1);
+    expect(built.schemaVersion).toBe(GRAPH_SCHEMA_VERSION);
   });
 
   it('refuses to create an edge with a missing endpoint', () => {

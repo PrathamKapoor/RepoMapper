@@ -485,16 +485,292 @@ Rules for this file:
 
 ---
 
+## Phase 2 — Drift detection and C4 architecture recovery
+
+### D-026: A snapshot's identity is a content digest, not a timestamp
+
+- **Date / phase / commit:** Phase 2
+- **Context:** Phase 1 deferred drift detection because comparing two analyses needs a
+  defensible notion of "the same state". The obvious identity — the analysis timestamp — is
+  wrong in a way that only shows up later: re-analysing an unchanged repository produces a
+  new timestamp, so "nothing changed" is indistinguishable from "analysed at a different
+  moment", and every drift report would be a diff of noise.
+- **Decision:** `createSnapshot()` (`packages/core/src/snapshot.ts`) derives
+  `graphDigest = sha256(extractorVersion, graphSchemaVersion, sorted nodes, edges,
+  evidence)` and the snapshot id from it. Provenance (analysis id, repository path, commit,
+  branch, timestamp, truncation) is recorded **outside** the identity.
+- **Why:** Content identity makes "identical" decidable, makes a report reproducible, and
+  makes a snapshot idempotent: analysing the same content twice yields the same id, so the
+  second analysis is visibly a re-run rather than a new state. Two extra inputs are folded
+  in deliberately: the extractor version and the graph schema version. If extraction changes,
+  every entity's facts change, and comparing across that change would otherwise report the
+  whole repository as rewritten. Folding them in makes it *detectable* instead of silent,
+  and `incomparabilityReason()` refuses the comparison outright with an explanation.
+- **Alternatives considered:**
+  - **Git commit as identity:** better as a *label* — it is recorded as `sourceRevision` —
+    but it is not available. An exported archive, a copy without `.git`, or a dirty working
+    tree all break it. Verified: a snapshot is created and compared for a repository with no
+    Git history (`drift.test.ts`, "creates a snapshot for a repository with no git history").
+  - **Hash the file tree rather than the graph:** would change when an extractor improves
+    even when no fact changed, so drift would report noise on every parser upgrade.
+  - **Timestamp + analysis id:** rejected; see above.
+- **Consequences:** The digest covers every node, edge and evidence record, so the cost is
+  O(graph) per analysis and the comparison itself is O(n + m) over indexed maps.
+  `GRAPH_SCHEMA_VERSION` was bumped 1 → 2 because `GraphNode.digest` was added. A snapshot
+  taken before the bump is reported incomparable rather than silently diffed.
+- **Files:** `packages/core/src/snapshot.ts`, `packages/core/src/graph.ts`,
+  `packages/server/src/store.ts`, `packages/server/src/service.ts`
+
+### D-027: Drift runs on the canonical graph, indexed, and is sorted before it returns
+
+- **Date / phase / commit:** Phase 2
+- **Context:** "What changed between two states" can be computed many ways. The two that
+  matter here are cost and determinism: a naive pairwise diff is O(n·m) on graphs that reach
+  thousands of nodes, and an unsorted diff produces a different report on every run, which
+  makes a drift report impossible to diff or to cache.
+- **Decision:** `compareSnapshots()` (`packages/core/src/drift.ts`) indexes base and target
+  by entity id (`indexById`), walks each index once, and sorts `changes` with a total order
+  over `(category, entityId)` before returning.
+- **Why:** Every entity in this graph already has a deterministic id (D-019), so the
+  comparison is a map lookup rather than a similarity question. That is what makes the whole
+  engine cheap and what removes any temptation to match by display name.
+- **Consequences:** The same pair of snapshots always produces byte-identical JSON, asserted
+  in `drift.test.ts` ("produces byte-identical reports for the same pair of snapshots").
+  `maxChanges` bounds the record list; counts are always complete regardless, so a capped
+  report never misstates how much changed.
+- **Files:** `packages/core/src/drift.ts`, `packages/core/test/drift.test.ts`
+
+### D-028: A removal is only asserted from a complete analysis
+
+- **Date / phase / commit:** Phase 2
+- **Context:** The single most damaging false statement this product could make is "X was
+  removed". Absence of an observation is not evidence of absence: if the target analysis hit
+  a file, node or edge limit, part of the repository was never walked, and every entity
+  outside the walked part looks identical to a deleted one.
+- **Decision:** A removal carries `claimConfidence` and `indeterminate`, distinct from the
+  entity's own confidence. When the target snapshot's analysis was truncated, every removal —
+  of nodes, of edges *and of evidence citations* — is reported with
+  `claimConfidence: 'INDETERMINATE'`, `indeterminate: true`, and a `reason` stating that
+  absence does not establish removal. The report carries `targetIncomplete` and
+  `removalConfidence` at the top level.
+- **Why:** It keeps the two questions separate. "Is this entity explicit?" is a property of
+  the graph. "Can we assert it is gone?" is a property of *how completely we looked*. One
+  confidence value cannot answer both, and conflating them is how a partial scan becomes a
+  confident deletion list.
+- **Enforcement:** `drift.test.ts` asserts that a truncated target produces indeterminate
+  removals, and that evidence removals follow the same rule.
+- **Alternatives considered:**
+  - **Suppress removals entirely when truncated:** rejected. The reader would lose the signal
+    that the two states differ in size, with no explanation of why the list is empty.
+  - **Re-run with raised limits automatically:** out of scope, and it would change the
+    snapshot under comparison.
+- **Files:** `packages/core/src/drift.ts`, `packages/server/src/analyze.ts`
+
+### D-029: Rename detection requires identical content, and nothing else
+
+- **Date / phase / commit:** Phase 2
+- **Context:** A renamed file changes its node id, so a naive diff reports one removal and one
+  addition. Reporting that as "renamed" is more useful — but only if it is *true*. A
+  similarity heuristic would produce confident, wrong renames, which is the exact failure this
+  product exists to avoid.
+- **Decision:** Extraction captures a `digest` on every module node: sha256 of the decoded
+  file text with CRLF normalised to LF, computed during the single read each file already
+  requires (`contentDigest()` in `packages/server/src/analyze.ts`), so hashing adds no I/O.
+  `detectRenames()` pairs a removed node with an added node only when all of the following
+  hold: same node kind, same language, equal digests, and the digest is **unique** on both
+  sides. Renames are reported with `claimConfidence: 'STRONGLY_INFERRED'` and never also as
+  a removal plus an addition.
+- **Why:** Identical content under a different path is the same bytes, which is a proof
+  rather than a resemblance. The uniqueness rule is what makes it a proof: two identical
+  files could be paired either way, and a guess dressed as a proof is worse than two honest
+  rows. CRLF normalisation matters because a Windows checkout and a Linux checkout of the
+  same commit are the same source, and treating them as different would invent a change on
+  every cross-platform run.
+- **Alternatives considered:**
+  - **Name similarity (edit distance, token overlap):** rejected outright. It cannot
+    distinguish "renamed" from "deleted one file and added a similar one".
+  - **Git rename detection (`git log --follow`, `git diff -M`):** stronger evidence when
+    available, but it needs a Git history this analysis does not require, and it describes a
+    commit range rather than two independent analyses. Recorded as a possible later
+    corroboration, not a replacement.
+  - **Symbol-level rename pairing (class moved between files):** deferred. It would need a
+    second identity rule and its own ambiguity handling; the module-level rule already covers
+    the common case honestly.
+- **Consequences:** A rename that also changed content is reported as removed plus added. So
+  is a rename when ingestion could not supply a digest. Both are tested
+  (`refuses to call a rename when the content also changed`,
+  `refuses to call a rename when the pairing would be ambiguous`).
+- **Files:** `packages/core/src/graph-builder.ts`, `packages/core/src/drift.ts`,
+  `packages/server/src/analyze.ts`, `packages/parsers/src/registry.ts`
+
+### D-030: `EVIDENCE_MOVED` was removed; evidence movement is observed on the entity
+
+- **Date / phase / commit:** Phase 2
+- **Context:** The first draft of the drift model included an `EVIDENCE_MOVED` category that
+  compared a stored evidence record against the same id in the target snapshot and reported a
+  change of line.
+- **Decision:** The category was deleted. It is unreachable by construction: an evidence id is
+  `evidenceId(path, kind, startLine, producer)` (`packages/core/src/evidence.ts`), so two
+  records sharing an id have the same path and the same line by definition. The category could
+  only ever report zero, and a category that always reports zero is worse than no category.
+- **What replaced it:** `EVIDENCE_CHANGED`, recorded on the entity that *cites* the evidence.
+  A citation that moved becomes a different record, so the observable fact is "this entity is
+  now cited elsewhere", which is compared by a set of `path:line:kind` fingerprints on the
+  retained nodes and edges. Both views are kept: `EVIDENCE_REMOVED`/`EVIDENCE_ADDED` on the
+  records themselves, `EVIDENCE_CHANGED` on the citing entity, carrying `evidenceBefore` and
+  `evidenceAfter` so a reader can follow the citation to its old and new location.
+- **Consequences:** Follows the repository's own rule (handoff §12.17): a check that cannot
+  fail is deleted rather than kept to inflate a count.
+- **Files:** `packages/core/src/drift.ts`, `packages/core/test/drift.test.ts`
+
+### D-031: Bug — snapshot provenance reported an empty identity
+
+- **Date / phase / commit:** Phase 2
+- **Symptom:** `GET /api/analyses/:id/snapshot` returned `"snapshotId": ""` while
+  `GET /api/analyses/:id/drift` reported a correct `base.snapshotId`.
+- **Root cause:** `createSnapshot()` built a `provenance` object with placeholder empty
+  `snapshotId` and `graphDigest` fields, then returned
+  `{ ...provenance, snapshotId: '', graphDigest }` — the computed digest was written back but
+  the id was left as the placeholder. The outer `snapshot.id` was correct, which is why the
+  drift engine was unaffected: it reads `provenance.graphDigest`, not `provenance.snapshotId`.
+- **Why it mattered:** Every consumer that serialises the *reference* rather than the
+  snapshot — the API route, and any future cache keyed on it — would have seen an empty
+  identity. Two different snapshots are indistinguishable by id.
+- **Fix:** Compute `graphDigest` and `snapshotId` first and write both into `provenance`.
+- **Regression test:** `drift.test.ts` — "carries the same identity on the snapshot and
+  inside its provenance", plus the HTTP assertion in
+  `packages/server/test/drift-api.test.ts` that the route returns `snap_<16 hex>`.
+- **Files:** `packages/core/src/snapshot.ts`
+
+### D-032: Bug — a failed analysis could be compared, reporting the whole system as removed
+
+- **Date / phase / commit:** Phase 2
+- **Symptom:** `GET /api/analyses/:id/drift?against=<failed-analysis>` returned 200 with a
+  report in which every node, edge and citation of the real analysis was `NODE_REMOVED`,
+  `EDGE_REMOVED` and `EVIDENCE_REMOVED`.
+- **Root cause:** `AnalysisService.getSnapshot()` required only that a record and a graph
+  existed. `Store.getGraph()` returns `{ nodes: [], edges: [], evidence: [] }` for an analysis
+  with no entity rows, which is exactly the state a failed analysis is left in. An empty graph
+  is a valid graph, so the comparison ran — and, worse, it ran with `truncated: false`, so the
+  removals were reported as `EXPLICIT`.
+- **Why it mattered:** This is the failure mode D-028 exists to prevent, arriving through a
+  different door: the report claimed a total deletion with full confidence.
+- **Fix:** `getSnapshot()` returns `null` unless the analysis `status === 'succeeded'` and the
+  graph has at least one node. The route answers 404 with a message saying the analyses could
+  not be loaded as snapshots.
+- **Regression test:** `packages/server/test/drift-api.test.ts` — "will not compare a failed
+  analysis, because it has no graph".
+- **Files:** `packages/server/src/service.ts`, `packages/server/src/app.ts`
+
+### D-033: C4 is a mapper over the graph, and an unsupported arrow is dropped rather than drawn
+
+- **Date / phase / commit:** Phase 2
+- **Context:** C4 models — system context, containers, components — are the diagrams teams ask
+  for first, and they are also the easiest to fabricate. A diagram that draws a person, a
+  database and a queue because they "look architectural" is worse than no diagram, because it
+  is indistinguishable from a recovered one.
+- **Decision:** `packages/artifacts/src/c4.ts` is a projection with no filesystem access and
+  no independent discovery. It reads `SoftwareGraph` and maps graph facts onto C4 elements:
+
+  | Level | Element | Graph source | Confidence |
+  |---|---|---|---|
+  | 1 context | software system | `repository` node | carried through |
+  | 1 context | external system | `deployment_component` whose image matches a fixed list of datastore/broker families | `WEEKLY_INFERRED` |
+  | 1 context | person | *none* | never emitted |
+  | 2 container | container | `deployment_component` | carried through (`EXPLICIT`) |
+  | 2 container | container dependency | `imports`/`calls` edges between modules placed in different containers | weakest support |
+  | 3 component | component | `module` attributed to a container by a `deploys` edge | carried through |
+
+  Every element carries `derivation` (the rule that produced it), `graphNodeIds`, `evidence`
+  and `confidence`. Every relationship carries `supportingEdgeIds` and/or `supportingNodeIds`.
+  `finish()` drops any relationship with neither, or whose endpoints are not in the same
+  level, and records each drop in `omitted[]`.
+- **Why:** `ArtifactNode`/`ArtifactEdge` already existed as the projection contract (D-020);
+  C4 uses it rather than inventing a parallel model, so the UI, Mermaid export and omission
+  reporting all work unchanged. The support fields are what make "why does RepoAtlas believe
+  this exists?" answerable by data rather than by reading the source.
+- **Deliberate non-mappings, each recorded in `omitted[]`:**
+  - **A package is not a container.** Dependency packages are libraries. Treating them as
+    runtime units asserts a boundary the repository never states.
+  - **A human actor is not invented.** Nothing in the graph describes who uses the system.
+    This is the most common fabrication in diagram tooling, so the omission is stated
+    explicitly rather than left as a silent gap.
+  - **A deployment file is not a component of the container it declares.** The compose file
+    describes the service; it does not run inside it.
+- **Alternatives considered:**
+  - **LLM-generated architecture description:** rejected. It cannot cite a file and a line,
+    which is the product's core promise.
+  - **A fourth C4 level (code) from the module graph:** deferred. It adds nothing that the
+    existing module-graph view does not already show with citations.
+- **Files:** `packages/artifacts/src/c4.ts`, `packages/artifacts/src/contract.ts`,
+  `packages/artifacts/src/index.ts`, `packages/artifacts/test/c4.test.ts`
+
+### D-034: Code is attributed to a container by its declared build context, in extraction
+
+- **Date / phase / commit:** Phase 2
+- **Context:** With C4 defined, level 3 was empty for every real repository. The reason is in
+  the graph: the only `deploys` edge the builder created ran from the *compose file's own
+  module* to the service it declares, so exactly one module could ever be placed in a
+  container, and it was the file describing the container. Without this decision there is no
+  honest component view at all.
+- **Decision:** `attributeBuildContext()` in `packages/core/src/graph-builder.ts` emits a
+  `deploys` edge from every module whose path lies inside a compose service's declared
+  `build:` context to that service's `deployment_component`, at `STRONGLY_INFERRED`, citing
+  the compose marker and carrying `attributes.derivedFrom = 'compose.build_context'` plus the
+  caveat that a build context says what is sent to the builder, not what a Dockerfile copies.
+  The declaring file's own `EXPLICIT` edge is left untouched — re-adding it would merge and
+  downgrade it (D-007), understating a fact the repository states directly.
+- **Why extraction, not projection.** The relationship belongs in the canonical graph, where
+  it is comparable across snapshots like any other fact and where a future drift report can
+  show a container gaining or losing code. A heuristic inside the C4 mapper would be invisible
+  to every other view and to drift. Confidence is `STRONGLY_INFERRED` rather than `EXPLICIT`
+  because the mapping from build context to running code is an interpretation; the caveat
+  travels with the edge so no consumer can read it as proof.
+- **Security:** the context string is attacker-controlled. It is only ever compared against
+  paths already inside the analysed repository — no filesystem access occurs — and a context
+  that is absolute, URL-shaped, or resolves outside the repository (`../..`) is ignored,
+  because honouring it would attribute code this analysis never read.
+- **Alternatives considered:**
+  - **Dockerfile `COPY` analysis:** would be stronger evidence, but it needs Dockerfile
+    instruction modelling including multi-stage builds and `ARG`-interpolated paths. Deferred;
+    noted as the natural next improvement.
+  - **Infer from package name or directory name matching the service name:** rejected. It is
+    exactly the kind of resemblance that produces confident nonsense.
+- **Files:** `packages/core/src/graph-builder.ts`,
+  `packages/core/test/graph-builder.test.ts`
+
+### D-035: Tests resolve packages through `dist/`, so a build must precede them
+
+- **Date / phase / commit:** Phase 2
+- **Symptom:** Four Phase 2 tests failed against code that had already been fixed, with
+  assertions contradicting the source that was sitting in front of me.
+- **Root cause:** each package's `exports` points at `./dist/index.js`, and there is no vitest
+  alias, so cross-package imports load the **built** output. `npm run verify` orders
+  `build` before `test`, which hides this in the normal workflow. Running `npx vitest run` on
+  its own after an edit tests the previous build.
+- **Why it matters:** a stale `dist` produces failures that look like logic errors and passes
+  that mean nothing. Both are worse than a red build.
+- **Decision:** no tooling change — `npm run verify` already enforces the correct order, and
+  changing resolution would diverge the test environment from the deployed one. Instead the
+  gotcha is recorded in `handoff.md` §11 Critical Context and in the CI workflow, which
+  already builds before testing.
+- **Files:** `handoff.md`, `packages/*/package.json`, `vitest.config.ts`
+
+---
+
 ## Deferred, with reasons
 
 Recorded so these are not mistaken for oversights.
 
 | Item | Why deferred |
 |---|---|
-| C4 architecture, sequence, DFD, use-case, activity, deployment diagrams | Each needs graph facts that do not exist yet. Building a projection before its facts are in the graph would produce a confident-looking diagram with invented content — the failure mode this product exists to avoid. |
+| C4 architecture, sequence, DFD, use-case, activity, deployment diagrams | **Partly resolved in Phase 2.** C4 levels 1–3 are implemented as evidence-grounded projections (D-033, D-034). Sequence, DFD, use-case, activity and deployment views remain deferred: each needs graph facts that do not exist yet, and building one before its facts are in the graph would produce a confident-looking diagram with invented content. |
 | Requirements and traceability | Needs requirement extraction, which needs document-structure parsing. No facts to trace yet. |
-| Consistency and drift engine | Needs two analyses of comparable graphs plus a diff over node and edge identity. Deterministic ids (D-019) are the prerequisite and are in place; the diff and rule set are not. |
+| Consistency and drift engine | **Implemented in Phase 2** (D-026 – D-030). A consistency checker that looks for *contradictions inside one graph* — declared versus imported, route with no handler — remains deferred; drift answers "what changed", not "what disagrees". |
+| Symbol-level and Git-corroborated rename detection | D-029 records the module-level content-identity rule in force and why the stronger sources are not used yet. |
+| Dockerfile `COPY` analysis for container contents | D-034 records why build-context attribution is an inference, and how instruction modelling would strengthen it. |
 | Authentication/authorisation relationships | No extractor produces them yet. Reported honestly as `NOT_FOUND` by the gap analysis (D-008). |
 | Archive upload endpoint | Extraction, containment and limits are implemented and tested (`extractTarArchive`). The HTTP route is not built. |
 | Languages beyond TypeScript/JavaScript and Python | D-003/D-004 explain the current coverage and the path to widening it. |
 | Sequence-diagram renderer | D-022 explains why the current renderer cannot express one. |
+| API authentication and rate limiting | Absent so far. `REPOATLAS_ALLOWED_ROOTS` is the only boundary, and `/api/health` reports when it is not enforced. |

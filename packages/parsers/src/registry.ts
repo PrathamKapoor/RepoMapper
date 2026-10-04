@@ -56,7 +56,17 @@ export interface ParseBatchResult {
 export async function parseFiles(
   files: readonly { path: string; language: string; absolutePath: string }[],
   registry: ParserRegistry,
-  options: { maxProblems: number; maxCalls: number; maxBytes: number; readFile: (absolutePath: string) => Promise<string | null> },
+  options: {
+    maxProblems: number;
+    maxCalls: number;
+    maxBytes: number;
+    /**
+     * Reads a file. The repository-relative path is passed alongside the absolute one so
+     * a caller can key derived data (for example a content digest) by path without
+     * re-deriving it.
+     */
+    readFile: (absolutePath: string, relativePath: string) => Promise<string | null>;
+  },
   diagnostics: DiagnosticCollector,
 ): Promise<ParseBatchResult> {
   const results: ParsedFile[] = [];
@@ -80,7 +90,7 @@ export async function parseFiles(
 
     let source: string | null;
     try {
-      source = await options.readFile(file.absolutePath);
+      source = await options.readFile(file.absolutePath, file.path);
     } catch (error) {
       diagnostics.warn('FILE_UNREADABLE', `Cannot read ${file.path}: ${(error as Error).message}`, {
         path: file.path,

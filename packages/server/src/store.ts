@@ -45,6 +45,9 @@ interface AnalysisRow {
   error_json: string | null;
   summary_json: string | null;
   warnings_json: string | null;
+  graph_digest: string | null;
+  extractor_version: string | null;
+  graph_schema_version: number | null;
 }
 
 interface NodeRow {
@@ -57,6 +60,7 @@ interface NodeRow {
   path: string | null;
   start_line: number | null;
   end_line: number | null;
+  digest: string | null;
   confidence: string;
   attributes_json: string | null;
   evidence_json: string | null;
@@ -105,7 +109,12 @@ CREATE TABLE IF NOT EXISTS analyses (
   branch          TEXT,
   error_json      TEXT,
   summary_json    TEXT,
-  warnings_json   TEXT
+  warnings_json   TEXT,
+  -- Snapshot identity. The digest is content-derived, so two runs over unchanged
+  -- content share it and "nothing changed" is decidable without a timestamp comparison.
+  graph_digest          TEXT,
+  extractor_version     TEXT,
+  graph_schema_version  INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_analyses_created ON analyses (created_at DESC);
@@ -121,6 +130,10 @@ CREATE TABLE IF NOT EXISTS nodes (
   path            TEXT,
   start_line      INTEGER,
   end_line        INTEGER,
+  -- Content digest of the underlying source, present on module nodes. Rename detection
+  -- compares these, so a rename is proved by identical content rather than by a
+  -- similar-looking name.
+  digest          TEXT,
   confidence      TEXT NOT NULL,
   attributes_json TEXT,
   evidence_json   TEXT,
@@ -227,8 +240,9 @@ export class Store {
     this.statements = {
       insertAnalysis: this.db.prepare(
         `INSERT INTO analyses (id, repository_path, repository_name, label, status, created_at, completed_at,
-          duration_ms, head_commit, branch, error_json, summary_json, warnings_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          duration_ms, head_commit, branch, error_json, summary_json, warnings_json,
+          graph_digest, extractor_version, graph_schema_version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       updateAnalysis: this.db.prepare(
         `UPDATE analyses SET status = ?, completed_at = ?, duration_ms = ?, head_commit = ?, branch = ?,
@@ -240,8 +254,8 @@ export class Store {
       deleteAnalysis: this.db.prepare('DELETE FROM analyses WHERE id = ?'),
       insertNode: this.db.prepare(
         `INSERT OR REPLACE INTO nodes (id, analysis_id, kind, name, qualified_name, language, path,
-          start_line, end_line, confidence, attributes_json, evidence_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          start_line, end_line, digest, confidence, attributes_json, evidence_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       insertEdge: this.db.prepare(
         `INSERT OR REPLACE INTO edges (id, analysis_id, from_id, to_id, kind, confidence, label,
@@ -275,6 +289,9 @@ export class Store {
     graph: SoftwareGraph;
     diagnostics: readonly Diagnostic[];
     artifacts: readonly { kind: string; title: string; format: string; body: unknown }[];
+    /** Snapshot identity, persisted so identity is queryable without re-reading the graph. */
+    graphDigest: string;
+    extractorVersion: string;
   }): void {
     const record = input.analysis;
 
@@ -294,6 +311,9 @@ export class Store {
         record.error ? JSON.stringify(record.error) : null,
         record.summary ? JSON.stringify(record.summary) : null,
         JSON.stringify(record.warnings),
+        input.graphDigest,
+        input.extractorVersion,
+        record.graphSchemaVersion ?? null,
       );
 
       for (const node of input.graph.nodes) {
@@ -307,6 +327,7 @@ export class Store {
           node.path ?? null,
           node.startLine ?? null,
           node.endLine ?? null,
+          node.digest ?? null,
           node.confidence,
           node.attributes ? JSON.stringify(node.attributes) : null,
           JSON.stringify(node.evidence),
@@ -380,6 +401,9 @@ export class Store {
       record.error ? JSON.stringify(record.error) : null,
       record.summary ? JSON.stringify(record.summary) : null,
       JSON.stringify(record.warnings),
+      null,
+      null,
+      null,
     );
   }
 
@@ -495,6 +519,9 @@ function rowToAnalysis(row: AnalysisRow): AnalysisRecord {
     error: row.error_json ? (JSON.parse(row.error_json) as AnalysisRecord['error']) : null,
     summary: row.summary_json ? (JSON.parse(row.summary_json) as AnalysisSummary) : null,
     warnings: row.warnings_json ? (JSON.parse(row.warnings_json) as string[]) : [],
+    graphDigest: row.graph_digest,
+    extractorVersion: row.extractor_version,
+    graphSchemaVersion: row.graph_schema_version,
   };
 }
 
@@ -508,6 +535,7 @@ function rowToNode(row: NodeRow): GraphNode {
     ...(row.path ? { path: row.path } : {}),
     ...(row.start_line !== null ? { startLine: row.start_line } : {}),
     ...(row.end_line !== null ? { endLine: row.end_line } : {}),
+    ...(row.digest ? { digest: row.digest } : {}),
     confidence: row.confidence as GraphNode['confidence'],
     ...(row.attributes_json ? { attributes: JSON.parse(row.attributes_json) as GraphNode['attributes'] } : {}),
     evidence: row.evidence_json ? (JSON.parse(row.evidence_json) as GraphNode['evidence']) : [],

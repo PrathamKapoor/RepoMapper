@@ -1,4 +1,5 @@
 import { readFile, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { basename, resolve } from 'node:path';
 import {
   AnalysisError,
@@ -107,6 +108,13 @@ export async function runAnalysis(request: RunAnalysisOptions): Promise<RunAnaly
       : analyzableFiles;
 
   const readSource = request.readSource ?? defaultReadSource;
+  /**
+   * Content digests are captured during the single read each file already requires, so
+   * hashing adds no extra I/O. They are what let the drift engine prove a rename instead
+   * of guessing one from a similar name.
+   */
+  const digestByPath = new Map<string, string>();
+
   const batch = await parseFiles(
     candidateFiles.map((file) => ({
       path: file.path,
@@ -118,8 +126,9 @@ export async function runAnalysis(request: RunAnalysisOptions): Promise<RunAnaly
       maxProblems: limits.maxParseErrorsPerFile,
       maxCalls: limits.maxCallRecordsPerFile,
       maxBytes: limits.maxFileBytes,
-      readFile: async (absolutePath: string) => {
+      readFile: async (absolutePath: string, path: string) => {
         const text = await readSource(absolutePath);
+        if (text !== null) digestByPath.set(path, contentDigest(text));
         return text;
       },
     },
@@ -139,6 +148,7 @@ export async function runAnalysis(request: RunAnalysisOptions): Promise<RunAnaly
     diagnostics,
     limits: { maxNodes: limits.maxNodes, maxEdges: limits.maxEdges },
     includeGitHistory,
+    digestByPath,
   });
 
   const graph = built.graph;
@@ -206,6 +216,18 @@ async function defaultReadSource(absolutePath: string): Promise<string | null> {
     if (code === 'ENOENT' || code === 'EISDIR' || code === 'EACCES') return null;
     return null;
   }
+}
+
+/**
+ * Content digest of a source file.
+ *
+ * Hashes the decoded text rather than the raw bytes so the digest is stable across
+ * platforms: a checkout with CRLF and one with LF are the same source, and treating them
+ * as different would invent a change on every cross-platform checkout. Line endings are
+ * normalised before hashing.
+ */
+export function contentDigest(text: string): string {
+  return createHash('sha256').update(text.replace(/\r\n/g, '\n')).digest('hex');
 }
 
 /**
