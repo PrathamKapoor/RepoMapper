@@ -1,4 +1,5 @@
 import type { CallRecord, ExtractedEntity, Marker, ParsedFile } from '@repoatlas/core';
+import { parseSqlStatement } from './typescript.js';
 import { addProblem, emptyResult, type ParserContext, type SourceParser } from './contract.js';
 
 /**
@@ -178,6 +179,9 @@ function handlePythonLine(
       endLine: line.line,
       signature: `(${functionMatch[3] ?? ''})`.replace(/\s+/g, ' '),
       ...(functionMatch[1] ? { modifiers: ['async'] } : {}),
+      // Present whether or not the keyword appears: for a `def` the absence of `async` is a
+      // statement the source does make.
+      isAsync: Boolean(functionMatch[1]),
     };
     result.entities.push(entity);
     collectCalls(line, entity.qualifiedName, calls);
@@ -220,10 +224,74 @@ function handlePythonLine(
 
   collectCalls(line, enclosing, calls);
 
+  // Control flow is recorded only from an explicit statement in the enclosing scope, for
+  // the same reason as in the TypeScript extractor: a workflow must not be inferred from
+  // the shape of a call graph.
+  const flow = pythonControlFlowMarker(code, line.line, enclosing);
+  if (flow) result.markers.push(flow);
+
+  const query = pythonSqlMarker(line.raw, line.line, enclosing);
+  if (query) result.markers.push(query);
+
   // Markers read the literal-preserving view: a decorator's route path is a string
   // value, and blanking string bodies would make it undetectable.
   const marker = pythonMarker(line.raw, line.line);
   if (marker) result.markers.push(marker);
+}
+
+/**
+ * `if` / `elif` / `for` / `while` / `try` at the start of a logical line.
+ *
+ * `elif` and `except` are folded into their parent kind: they are the same decision point
+ * with a different spelling, and a projection that drew them separately would imply a
+ * separate stage.
+ */
+function pythonControlFlowMarker(code: string, line: number, scope: string | undefined): Marker | undefined {
+  if (!scope) return undefined;
+
+  const branch = /^(if|elif)\s+(.+?):\s*$/.exec(code);
+  if (branch?.[2]) {
+    return { name: 'control.branch', line, attributes: { flow: 'branch', scope, condition: clip(branch[2]) } };
+  }
+
+  const loop = /^(for|while)\s+(.+?):\s*$/.exec(code);
+  if (loop?.[2]) {
+    return { name: 'control.loop', line, attributes: { flow: 'loop', scope, condition: clip(loop[2]) } };
+  }
+
+  if (/^(try|finally)\s*:/.test(code)) {
+    return { name: 'control.handler', line, attributes: { flow: 'handler', scope } };
+  }
+
+  return undefined;
+}
+
+/**
+ * A SQL statement in a Python string literal.
+ *
+ * Mirrors the TypeScript rule exactly: one statement, one table, no joins. The parser stays
+ * a structural extractor, so the statement is matched as text rather than parsed as SQL.
+ */
+function pythonSqlMarker(raw: string, line: number, scope: string | undefined): Marker | undefined {
+  if (!scope) return undefined;
+  for (const match of raw.matchAll(/(['"])(.*?)\1/gs)) {
+    const statement = match[2];
+    if (!statement) continue;
+    const parsed = parseSqlStatement(statement);
+    if (parsed) {
+      return {
+        name: 'sql.query',
+        line,
+        attributes: { operation: parsed.operation, table: parsed.table, scope },
+      };
+    }
+  }
+  return undefined;
+}
+
+function clip(text: string): string {
+  const collapsed = text.replace(/\s+/g, ' ').trim();
+  return collapsed.length > 120 ? `${collapsed.slice(0, 119)}…` : collapsed;
 }
 
 /**

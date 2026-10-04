@@ -56,6 +56,8 @@ interface SymbolRef {
   id: string;
   filePath: string;
   kind: ExtractedEntity['kind'];
+  /** Qualified name as declared, used in derivations and condition ids. */
+  qualifiedName: string;
 }
 
 /** Entity kinds that can participate in an inheritance relationship. */
@@ -189,8 +191,8 @@ export function buildGraph(input: GraphBuildInput): GraphBuildResult {
   for (const file of input.parsed) {
     for (const entity of file.entities) {
       const id = nodeId(entity.kind, entity.qualifiedName);
-      indexSymbol(symbolIndex, entity.qualifiedName, id, file.path, entity.kind);
-      indexSymbol(symbolIndex, entity.name, id, file.path, entity.kind);
+      indexSymbol(symbolIndex, entity.qualifiedName, id, file.path, entity.kind, entity.qualifiedName);
+      indexSymbol(symbolIndex, entity.name, id, file.path, entity.kind, entity.qualifiedName);
     }
   }
 
@@ -226,6 +228,10 @@ export function buildGraph(input: GraphBuildInput): GraphBuildResult {
         attributes: {
           ...(entity.signature ? { signature: entity.signature } : {}),
           ...(entity.modifiers ? { modifiers: entity.modifiers.join(' ') } : {}),
+          // Present whenever the source states it, in both directions. A behaviour projection
+          // showing a synchronous call into an `async` function would be describing something
+          // the code does not do, and "the source did not say" is a third, distinct state.
+          ...(entity.isAsync === undefined ? {} : { isAsync: entity.isAsync }),
           ...(entity.attributes ?? {}),
         },
       });
@@ -396,7 +402,7 @@ export function buildGraph(input: GraphBuildInput): GraphBuildResult {
   }
 
   // ------------------------------------------------------------------- markers
-  addMarkerFacts(input, builder, moduleByPath, counters);
+  addMarkerFacts(input, builder, moduleByPath, symbolIndex, counters);
 
   // ------------------------------------------------------------------ git facts
   if (input.includeGitHistory && input.commits.length > 0) {
@@ -419,12 +425,13 @@ function indexSymbol(
   id: string,
   filePath: string,
   kind: ExtractedEntity['kind'],
+  qualifiedName: string,
 ): void {
   if (symbol.length === 0) return;
   // First declaration wins. A symbol declared in two files is a duplicate to be
   // reported later, not a second node.
   if (!index.has(symbol)) {
-    index.set(symbol, { id, filePath, kind });
+    index.set(symbol, { id, filePath, kind, qualifiedName });
   }
 }
 
@@ -508,6 +515,7 @@ function addMarkerFacts(
   input: GraphBuildInput,
   builder: SoftwareGraphBuilder,
   moduleByPath: ReadonlyMap<string, string>,
+  symbolIndex: ReadonlyMap<string, SymbolRef>,
   counters: GraphBuildCounters,
 ): void {
   const { evidence } = input;
@@ -526,6 +534,17 @@ function addMarkerFacts(
           break;
         case 'schema.column':
           addColumn(builder, evidence, file, marker);
+          break;
+        case 'schema.foreign_key':
+          addForeignKey(builder, evidence, file, marker);
+          break;
+        case 'sql.query':
+          addSqlQuery(builder, evidence, file, marker, moduleId, symbolIndex);
+          break;
+        case 'control.branch':
+        case 'control.loop':
+        case 'control.handler':
+          addControlFlow(builder, evidence, file, marker, symbolIndex);
           break;
         case 'manifest.dependency':
           addDeclaredDependency(builder, evidence, file, moduleId, marker);
@@ -654,9 +673,187 @@ function addColumn(
     path: file.path,
     evidence: [markerEvidence],
     confidence: 'EXPLICIT',
-    attributes: { table, dataType: marker.attributes.dataType ?? null },
+    attributes: {
+      table,
+      dataType: marker.attributes.dataType ?? null,
+      // What the DDL actually constrains. These are facts about the schema, not inferences
+      // from a column's name, and the ER projection draws them because they are stated.
+      primaryKey: marker.attributes.primaryKey === true,
+      notNull: marker.attributes.notNull === true,
+      unique: marker.attributes.unique === true,
+      ...(marker.attributes.referencesTable ? { referencesTable: String(marker.attributes.referencesTable) } : {}),
+    },
   });
   builder.addEdge({ from: tableId, to: columnId, kind: 'contains', confidence: 'EXPLICIT', evidence: [markerEvidence] });
+}
+
+/**
+ * Records an explicit foreign key as a relationship between two tables.
+ *
+ * Created only from a `REFERENCES` clause or a table-level `FOREIGN KEY` constraint. A column
+ * named `report_id` is not a foreign key because of its name, and the ER projection reports
+ * that absence rather than inferring the relationship from naming.
+ */
+function addForeignKey(
+  builder: SoftwareGraphBuilder,
+  evidence: EvidenceStore,
+  file: ParsedFileRef,
+  marker: ParsedFileRef['markers'][number],
+): void {
+  const table = String(marker.attributes.table ?? '');
+  const column = String(marker.attributes.column ?? '');
+  const referencesTable = String(marker.attributes.referencesTable ?? '');
+  if (table.length === 0 || column.length === 0 || referencesTable.length === 0) return;
+
+  const fromId = nodeId('table', table);
+  const toId = nodeId('table', referencesTable);
+  // Both endpoints must exist: a relationship to a table this analysis never read is not
+  // representable, and creating the target would assert a table the repository does not show.
+  if (!builder.hasNode(fromId) || !builder.hasNode(toId)) return;
+
+  const markerEvidence = evidence.add({
+    kind: 'SCHEMA_DDL',
+    path: file.path,
+    startLine: marker.line,
+    endLine: marker.line,
+    symbol: `${table}.${column}`,
+    excerpt: `FOREIGN KEY (${column}) REFERENCES ${referencesTable}${marker.attributes.referencesColumn ? `(${String(marker.attributes.referencesColumn)})` : ''}`,
+    producer: file.producer,
+  });
+
+  builder.addEdge({
+    from: fromId,
+    to: toId,
+    kind: 'references',
+    confidence: 'EXPLICIT',
+    evidence: [markerEvidence],
+    attributes: { column, ...(marker.attributes.referencesColumn ? { referencesColumn: String(marker.attributes.referencesColumn) } : {}) },
+  });
+}
+
+/**
+ * Records a SQL statement found in code as a read from, or a write to, the table it names.
+ *
+ * The relationship is stated by the code: the literal query names the table. Attributed to
+ * the enclosing function when the parser resolved one, because "this endpoint writes
+ * reports" is a more useful claim than "this module writes reports" — and when no function
+ * encloses the statement, the module is used and the edge is marked `WEEKLY_INFERRED`, since
+ * that is a weaker claim about who does it.
+ */
+function addSqlQuery(
+  builder: SoftwareGraphBuilder,
+  evidence: EvidenceStore,
+  file: ParsedFileRef,
+  marker: ParsedFileRef['markers'][number],
+  moduleId: string,
+  symbolIndex: ReadonlyMap<string, SymbolRef>,
+): void {
+  const table = String(marker.attributes.table ?? '');
+  const operation = String(marker.attributes.operation ?? 'read');
+  if (table.length === 0) return;
+
+  // The citation is created first because it is also the only evidence the referenced table
+  // will ever have. A query names a table without declaring it, so the evidence points at the
+  // query — "a statement referring to `analyses` appears here" — and the node is marked as
+  // not declared in any DDL this analysis read.
+  const markerEvidence = evidence.add({
+    kind: 'CALL_SITE',
+    path: file.path,
+    startLine: marker.line,
+    endLine: marker.line,
+    symbol: table,
+    excerpt: `${operation.toUpperCase()} ${table}`,
+    producer: file.producer,
+  });
+
+  const tableId = nodeId('table', table);
+  if (!builder.hasNode(tableId)) {
+    // A query may name a table whose DDL this analysis did not read — an external or legacy
+    // schema. Recording the reference is still correct; the data projection reports the store
+    // as an unknown schema rather than inventing columns for it.
+    builder.addNode({
+      kind: 'table',
+      name: table,
+      qualifiedName: table,
+      evidence: [markerEvidence],
+      confidence: 'UNKNOWN',
+      attributes: { declaredInDdl: false },
+    });
+  }
+
+  const scopeName = typeof marker.attributes.scope === 'string' ? marker.attributes.scope : undefined;
+  const scoped = scopeName ? symbolIndex.get(scopeName) : undefined;
+  const fromId = scoped?.id ?? moduleId;
+
+  builder.addEdge({
+    from: fromId,
+    to: tableId,
+    kind: operation === 'write' ? 'writes' : 'reads',
+    confidence: scoped ? 'EXPLICIT' : 'WEEKLY_INFERRED',
+    evidence: [markerEvidence],
+    attributes: { operation, ...(scoped ? {} : { scopeUnknown: true }) },
+  });
+}
+
+/**
+ * Records an explicit branch, loop or handler as a decision point owned by the function it
+ * appears in.
+ *
+ * The edge kind distinguishes a loop from a branch, and the condition is stored verbatim as
+ * written, because an activity diagram that paraphrases the repository's own condition is
+ * showing something the repository does not say.
+ */
+function addControlFlow(
+  builder: SoftwareGraphBuilder,
+  evidence: EvidenceStore,
+  file: ParsedFileRef,
+  marker: ParsedFileRef['markers'][number],
+  symbolIndex: ReadonlyMap<string, SymbolRef>,
+): void {
+  const scopeName = typeof marker.attributes.scope === 'string' ? marker.attributes.scope : undefined;
+  const scope = scopeName ? symbolIndex.get(scopeName) : undefined;
+  // A condition outside any named scope has no owner, and attaching it to the module would
+  // make module-level setup look like a step of some function's workflow.
+  if (!scope) return;
+
+  const flow = String(marker.attributes.flow ?? 'branch');
+  const condition = typeof marker.attributes.condition === 'string' ? marker.attributes.condition : undefined;
+
+  const markerEvidence = evidence.add({
+    kind: 'DECLARATION',
+    path: file.path,
+    startLine: marker.line,
+    endLine: marker.line,
+    symbol: scope.qualifiedName,
+    excerpt: condition ? `${flow}: ${condition}` : flow,
+    producer: file.producer,
+  });
+
+  // Keyed by owner and line so two conditions on the same line stay distinct, and so the id
+  // is stable across runs.
+  const conditionId = nodeId('condition', `${scope.qualifiedName}#${marker.line}:${flow}`);
+  builder.addNode({
+    kind: 'condition',
+    name: condition ?? flow,
+    qualifiedName: `${scope.qualifiedName}#${marker.line}`,
+    path: file.path,
+    startLine: marker.line,
+    evidence: [markerEvidence],
+    confidence: 'EXPLICIT',
+    attributes: {
+      flow,
+      ...(condition ? { condition } : {}),
+      scope: scope.qualifiedName,
+    },
+  });
+
+  builder.addEdge({
+    from: scope.id,
+    to: conditionId,
+    kind: flow === 'loop' ? 'loops' : 'branches',
+    confidence: 'EXPLICIT',
+    evidence: [markerEvidence],
+  });
 }
 
 /**

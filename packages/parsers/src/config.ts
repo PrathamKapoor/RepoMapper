@@ -320,29 +320,99 @@ function scalarToString(value: unknown): string | null {
   return null;
 }
 
-/** Reads `CREATE TABLE` statements so ER projection has a source of truth. */
+/**
+ * Reads `CREATE TABLE` statements so the ER projection has a source of truth.
+ *
+ * Beyond names and types, this records what the DDL actually constrains: primary keys,
+ * foreign-key targets, nullability and uniqueness. Those are the facts that turn a list of
+ * columns into a schema. They are read from the statement rather than inferred from column
+ * names, because a column called `report_id` is not a foreign key unless the DDL says so.
+ */
 function parseSql(source: string, result: ParsedFile): void {
   const tableMarkers: Marker[] = [];
   const columnMarkers: Marker[] = [];
+  const foreignKeyMarkers: Marker[] = [];
   const tablePattern = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["'`]?([\w.]+)["'`]?\s*\(([\s\S]*?)\)\s*;/gi;
   let match: RegExpExecArray | null;
   while ((match = tablePattern.exec(source)) !== null) {
     const table = match[1];
     if (!table) continue;
+    const tableLine = lineOfIndex(source, match.index);
 
+    // Column-level constraints, collected before the columns so each column marker can carry
+    // them. A table-level `PRIMARY KEY (a, b)` is folded in afterwards.
+    const inline = new Map<string, { primaryKey: boolean; notNull: boolean; unique: boolean; references?: string }>();
+    const tablePrimaryKey: string[] = [];
     const columns: string[] = [];
+
     for (const raw of splitTopLevel(match[2] ?? '')) {
       const column = raw.trim();
       if (column.length === 0) continue;
-      if (/^(PRIMARY|FOREIGN|UNIQUE|KEY|CONSTRAINT|INDEX|CHECK)\b/i.test(column)) continue;
-      const name = /^["'`]?([\w]+)["'`]?/.exec(column)?.[1];
+
+      const reference = /\bREFERENCES\s+["'`]?([\w.]+)["'`]?(?:\s*\(\s*["'`]?(\w+)["'`]?\s*\))?/i.exec(column);
+      if (reference?.[1]) {
+        // Recorded as its own relationship rather than as a column attribute, so the ER
+        // projection can draw the relationship and the consistency engine can check it.
+        foreignKeyMarkers.push({
+          name: 'schema.foreign_key',
+          line: tableLine,
+          attributes: {
+            table,
+            column: (columnName(column) ?? '').length > 0 ? columnName(column)! : '',
+            referencesTable: reference[1],
+            ...(reference[2] ? { referencesColumn: reference[2] } : {}),
+          },
+        });
+      }
+
+      if (/^PRIMARY\s+KEY\b/i.test(column)) {
+        tablePrimaryKey.push(...(columnNameList(column, 'PRIMARY\\s+KEY') ?? []));
+        continue;
+      }
+      if (/^FOREIGN\s+KEY\b/i.test(column)) {
+        const names = columnNameList(column, 'FOREIGN\\s+KEY') ?? [];
+        const target = /\bREFERENCES\s+["'`]?([\w.]+)["'`]?/i.exec(column)?.[1];
+        if (target) {
+          for (const name of names) {
+            foreignKeyMarkers.push({
+              name: 'schema.foreign_key',
+              line: tableLine,
+              attributes: { table, column: name, referencesTable: target },
+            });
+          }
+        }
+        continue;
+      }
+      if (/^(UNIQUE|KEY|INDEX|CONSTRAINT|CHECK)\b/i.test(column)) continue;
+
+      const name = columnName(column);
       if (!name) continue;
-      const type = /\b(\w+(?:\s+\w+)*)\s*(?:\([^)]*\))?\s*(?:NOT\s+NULL|NULL|DEFAULT|$)/i.exec(column.slice(name.length))?.[1];
+      const body = column.slice(name.length);
+      inline.set(name, {
+        primaryKey: /\bPRIMARY\s+KEY\b/i.test(body),
+        notNull: /\bNOT\s+NULL\b/i.test(body),
+        unique: /\bUNIQUE\b/i.test(body),
+        ...(reference?.[1] ? { references: reference[1] } : {}),
+      });
       columns.push(name);
+    }
+
+    for (const name of columns) {
+      const flags = inline.get(name) ?? { primaryKey: false, notNull: false, unique: false };
+      const isPrimary = flags.primaryKey || tablePrimaryKey.includes(name);
       columnMarkers.push({
         name: 'schema.column',
-        line: lineOfIndex(source, match.index),
-        attributes: { table, column: name, dataType: type?.trim() ?? null },
+        line: tableLine,
+        attributes: {
+          table,
+          column: name,
+          dataType: typeOf(columnDefinition(source, table, name)) ?? null,
+          // A primary key is always NOT NULL, whatever the DDL says or omits.
+          primaryKey: isPrimary,
+          notNull: flags.notNull || isPrimary,
+          unique: flags.unique,
+          ...(flags.references ? { referencesTable: flags.references } : {}),
+        },
       });
     }
 
@@ -351,12 +421,54 @@ function parseSql(source: string, result: ParsedFile): void {
     // column, because a column with no owning table is not representable.
     tableMarkers.push({
       name: 'schema.table',
-      line: lineOfIndex(source, match.index),
-      attributes: { table, columnCount: columns.length },
+      line: tableLine,
+      attributes: {
+        table,
+        columnCount: columns.length,
+        primaryKey: tablePrimaryKey.join(','),
+      },
     });
   }
 
-  result.markers.push(...tableMarkers, ...columnMarkers);
+  result.markers.push(...tableMarkers, ...columnMarkers, ...foreignKeyMarkers);
+}
+
+/** The identifier at the start of a column or constraint definition, unquoted. */
+function columnName(definition: string): string | undefined {
+  return /^["'`]?([A-Za-z_]\w*)["'`]?/.exec(definition.trim())?.[1];
+}
+
+/** The parenthesised column list of a table-level constraint, e.g. `PRIMARY KEY (a, b)`. */
+function columnNameList(definition: string, keyword: string): string[] | undefined {
+  const list = new RegExp(`${keyword}\\s*\\(([^)]*)\\)`, 'i').exec(definition)?.[1];
+  if (!list) return undefined;
+  const names = list
+    .split(',')
+    .map((entry) => columnName(entry))
+    .filter((name): name is string => Boolean(name));
+  return names.length > 0 ? names : undefined;
+}
+
+/** The declared type of a column, found by locating its definition in the source. */
+function columnDefinition(source: string, table: string, column: string): string | undefined {
+  const pattern = new RegExp(`CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?["'\`]?${table}["'\`]?\\s*\\(([\\s\\S]*?)\\)\\s*;`, 'i');
+  const body = pattern.exec(source)?.[1];
+  if (!body) return undefined;
+  for (const raw of splitTopLevel(body)) {
+    const definition = raw.trim();
+    if (columnName(definition) === column) return definition;
+  }
+  return undefined;
+}
+
+function typeOf(definition: string | undefined): string | undefined {
+  if (!definition) return undefined;
+  const name = columnName(definition);
+  if (!name) return undefined;
+  const type = /\b(\w+(?:\s+\w+)*)\s*(?:\([^)]*\))?\s*(?:NOT\s+NULL|NULL|DEFAULT|PRIMARY|UNIQUE|$)/i.exec(
+    definition.slice(name.length),
+  )?.[1];
+  return type?.trim();
 }
 
 /** Strips `//` and `/* *\/` comments and trailing commas so JSONC parses as JSON. */

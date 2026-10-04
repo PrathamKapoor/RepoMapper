@@ -138,6 +138,14 @@ export const NODE_KINDS = [
   'configuration',
   'commit',
   'contributor',
+  /**
+   * A decision point in the control flow of an enclosing function.
+   *
+   * Created only from an explicit branch, loop or handler in source. Nothing infers a state
+   * machine from an entity that happens to have create, read and update operations: the
+   * absence of a state model must be reported as unsupported rather than drawn.
+   */
+  'condition',
 ] as const;
 
 export type NodeKind = (typeof NODE_KINDS)[number];
@@ -213,6 +221,11 @@ export const EDGE_KINDS = [
   'supersedes',
   'authored_by',
   'configures',
+  // Phase 3. Control flow and schema relationships, so behaviour and data projections read
+  // facts from the graph rather than re-parsing source in a projection.
+  'branches',
+  'loops',
+  'references',
 ] as const;
 
 export type EdgeKind = (typeof EDGE_KINDS)[number];
@@ -382,6 +395,14 @@ export interface ExtractedEntity {
   implementsFrom?: string[];
   modifiers?: string[];
   signature?: string;
+  /**
+   * True when the source marks this callable `async`.
+   *
+   * Recorded because a sequence diagram that shows a synchronous call to an `async` function
+   * is describing something the code does not do. Absent means the source did not say, which
+   * is not the same as synchronous.
+   */
+  isAsync?: boolean;
 }
 
 export const EXTRACTABLE_ENTITY_KINDS = [

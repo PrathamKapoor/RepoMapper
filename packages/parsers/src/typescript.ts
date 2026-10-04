@@ -111,6 +111,12 @@ function visit(node: ts.Node, ctx: WalkContext): void {
     handleCallExpression(node, ctx);
   }
 
+  // Control flow is recorded only from explicit source constructs. Nothing downstream infers
+  // a branch or a loop from the shape of a call graph: an activity diagram built from calls
+  // would be a diagram of the dependency structure wearing a workflow's clothes.
+  const flow = controlFlowMarker(node, ctx);
+  if (flow) ctx.result.markers.push(flow);
+
   const declaration = describeDeclaration(node, ctx);
   if (declaration) {
     ctx.result.entities.push(declaration.entity);
@@ -148,8 +154,22 @@ function describeDeclaration(node: ts.Node, ctx: WalkContext): DeclarationDescri
   });
 
   if (ts.isFunctionDeclaration(node) && node.name) {
-    return base('function', node.name.text, node, { signature: signatureOf(node, ctx) }, true);
+    const modifiers = modifiersOf(node);
+    return base(
+      'function',
+      node.name.text,
+      node,
+      {
+        signature: signatureOf(node, ctx),
+        modifiers,
+        // Explicitly `async`, or explicitly not. Absent would mean "the source did not say",
+        // which for a declaration is a different claim from "synchronous".
+        ...(modifiers?.includes('async') ? { isAsync: true } : { isAsync: false }),
+      },
+      true,
+    );
   }
+
 
   if (ts.isClassDeclaration(node)) {
 return base(
@@ -192,16 +212,21 @@ if (ts.isEnumDeclaration(node)) {
   if (ts.isMethodDeclaration(node)) {
     const name = propertyNameText(node.name);
     if (!name) return undefined;
+    const modifiers = modifiersOf(node);
     return base(
       'function',
       name,
       node,
-      { signature: signatureOf(node, ctx), modifiers: modifiersOf(node) },
+      {
+        signature: signatureOf(node, ctx),
+        modifiers,
+        ...(modifiers?.includes('async') ? { isAsync: true } : { isAsync: false }),
+      },
       true,
     );
   }
 
-if (ts.isConstructorDeclaration(node)) {
+  if (ts.isConstructorDeclaration(node)) {
     return base('function', 'constructor', node, { signature: signatureOf(node, ctx) }, true);
   }
 
@@ -216,7 +241,14 @@ if (ts.isConstructorDeclaration(node)) {
       functional ? 'function' : 'constant',
       name,
       node,
-      functional ? { signature: signatureOf(node.initializer as ts.SignatureDeclaration, ctx) } : {},
+      {
+        ...(functional
+          ? {
+              signature: signatureOf(node.initializer as ts.SignatureDeclaration, ctx),
+              isAsync: hasAsyncModifier(node.initializer),
+            }
+          : {}),
+      },
       functional,
     );
   }
@@ -229,7 +261,12 @@ if (ts.isConstructorDeclaration(node)) {
       node.name.text,
       node,
       {
-        ...(functional ? { signature: signatureOf(node.initializer as ts.SignatureDeclaration, ctx) } : {}),
+        ...(functional
+          ? {
+              signature: signatureOf(node.initializer as ts.SignatureDeclaration, ctx),
+              isAsync: hasAsyncModifier(node.initializer),
+            }
+          : {}),
         ...(typeText ? { attributes: { declaredType: typeText } } : {}),
       },
       functional,
@@ -293,6 +330,9 @@ function handleCallExpression(node: ts.CallExpression, ctx: WalkContext): void {
       ctx.result.imports.push(makeImport(first.text, node, ctx, 'require'));
     }
   }
+
+  const query = sqlQueryMarker(node.arguments, ctx);
+  if (query) ctx.result.markers.push(query);
 
 const route = routeMarker(node, ctx);
   if (route) ctx.result.markers.push(route);
@@ -509,6 +549,161 @@ function propertyNameText(name: ts.PropertyName): string | undefined {
 function isArrowOrFunction(node: ts.Node): boolean {
   return ts.isArrowFunction(node) || ts.isFunctionExpression(node);
 }
+
+/** True when a function expression or arrow carries the `async` modifier. */
+function hasAsyncModifier(node: ts.Node): boolean {
+  try {
+    return modifiersOf(node)?.includes('async') ?? false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Control-flow constructs, mapped to the marker that records them.
+ *
+ * A `try` is recorded as a `handler` rather than a branch: the interesting fact is that an
+ * exception path exists at all, and a `catch` clause is where the repository states what
+ * happens when something fails.
+ */
+type ControlFlowKind = 'branch' | 'loop' | 'handler';
+
+function controlFlowMarker(node: ts.Node, ctx: WalkContext): Marker | undefined {
+  const kind = controlFlowKind(node);
+  if (!kind) return undefined;
+
+  // Attributed to the innermost named scope. A condition in a module-level statement has no
+  // scope to attach to, and inventing one would produce an unattached decision point.
+  const scope = ctx.stack.at(-1);
+  if (!scope) return undefined;
+
+  const condition = controlFlowCondition(node, ctx.sourceFile);
+  return {
+    name: `control.${kind}`,
+    line: lineOf(ctx, safeStart(node, ctx)),
+    attributes: {
+      flow: kind,
+      scope,
+      ...(condition ? { condition } : {}),
+    },
+  };
+}
+
+function controlFlowKind(node: ts.Node): ControlFlowKind | undefined {
+  if (ts.isIfStatement(node) || ts.isSwitchStatement(node) || ts.isConditionalExpression(node)) return 'branch';
+  if (
+    ts.isForStatement(node) ||
+    ts.isForInStatement(node) ||
+    ts.isForOfStatement(node) ||
+    ts.isWhileStatement(node) ||
+    ts.isDoStatement(node)
+  ) {
+    return 'loop';
+  }
+  if (ts.isTryStatement(node)) return 'handler';
+  return undefined;
+}
+
+/**
+ * The condition as written, collapsed to one line.
+ *
+ * Truncated because a generated condition can be arbitrarily long, and the projection shows
+ * it as a label rather than as code.
+ */
+function controlFlowCondition(node: ts.Node, sourceFile: ts.SourceFile): string | undefined {
+  let expression: ts.Expression | undefined;
+  if (ts.isIfStatement(node)) expression = node.expression;
+  else if (ts.isConditionalExpression(node)) expression = node.condition;
+  else if (ts.isSwitchStatement(node)) expression = node.expression;
+  else if (ts.isWhileStatement(node) || ts.isDoStatement(node)) expression = node.expression;
+  else if (ts.isForStatement(node)) expression = node.condition;
+  else if (ts.isForInStatement(node) || ts.isForOfStatement(node)) expression = node.expression;
+
+  if (!expression) return undefined;
+  try {
+    const text = expression.getText(sourceFile).replace(/\s+/g, ' ').trim();
+    return text.length > 0 ? text.slice(0, 120) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A SQL statement passed as a string literal to a call.
+ *
+ * This is the only place data flow comes from: a `reads`/`writes` edge exists when the code
+ * literally contains a query naming a table. No ORM, repository naming convention or
+ * "module looks like a data layer" heuristic is used, because each of those produces data
+ * flow that the repository never states.
+ */
+function sqlQueryMarker(args: readonly ts.Expression[], ctx: WalkContext): Marker | undefined {
+  for (const argument of args) {
+    if (!ts.isStringLiteralLike(argument)) continue;
+    const statement = parseSqlStatement(argument.text);
+    if (!statement) continue;
+    return {
+      name: 'sql.query',
+      line: lineOf(ctx, safeStart(argument, ctx)),
+      attributes: {
+        operation: statement.operation,
+        table: statement.table,
+      },
+    };
+  }
+  return undefined;
+}
+
+/**
+ * Recognises a single-table SQL statement written in a string literal.
+ *
+ * Deliberately narrow: one statement, one table, no joins and no subquery. A join names two
+ * tables and the code does not say which of them this call reads or writes, so such a
+ * statement is reported as unsupported by the data projection rather than attributed to the
+ * first table matched.
+ */
+export function parseSqlStatement(text: string): { operation: string; table: string } | null {
+  const statement = text.replace(/\s+/g, ' ').trim().replace(/;$/, '');
+  if (statement.length === 0) return null;
+
+  const single = (primary: RegExp, other: readonly RegExp[]): boolean => {
+    if (countMatches(statement, primary) !== 1) return false;
+    return other.every((pattern) => countMatches(statement, pattern) === 0);
+  };
+
+  const select = /^SELECT\s+.+?\s+FROM\s+([A-Za-z_][\w.]*)/i.exec(statement);
+  if (select && single(/\bFROM\s+[A-Za-z_][\w.]*/gi, [/\bJOIN\s+[A-Za-z_][\w.]*/gi])) {
+    return tableOf('read', select[1]);
+  }
+
+  const insert = /^INSERT\s+INTO\s+([A-Za-z_][\w.]*)/i.exec(statement);
+  if (insert && single(/\bINTO\s+[A-Za-z_][\w.]*/gi, [/\bFROM\s+/gi])) {
+    return tableOf('write', insert[1]);
+  }
+
+  const update = /^UPDATE\s+([A-Za-z_][\w.]*)\s+SET\s+/i.exec(statement);
+  if (update && single(/\bUPDATE\s+[A-Za-z_][\w.]*/gi, [/\bFROM\s+/gi, /\bJOIN\s+/gi])) {
+    return tableOf('write', update[1]);
+  }
+
+  const del = /^DELETE\s+FROM\s+([A-Za-z_][\w.]*)/i.exec(statement);
+  if (del && single(/\bFROM\s+[A-Za-z_][\w.]*/gi, [/\bJOIN\s+[A-Za-z_][\w.]*/gi])) {
+    return tableOf('write', del[1]);
+  }
+
+  return null;
+}
+
+function countMatches(text: string, pattern: RegExp): number {
+  return [...text.matchAll(pattern)].length;
+}
+
+/** Normalises a possibly quoted, possibly qualified table name to its bare name. */
+function tableOf(operation: string, raw: string | undefined): { operation: string; table: string } | null {
+  if (!raw) return null;
+  const table = raw.replace(/^["`[]|["`\]]$/g, '').split('.').at(-1);
+  return table ? { operation, table } : null;
+}
+
 
 function modifiersOf(node: ts.Node): string[] | undefined {
   if (!ts.canHaveModifiers(node)) return undefined;
