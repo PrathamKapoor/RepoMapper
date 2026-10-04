@@ -51,13 +51,39 @@ const TABS: { id: TabId; label: string }[] = [
   { id: 'diagnostics', label: 'Diagnostics' },
 ];
 
+const TAB_IDS = new Set<string>(TABS.map((entry) => entry.id));
+
+/** C4 levels, used to resolve a `#/c4/<level>` deep link. */
+const C4_LEVELS_LOCAL = new Set(['context', 'container', 'component']);
+
+/**
+ * Reads the tab from the URL fragment, e.g. `#/drift` or `#/c4/container`.
+ *
+ * Deep links are worth having on their own: an architecture or drift view is the thing a
+ * person wants to send to a colleague, and a link that always lands on Overview cannot be.
+ * They also make every screen reachable without a mouse, which is what lets each one be
+ * verified by loading a URL rather than by clicking — the only way this repository can check
+ * that the views render, since it has no browser test harness.
+ */
+function tabFromHash(): TabId {
+  // Only the first segment names the tab; a second segment is a view within it (`c4/container`).
+  const [candidate] = window.location.hash.replace(/^#\/?/, '').split('/');
+  return candidate !== undefined && TAB_IDS.has(candidate) ? (candidate as TabId) : 'overview';
+}
+
+/** Reads the C4 level from `#/c4/<level>`, defaulting to the first level. */
+export function c4LevelFromHash(): 'context' | 'container' | 'component' {
+  const [, level] = window.location.hash.replace(/^#\/?/, '').split('/');
+  return C4_LEVELS_LOCAL.has(level ?? '') ? (level as 'context' | 'container' | 'component') : 'context';
+}
+
 export function App(): React.ReactElement {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
   const [analyses, setAnalyses] = useState<AnalysisListEntry[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<AnalysisDetail | null>(null);
-  const [tab, setTab] = useState<TabId>('overview');
+  const [tab, setTab] = useState<TabId>(tabFromHash);
   // The inspector carries its own analysis id: a drift row can be a fact about the *base*
   // snapshot, whose entity does not exist in the analysis currently selected in the sidebar.
   const [inspect, setInspect] = useState<{ analysisId: string; nodeId: string } | null>(null);
@@ -70,6 +96,26 @@ export function App(): React.ReactElement {
     },
     [selectedId],
   );
+
+  // Keeps the fragment in step with the tab, so the current view can be copied or reloaded.
+  // A tab with its own levels keeps the level segment.
+  const selectTab = useCallback((next: TabId) => {
+    setTab(next);
+    const hash = next === 'c4' ? `#/c4/${c4LevelFromHash()}` : `#/${next}`;
+    if (window.location.hash !== hash) window.location.hash = hash;
+  }, []);
+
+  // A fragment change made outside React — pasted into the address bar, or a link opened in
+  // the same tab — must switch the view too. Without this, a deep link works on a fresh load
+  // and silently does nothing in an already-open application.
+  useEffect(() => {
+    const onHashChange = (): void => {
+      setTab(tabFromHash());
+      setInspect(null);
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
 
   const refreshAnalyses = useCallback(async () => {
     try {
@@ -136,7 +182,7 @@ export function App(): React.ReactElement {
                   const result = await api.createAnalysis({ repositoryPath, ...(label ? { label } : {}) });
                   await refreshAnalyses();
                   setSelectedId(result.analysis.id);
-                  setTab('overview');
+                  selectTab('overview');
                 } catch (cause) {
                   setError(describeApiError(cause));
                 } finally {
@@ -198,7 +244,7 @@ export function App(): React.ReactElement {
                       key={entry.id}
                       type="button"
                       className={tab === entry.id ? 'active' : ''}
-                      onClick={() => setTab(entry.id)}
+                      onClick={() => selectTab(entry.id)}
                     >
                       {entry.label}
                     </button>
@@ -209,7 +255,7 @@ export function App(): React.ReactElement {
                 {tab === 'architecture' ? (
                   <ProjectionTab analysisId={selectedId} artifactKinds={['dependency-graph', 'er-diagram']} onSelectNode={selectNode} />
                 ) : null}
-                {tab === 'c4' ? <C4Tab analysisId={selectedId} onSelectNode={selectNode} /> : null}
+                {tab === 'c4' ? <C4Tab analysisId={selectedId} onSelectNode={selectNode} initialLevel={c4LevelFromHash()} /> : null}
                 {tab === 'structure' ? (
                   <ProjectionTab analysisId={selectedId} artifactKinds={['module-graph', 'class-diagram']} onSelectNode={selectNode} />
                 ) : null}

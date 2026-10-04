@@ -12,8 +12,10 @@ The canonical graph now has the two things it was missing: a comparable identity
 repository state, and an architecture view derived only from that state.
 
 The product is **usable and deployable for its stated scope** and **explicitly partial**
-beyond it. Browser rendering remains **unknown** — see §8. Per-capability status is in
-`docs/verification.md`.
+beyond it. Browser rendering moved from *unknown* to *partially verified* during this phase —
+a real headless Chromium is now driven over the DevTools Protocol with no added dependency
+(D-041). Visual layout, zoom, drag and non-Chromium browsers remain unverified — see §8.
+Per-capability status is in `docs/verification.md`.
 
 ---
 
@@ -170,7 +172,8 @@ Three invariants now hold the design together:
 | D-030 | `EVIDENCE_MOVED` deleted as unreachable; replaced by `EVIDENCE_CHANGED` |
 | D-033 | C4 is a mapper over the graph; an unsupported arrow is dropped, not drawn |
 | D-034 | Code is attributed to a container by its build context, **in extraction** |
-| D-036 | UI decisions live in testable functions because no browser test exists |
+| D-036 | UI decisions live in testable functions, so they can be tested without a DOM |
+| D-041 | Browser verification driven over CDP with no dependency; the UI moved from unknown to partially verified |
 | D-039 | Compose volumes and base images are not containers (bug found by real C4) |
 | D-040 | Git's dubious-ownership guard is not disabled |
 
@@ -221,10 +224,15 @@ Phase 2 verification, recorded with output in `docs/verification.md`:
 - **Container.** Rebuilt, run healthy, both Phase 2 endpoints exercised, `schemaVersion: 2`
   after D-038, a rename detected across two host-side analyses, `/etc` and
   `/repos/fixture/../..` both refused with 403.
+- **Browser.** Real headless Chromium, driven over the DevTools Protocol by
+  `scripts/verify-browser.mjs` with no added dependency. **27/27** checks against a fixture
+  with two analyses, **24/24** against this repository. Covers rendering and the click paths:
+  every tab, all three C4 levels with their omission tables, selecting a C4 element to reveal
+  its derivation and evidence, and a drift row drilling through to the entity inspector.
 
-**Not verified:** browser rendering of any screen, including C4 and Drift. The decisions
-those views make are unit-tested; that React draws them is not. No benchmark numbers are
-claimed. See `docs/verification.md` §5 for the full list.
+**Not verified:** visual layout, styling and responsive behaviour at any viewport; React Flow
+zoom, pan and drag; and any browser other than the Chromium builds installed here. No
+benchmark numbers are claimed. See `docs/verification.md` §5 for the full list.
 
 ---
 
@@ -232,7 +240,8 @@ claimed. See `docs/verification.md` §5 for the full list.
 
 | Issue | Impact | Status |
 |---|---|---|
-| The UI has still never been opened in a real browser | A React runtime error, layout failure or broken React Flow canvas would not be caught by any current check | Known gap. `npm run dev:web`, open `localhost:5173`. UI *logic* is unit-tested (D-036) |
+| Visual layout, zoom, drag and non-Chromium browsers | The browser driver asserts on DOM content and node counts, not on appearance; a visual regression would not be caught | Known gap. Open `localhost:5173` by eye, or extend the driver with a screenshot comparison |
+| A deep link pasted into an already-open tab did nothing | Found by browser verification: the tab was initialised once and ignored `hashchange` | Fixed in `app.tsx`. Deep links now work in an open application |
 | C4 component boundaries come from a declared build context | A build context says what is sent to the builder, not what the image runs | Accepted and labelled `STRONGLY_INFERRED`; the caveat travels on the edge (D-034) |
 | Rename detection is whole-file and content-exact | A moved class, or a rename whose content changed, is removed + added | Deliberate. Proved rather than guessed (D-029) |
 | A container with an image but no build context gets no components | Level 3 is empty for such repositories | Recorded in `omitted[]`. Dockerfile `COPY` analysis would fix it |
@@ -272,8 +281,8 @@ Ordered by what unblocks the most downstream value. None of these are started.
    missing.
 8. **Wider language coverage** via `web-tree-sitter`, per D-003.
 9. **API auth and rate limiting** if the service is ever exposed beyond localhost.
-10. **Browser verification**, and possibly a DOM test harness, so the UI's status can move
-    from `unknown`.
+10. **Visual-regression checks.** The browser driver exists; a screenshot comparison would catch
+    layout changes. It would not replace the driver.
 11. **Coverage measurement** and closing any gaps it reveals.
 
 ---
@@ -290,8 +299,8 @@ Why this order:
   already in the graph.
 - Dockerfile `COPY` analysis is the smallest change that would turn C4 component boundaries
   from an inference into a citation, and it improves every future view that touches deployment.
-- Browser verification should happen before more UI is built on top. Every additional screen
-  multiplies the unverified surface.
+- `scripts/verify-browser.mjs` now runs against every screen. Extend it as screens are added:
+  a new view nobody checks is a new unverified surface.
 
 Concrete first steps:
 
@@ -305,7 +314,8 @@ Concrete first steps:
 4. Expose `GET /api/analyses/:id/consistency` and add it to the UI next to Gaps.
 5. Add cross-artifact consistency tests: a graph edge removed must change the C4 projection,
    and a drift-visible change must be visible in C4.
-6. Open the UI in a real browser and record what actually renders in `docs/verification.md`.
+6. Extend the browser driver to cover the new view, and add a screenshot comparison so layout
+   regressions are caught rather than judged by eye.
 
 ---
 
@@ -315,6 +325,10 @@ Things that are not obvious from the code and cost time to rediscover:
 
 - **Tests resolve packages through `dist/`.** No alias exists, so `npx vitest run` after an
   edit tests the *previous* build. Use `npm run verify` (D-035).
+- **`scripts/verify-browser.mjs` needs a running server and two analyses.** It polls on content,
+  never on a timer. If a check fails, read the reported URL and the DOM text it saw before
+  concluding the product is broken — the driver's own URL handling has already caused two false
+  failures (a query appended after the fragment, and a too-weak readiness check).
 - **`getText()` requires an explicit source file.** `setParentNodes: false` means
   `node.getText()` throws and silently aborts the rest of that file's parse (D-009).
 - **The symbol index must be complete before relationships resolve**, or extraction becomes

@@ -58,16 +58,29 @@ export interface C4TabProps {
   analysisId: string;
   /** Opens the graph entity inspector for a graph node id. */
   onSelectNode: (nodeId: string) => void;
+  /** Level requested through the URL fragment, e.g. `#/c4/container`. */
+  initialLevel?: C4Level;
 }
 
-export function C4Tab({ analysisId, onSelectNode }: C4TabProps): React.ReactElement {
-  const [level, setLevel] = useState<C4Level>('context');
+export function C4Tab({ analysisId, onSelectNode, initialLevel }: C4TabProps): React.ReactElement {
+  const [level, setLevel] = useState<C4Level>(initialLevel ?? 'context');
   const [artifact, setArtifact] = useState<Artifact | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
   const descriptor = LEVELS.find((entry) => entry.id === level) ?? LEVELS[0]!;
+
+  // The level is part of the deep link, so a container or component view can be shared and
+  // reloaded rather than only reached by clicking through from context.
+  const chooseLevel = useCallback((next: C4Level) => {
+    setLevel(next);
+    if (window.location.hash !== `#/c4/${next}`) window.location.hash = `#/c4/${next}`;
+  }, []);
+
+  useEffect(() => {
+    if (initialLevel) setLevel(initialLevel);
+  }, [initialLevel]);
 
   useEffect(() => {
     let cancelled = false;
@@ -116,7 +129,7 @@ export function C4Tab({ analysisId, onSelectNode }: C4TabProps): React.ReactElem
             key={entry.id}
             type="button"
             className={entry.id === level ? 'primary' : ''}
-            onClick={() => setLevel(entry.id)}
+            onClick={() => chooseLevel(entry.id)}
           >
             {entry.label}
           </button>

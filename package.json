@@ -31,6 +31,7 @@
     "start": "node packages/server/dist/main.js",
     "analyze": "node packages/server/dist/cli.js",
     "verify": "npm run lint && npm run typecheck && npm run build && npm run test",
+    "verify:browser": "node scripts/verify-browser.mjs",
     "clean": "node scripts/clean.mjs"
   },
   "devDependencies": {

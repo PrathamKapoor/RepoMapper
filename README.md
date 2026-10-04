@@ -33,7 +33,7 @@ stated scope; deliberately incomplete beyond it. Per-capability status is in
 | Container image | Builds and runs; verified, including Phase 2 endpoints |
 | Languages parsed | TypeScript, JavaScript, Python (structural) |
 | Artifacts | Dependency graph, module structure, class diagram, ER diagram, C4 × 3 levels |
-| Browser rendering of the UI | **Unknown** — never opened in a real browser |
+| Browser rendering of the UI | **Partially verified** — driven in real headless Chromium, 27/27 checks; layout, zoom and non-Chromium browsers are not verified |
 | Not built | Sequence, DFD, use-case, activity, deployment diagrams; requirements; in-graph consistency checks; symbol-level and Git-corroborated renames; archive-upload endpoint; API auth and rate limiting |
 
 ## Quick start

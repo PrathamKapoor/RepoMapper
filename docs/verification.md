@@ -338,6 +338,55 @@ the container with *"detected dubious ownership in repository"*. RepoAtlas recor
 `GIT_UNAVAILABLE`, left `headCommit` empty and continued — the documented degradation path.
 See D-040 for why this is not silently disabled.
 
+### 4d. Browser — PARTIALLY VERIFIED
+
+Phase 1 recorded browser rendering as *unknown*. It is no longer unknown: a real headless
+Chromium was driven over the DevTools Protocol with **no added dependency**, because Node 24
+ships a global `WebSocket` (`scripts/verify-browser.mjs`, D-041).
+
+```
+npm run verify:browser -- http://127.0.0.1:4300 "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+```
+
+The driver navigates by URL, **waits on content rather than on a timer** — a fixed sleep would
+let a check pass against a page whose data had not arrived, which is how a broken view gets
+reported as a working one — dispatches real clicks, and reads the resulting DOM.
+
+**Run 1 — this repository, one analysis: 24/24 passed.**
+
+| Check | Result |
+|---|---|
+| Application loads, React mounts | pass |
+| All eight tabs render | pass — `Overview Architecture C4 Structure Drift Evidence Gaps Diagnostics` |
+| Stored analyses listed, health in the top bar | pass |
+| No allow-list warning shown while one is enforced | pass |
+| C4 context / container / component render, each with its omission table | pass — 2, 3 and 97 canvas nodes |
+| Selecting a C4 element opens the panel with its derivation, evidence and relationship support | pass |
+| The graph entity inspector opens for the same element; the cited file is reachable | pass |
+| **Drift with only one analysis** explains that it needs two, and does **not** say "nothing changed" | pass |
+| Architecture, Structure, Evidence, Gaps, Diagnostics render their content | pass |
+| No uncaught exceptions and no console errors | pass |
+
+**Run 2 — a fixture with two analyses and a real change between them: 27/27 passed.**
+
+| Check | Result |
+|---|---|
+| Drift renders the base/target identity table | pass |
+| Drift renders the change summary | pass |
+| Drift renders individual changes with evidence on both sides (`path:line` for each) | pass |
+| A change row offers an inspect action and drills through to the entity inspector | pass |
+
+**A real defect was found by this work.** Before it, a deep link worked on a fresh page load
+and silently did nothing in an already-open application, because the tab was initialised once
+and never reacted to `hashchange`. Fixed, with the `hashchange` listener now in
+`packages/web/src/app.tsx` — and deep links are worth having on their own, since an
+architecture or drift view is what a person wants to send to a colleague.
+
+**Still not verified, and deliberately not claimed:** visual layout, styling and responsive
+behaviour at any viewport; React Flow zoom, pan and drag; and any browser other than the
+Chromium builds installed here. The driver asserts on DOM content and node counts, not on
+appearance, so a visual regression would not be caught.
+
 ---
 
 ## 5. Not verified — read this
@@ -346,11 +395,11 @@ Stated plainly. None of these are claimed as working.
 
 | Item | Status | Why |
 |---|---|---|
-| **Browser rendering of the UI** | **Unknown** | The API, the built bundle and the served HTML shell are verified, and the C4 and Drift views' decision logic is unit-tested, but the UI has **never been opened in a real browser**. A React runtime error, a layout failure or a broken React Flow canvas would not be caught by any current check. Run `npm run dev:web` and open `localhost:5173`. |
-| **C4 rendering in a browser** | **Unknown** | The C4 model, its evidence, its confidence and its exports are verified through the API and in tests. Whether the C4 canvas, level selector and element panel render correctly on screen is unverified, for the same reason as the row above. |
-| **Drift rendering in a browser** | **Unknown** | Same. The report payload, every state it can be in, and the drill-through from a change row to the entity inspector are covered by tests at the logic level; the rendering is not. |
-| **Git-backed facts** (commits, contributors, ownership) | **Verified** | Confirmed against real history after the initial commit: `branch=main`, HEAD resolved, and `commit`, `contributor` and `authored_by` entities produced. `modifies` edges from multi-commit history are covered by unit tests. **Exception:** inside the container, a bind-mounted repository owned by another user is refused by `git` as dubious ownership, so no history is read there (D-040). |
-| **Sequence, DFD, use-case, activity and deployment diagrams** | **Not implemented** | Each needs graph facts that do not exist yet. Deliberately absent rather than drawn from guesses. C4 context, container and component levels **are** implemented and verified (§3e). |
+| **Browser rendering of the UI** | **Partially verified** | Driven in real headless Chromium via the DevTools Protocol (`scripts/verify-browser.mjs`): **27/27** checks pass against a fixture with two analyses, **24/24** against this repository. Rendering *and* the click paths are covered. **Still unverified:** visual layout and styling at any viewport, React Flow zoom and drag, and any non-Chromium browser. See §4d. |
+| **C4 rendering in a browser** | **Verified** | All three levels draw (1, 2 and 43 canvas nodes on the fixture; 2, 3 and 97 on this repository), each shows its omission table, and selecting an element opens its derivation, its evidence locations and the graph support of each relationship. |
+| **Drift rendering in a browser** | **Verified** | Identity table, change summary and individual changes with evidence on both sides render; a change row drills through to the entity inspector; the single-analysis empty state explains itself and is not presented as "nothing changed". |
+| **Git-backed facts** (commits, contributors, ownership) | **Verified** | Confirmed against real history: `branch=main`, HEAD resolved, and `commit`, `contributor` and `authored_by` entities produced. `modifies` edges from multi-commit history are covered by unit tests. **Exception:** inside the container, a bind-mounted repository owned by another user is refused by `git` as dubious ownership, so no history is read there (D-040). |
+| **Sequence, DFD, use-case, activity and deployment diagrams** | **Not implemented** | Each needs graph facts that do not exist yet. Deliberately absent rather than drawn from guesses. C4 context, container and component levels **are** implemented and verified (§3e, §4d). |
 | **Requirements extraction and traceability** | **Not implemented** | Needs document-structure parsing. |
 | **In-graph consistency checking** | **Not implemented** | Drift answers "what changed between two states". It does not look for contradictions *inside* one graph — a route with no handler, an import nothing calls, a table no code reads. |
 | **Symbol-level rename detection** | **Not implemented** | A class moved between files is reported as removed plus added. Only whole-file renames with unchanged content are proved (D-029). |
@@ -366,6 +415,7 @@ Stated plainly. None of these are claimed as working.
 | **Non-Windows, non-Linux hosts** | **Not verified** | Path handling is written to be platform-neutral and is exercised on Windows and in Linux containers, but no macOS run was performed. |
 | **Large-repository limits in practice** | **Not verified** | Limits are unit-tested at small values. Whether 20 000 files / 512 MB completes acceptably in wall-clock time is unknown. |
 | **Drift across an extractor or schema change** | **Implemented, deliberately not diffed** | Two snapshots whose extractor or schema versions differ return `comparable: false` with an explanation and zero changes. Covered by tests; no real cross-version pair exists to compare. |
+| **Responsive layout, theming, zoom and drag** | **Not verified** | The browser driver asserts on DOM content and node counts, not on appearance. A visual regression would not be caught. |
 
 ---
 
@@ -414,5 +464,5 @@ extraction and traceability; in-graph consistency checking; symbol-level and
 Git-corroborated renames; the archive-upload endpoint; CORS; rate limiting; API
 authentication.
 
-**Unknown:** browser rendering of every screen including C4 and Drift; performance at scale;
+**Unknown:** visual layout, styling, zoom and drag in the browser, and non-Chromium browsers; performance at scale;
 memory profile; coverage percentage.

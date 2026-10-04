@@ -894,6 +894,47 @@ Rules for this file:
 - **Files:** `packages/ingest/src/git.ts` (unchanged), `docs/deployment.md`,
   `docs/verification.md`
 
+### D-041: Browser verification became possible, so the UI's status changed from unknown
+
+- **Date / phase / commit:** Phase 2
+- **Context:** Phase 1 carried an honest standing gap: *"browser rendering is unknown"*. The
+  prompt for Phase 2 required re-testing that claim rather than preserving it. Re-reading the
+  rule — do not change the claim unless actually verified — the honest next step was to look
+  for a real browser capability rather than to keep writing "unknown" by habit.
+- **What exists on this machine:** Microsoft Edge and Google Chrome are installed. Node 24 ships
+  a global `WebSocket`, so the Chrome DevTools Protocol can be driven with **no dependency at
+  all**. Headless `--dump-dom` was not sufficient: it proves a page renders on load, but not
+  that clicking a C4 element opens its evidence or that a drift row drills through to the
+  right snapshot.
+- **Decision:** Add `scripts/verify-browser.mjs`, a CDP driver that launches a headless
+  browser, attaches to a page target with flattened sessions, navigates by URL, waits on
+  content rather than on a timer, dispatches clicks, and asserts on the resulting DOM. It
+  exits non-zero on failure. Run with `npm run verify:browser -- <baseUrl> <browserPath>`.
+  It is deliberately **not** part of `npm run verify`: it needs a running server holding at
+  least two analyses of the same repository, and a browser binary.
+- **Consequence for the product:** two deep-link affordances were added so that screens are
+  reachable without a mouse — `#/drift`, `#/c4/container` and so on, with a `hashchange`
+  listener so a fragment pasted into an open tab switches the view. Without them there is no
+  way to verify a screen without clicking, and a deep link is worth having regardless: an
+  architecture or drift view is exactly the thing a person wants to send to a colleague.
+  **A real bug was found this way:** before the `hashchange` listener existed, a deep link
+  worked on a fresh load and silently did nothing in an already-open application.
+- **What is now verified:** `24/24` checks against this repository (which has one analysis, so
+  the Drift empty state is what is exercised) and `27/27` against a fixture with two analyses
+  and a real change between them. These include: the application mounts, all eight tabs
+  render, health reaches the top bar, all three C4 levels draw and each reports what it could
+  not draw, selecting a C4 element opens its derivation, its evidence and its relationships'
+  graph support, the cited source file is reachable from the element, the drift report renders
+  its identity table and summary and individual changes with evidence on both sides, a change
+  row drills through to the entity inspector, every other tab renders its content, and there
+  are **no uncaught exceptions or console errors**.
+- **What remains unverified:** visual layout and styling, at any viewport; the React Flow
+  canvas beyond the node count; mouse-wheel zoom and drag behaviour; and rendering in any
+  browser other than the two Chromium builds on this machine. Those are recorded in
+  `docs/verification.md` §5.
+- **Files:** `scripts/verify-browser.mjs`, `package.json`, `packages/web/src/app.tsx`,
+  `packages/web/src/c4.tsx`, `docs/verification.md`
+
 ---
 
 ## Deferred, with reasons
