@@ -277,6 +277,159 @@ export interface MetaResponse {
   edgeKinds: string[];
   confidenceLevels: string[];
   artifacts: { kind: string; title: string }[];
+  useCaseStatuses: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Requirements, use cases, consistency, traceability, lineage
+// ---------------------------------------------------------------------------
+
+export type RequirementStatus = 'OBSERVED' | 'DERIVED' | 'PARTIAL' | 'UNKNOWN' | 'UNSUPPORTED';
+
+export interface Requirement {
+  id: string;
+  category: string;
+  statement: string;
+  status: RequirementStatus;
+  confidence: Confidence;
+  /** `declared` means a document states it; `derived` means a fixed rule read it from the code. */
+  origin: 'declared' | 'derived';
+  derivation: string;
+  evidence: EvidenceRef[];
+  supportedByNodeIds: string[];
+  supportedByEdgeIds: string[];
+  declaredInPath?: string;
+}
+
+export interface RequirementModel {
+  requirements: Requirement[];
+  counts: Record<RequirementStatus, number>;
+  documentsSearched: number;
+  summary: {
+    declared: number;
+    derived: number;
+    notRecovered: { reason: string; count: number }[];
+  };
+}
+
+export type UseCaseStatus = 'OBSERVED' | 'PARTIAL' | 'UNKNOWN';
+
+export interface UseCaseStep {
+  nodeId: string;
+  label: string;
+  kind: string;
+  viaEdgeIds: string[];
+  evidence: EvidenceRef[];
+  confidence: Confidence;
+}
+
+export interface UseCase {
+  id: string;
+  title: string;
+  entryKind: string;
+  entryNodeId: string;
+  systemNodeId: string;
+  actor: { nodeId: string; name: string; derivation: string; evidence: EvidenceRef[] } | null;
+  trigger: string;
+  preconditions: string[];
+  steps: UseCaseStep[];
+  postconditions: string[];
+  status: UseCaseStatus;
+  confidence: Confidence;
+  derivation: string;
+  evidence: EvidenceRef[];
+  supportsRequirementIds: string[];
+  /** What the repository does not evidence about this use case. */
+  missing: string[];
+}
+
+export interface UseCaseModel {
+  useCases: UseCase[];
+  counts: Record<UseCaseStatus, number>;
+  actors: { nodeId: string; name: string; derivation: string; evidence: EvidenceRef[] }[];
+  entryPoints: Record<string, number>;
+  notRecovered: { reason: string; count: number }[];
+}
+
+export type ConsistencyClass =
+  | 'CONTRADICTION'
+  | 'MISSING_EVIDENCE'
+  | 'PARTIAL_EVIDENCE'
+  | 'UNSUPPORTED_INFERENCE'
+  | 'CONSISTENT';
+
+export interface ConsistencyFinding {
+  id: string;
+  rule: string;
+  class: ConsistencyClass;
+  severity: 'info' | 'warning';
+  title: string;
+  detail: string;
+  artifacts: string[];
+  nodeIds: string[];
+  edgeIds: string[];
+  evidenceExpected: string;
+  evidenceFound: string;
+  derivation: string;
+  confidence: Confidence;
+}
+
+export interface ConsistencyReport {
+  findings: ConsistencyFinding[];
+  counts: Record<ConsistencyClass, number>;
+  compared: string[];
+  summary: string;
+}
+
+export interface TraceLink {
+  role: 'requirement' | 'use_case' | 'implementation' | 'test';
+  id: string;
+  label: string;
+  kind: string;
+  edgeIds: string[];
+  evidence: EvidenceRef[];
+  confidence: Confidence;
+  note?: string;
+}
+
+export interface Traceability {
+  subject: { id: string; name: string; kind: string };
+  links: TraceLink[];
+  breaks: { kind: string; reason: string }[];
+  complete: boolean;
+  summary: string;
+}
+
+export interface TraceabilityIndex {
+  rows: {
+    subjectId: string;
+    title: string;
+    entryKind: string;
+    requirements: number;
+    useCases: number;
+    implementation: number;
+    tests: number;
+    complete: boolean;
+  }[];
+  totals: { subjects: number; complete: number; incomplete: number };
+}
+
+export interface LineageHop {
+  edgeId: string;
+  direction: 'inbound' | 'outbound';
+  from: string;
+  to: string;
+  relation: string;
+  confidence: Confidence;
+  evidence: EvidenceRef[];
+}
+
+export interface Lineage {
+  subjectNodeId: string;
+  subjectName: string;
+  upstream: LineageHop[];
+  downstream: LineageHop[];
+  truncated: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -437,4 +590,39 @@ export const api = {
   getGaps: (analysisId: string) => request<GapReport>(`/api/analyses/${analysisId}/gaps`),
 
   getDiagnostics: (analysisId: string) => request<{ diagnostics: Diagnostic[] }>(`/api/analyses/${analysisId}/diagnostics`),
+
+  /**
+   * Requirements recovered for an analysis.
+   *
+   * Declared and derived requirements arrive together with their `origin`, because a reader
+   * deciding how far to trust a statement needs to know whether the repository said it or a
+   * fixed rule read it out of the code.
+   */
+  getRequirements: (analysisId: string) => request<RequirementModel>(`/api/analyses/${analysisId}/requirements`),
+
+  /**
+   * Use cases for an analysis, optionally filtered by status.
+   *
+   * No filter by default: partially evidenced use cases are the ones a reviewer needs, so
+   * excluding them would hide the interesting half.
+   */
+  getUseCases: (analysisId: string, status?: UseCaseStatus) =>
+    request<UseCaseModel & { filtered: boolean; totals: { useCases: number; returned: number } }>(
+      `/api/analyses/${analysisId}/use-cases${status ? `?status=${status}` : ''}`,
+    ),
+
+  getUseCase: (analysisId: string, useCaseId: string) =>
+    request<{ useCase: UseCase; actors: UseCaseModel['actors'] }>(
+      `/api/analyses/${analysisId}/use-cases/${encodeURIComponent(useCaseId)}`,
+    ),
+
+  getConsistency: (analysisId: string) => request<ConsistencyReport>(`/api/analyses/${analysisId}/consistency`),
+
+  getTraceabilityIndex: (analysisId: string) => request<TraceabilityIndex>(`/api/analyses/${analysisId}/traceability`),
+
+  getTraceability: (analysisId: string, nodeId: string) =>
+    request<Traceability>(`/api/analyses/${analysisId}/traceability/${encodeURIComponent(nodeId)}`),
+
+  getLineage: (analysisId: string, nodeId: string) =>
+    request<Lineage>(`/api/analyses/${analysisId}/lineage/${encodeURIComponent(nodeId)}`),
 };

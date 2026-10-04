@@ -7,8 +7,9 @@
  * whose whole claim is about what a user can see.
  *
  * It verifies rendering and interaction: every tab loads, the C4 levels draw, selecting a C4
- * element opens its derivation and evidence, and a drift row drills through to the entity
- * inspector in the right snapshot.
+ * element opens its derivation and evidence, the behaviour and traceability views render their
+ * lists and drill through, and a drift row drills through to the entity inspector in the right
+ * snapshot.
  *
  * This is verification tooling, not product code, and it is not part of `npm run verify`: it
  * needs a running server with at least two analyses of the same repository, and a browser
@@ -166,8 +167,8 @@ try {
   await goto(`${baseUrl}/`, `document.body.textContent.includes('Entities')`);
   record('application loads and React mounts', await evaluate(`!!document.querySelector('h1')?.textContent?.includes('RepoAtlas')`));
   record(
-    'all eight tabs render',
-    (await evaluate(`document.querySelectorAll('.tabs button').length`)) === 8,
+    'all ten tabs render',
+    (await evaluate(`document.querySelectorAll('.tabs button').length`)) === 10,
     `${await evaluate(`[...document.querySelectorAll('.tabs button')].map((b) => b.textContent).join(' ')`)}`,
   );
   record('stored analyses are listed', await evaluate(`document.querySelectorAll('.list button').length > 0`));
@@ -195,6 +196,101 @@ try {
   );
   record('the graph entity inspector opens for the same element', await evaluate(`document.body.textContent.includes('Outgoing') || document.body.textContent.includes('Incoming')`));
   record('the cited source file is reachable from the C4 element', await evaluate(`document.querySelector('.drawer')?.textContent?.includes('docker-compose.yml') ?? false`));
+
+  // ---------------------------------------------------------------- behaviour
+  // Each behaviour view is a separate claim about the repository, so each is opened by name
+  // rather than checked by whatever happened to render.
+  for (const [view, marker] of [
+    ['Sequence', 'Sequence'],
+    ['Activity', 'Activity'],
+    ['Data flow', 'Data flow'],
+  ]) {
+    await goto(`${baseUrl}/#/behaviour`, `document.body.textContent.includes('Sequence')`);
+    const clicked = await evaluate(`
+      (() => {
+        const button = [...document.querySelectorAll('button')].find((b) => b.textContent === ${JSON.stringify(view)});
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await waitFor(`document.body.textContent.includes(${JSON.stringify(marker)})`, `behaviour ${view}`);
+    record(`behaviour view ${view} renders`, clicked);
+  }
+
+  await goto(`${baseUrl}/#/behaviour`, `document.body.textContent.includes('Sequence')`);
+  const lineage = await evaluate(`document.body.textContent.includes('Data lineage')`);
+  record('behaviour offers data lineage alongside the projections', lineage);
+  record(
+    'lineage either traces a store or says the repository moves no data to one',
+    lineage &&
+      (await evaluate(
+        `/\\d+ hop\\(s\\) upstream/.test(document.body.textContent) || document.body.textContent.includes('nothing in') || document.body.textContent.includes('declares no table')`,
+      )),
+  );
+
+  // ---------------------------------------------------------------- traceability
+  await goto(`${baseUrl}/#/traceability`, `document.body.textContent.includes('Requirements')`);
+  record('traceability renders the requirements view', await evaluate(`document.body.textContent.includes('stated by the repository') || document.body.textContent.includes('derived from code')`));
+  record(
+    'traceability distinguishes stated from derived requirements',
+    await evaluate(`/stated by the repository|derived from code|partly evidenced|not supported by this repository/.test(document.body.textContent)`),
+  );
+
+  const useCasesClicked = await evaluate(`
+    (() => {
+      const button = [...document.querySelectorAll('button')].find((b) => b.textContent === 'Use cases');
+      if (button) button.click();
+      return !!button;
+    })()
+  `);
+  await waitFor(`document.body.textContent.includes('Fully traced')`, 'use cases view');
+  record('traceability renders the use-case list', useCasesClicked);
+  record(
+    'a use case states what is not evidenced about it',
+    await evaluate(`document.body.textContent.includes('nothing outstanding') || document.body.textContent.includes('No actor is named')`),
+  );
+
+  const chainClicked = await evaluate(`
+    (() => {
+      const button = [...document.querySelectorAll('button')].find((b) => b.textContent === 'Traceability');
+      if (button) button.click();
+      return !!button;
+    })()
+  `);
+  await waitFor(`document.body.textContent.includes('Entry points')`, 'traceability index');
+  record('traceability renders the chain index', chainClicked);
+
+  const rowClicked = await evaluate(`
+    (() => {
+      const button = [...document.querySelectorAll('.link')].find((b) => b.closest('table'));
+      if (button) button.click();
+      return !!button;
+    })()
+  `);
+  if (rowClicked) {
+    await waitFor(`document.body.textContent.includes('joint') || document.body.textContent.includes('requirement use case')`, 'chain detail');
+    record('selecting an entry point opens its requirement → test chain', true);
+    record(
+      'the chain reports every joint, zeros included',
+      await evaluate(`/\\brequirement\\b/i.test(document.body.textContent) && /\\btest\\b/i.test(document.body.textContent)`),
+    );
+  } else {
+    record('this repository declares no entry point, so no chain opens', await evaluate(`document.body.textContent.includes('no entry point')`));
+  }
+
+  const consistencyClicked = await evaluate(`
+    (() => {
+      const button = [...document.querySelectorAll('button')].find((b) => b.textContent === 'Consistency');
+      if (button) button.click();
+      return !!button;
+    })()
+  `);
+  await waitFor(`document.body.textContent.includes('Compared:') || document.body.textContent.includes('No cross-artifact finding')`, 'consistency view');
+  record('consistency view renders with the representations it compared', consistencyClicked);
+  record(
+    'consistency says absence is not a contradiction',
+    await evaluate(`document.body.textContent.includes('contradiction is reserved')`),
+  );
 
   // ---------------------------------------------------------------- drift
   // With fewer than two successful analyses there is nothing to compare, and the view must

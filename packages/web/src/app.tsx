@@ -15,6 +15,7 @@ import { C4Tab } from './c4';
 import { DriftTab } from './drift';
 import { EntityDrawer } from './entity-drawer';
 import { GraphView } from './graph';
+import { BehaviourTab, TraceabilityTab } from './phase3';
 import {
   ConfidenceBadge,
   CountChips,
@@ -38,13 +39,25 @@ import {
  * be followed back to a file and a line.
  */
 
-type TabId = 'overview' | 'architecture' | 'c4' | 'structure' | 'drift' | 'evidence' | 'gaps' | 'diagnostics';
+type TabId =
+  | 'overview'
+  | 'architecture'
+  | 'c4'
+  | 'structure'
+  | 'behaviour'
+  | 'traceability'
+  | 'drift'
+  | 'evidence'
+  | 'gaps'
+  | 'diagnostics';
 
 const TABS: { id: TabId; label: string }[] = [
   { id: 'overview', label: 'Overview' },
   { id: 'architecture', label: 'Architecture' },
   { id: 'c4', label: 'C4' },
   { id: 'structure', label: 'Structure' },
+  { id: 'behaviour', label: 'Behaviour' },
+  { id: 'traceability', label: 'Traceability' },
   { id: 'drift', label: 'Drift' },
   { id: 'evidence', label: 'Evidence' },
   { id: 'gaps', label: 'Gaps' },
@@ -259,6 +272,8 @@ export function App(): React.ReactElement {
                 {tab === 'structure' ? (
                   <ProjectionTab analysisId={selectedId} artifactKinds={['module-graph', 'class-diagram']} onSelectNode={selectNode} />
                 ) : null}
+                {tab === 'behaviour' ? <BehaviourTab analysisId={selectedId} onSelectNode={selectNode} /> : null}
+                {tab === 'traceability' ? <TraceabilityTab analysisId={selectedId} onSelectNode={selectNode} /> : null}
                 {tab === 'drift' ? (
                   <DriftTab analyses={analyses} analysisId={selectedId} onInspectNode={(id, nodeId) => setInspect({ analysisId: id, nodeId })} />
                 ) : null}
