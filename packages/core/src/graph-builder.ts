@@ -8,6 +8,7 @@ import type {
   DiscoveredFile,
   EvidenceRef,
   ExtractedEntity,
+  GraphNode,
   ParsedFile,
   RepositoryRef,
   SoftwareGraph,
@@ -401,8 +402,11 @@ export function buildGraph(input: GraphBuildInput): GraphBuildResult {
     }
   }
 
-  // ------------------------------------------------------------------- markers
+// ------------------------------------------------------------------- markers
   addMarkerFacts(input, builder, moduleByPath, symbolIndex, counters);
+
+  // ---------------------------------------------------------------- test facts
+  addTestFacts(builder);
 
   // ------------------------------------------------------------------ git facts
   if (input.includeGitHistory && input.commits.length > 0) {
@@ -879,6 +883,68 @@ function addControlFlow(
     confidence: 'EXPLICIT',
     evidence: [markerEvidence],
   });
+}
+
+/**
+ * Links a test to the entry point it exercises.
+ *
+ * A `tests` edge is what makes a requirement traceable to a test: requirement → use case →
+ * implementation → test. The link is drawn when a test calls a function that a route
+ * registration names as its handler.
+ *
+ * Two limits are deliberate:
+ *
+ * - **One hop only.** A test that reaches the handler through a client helper is not linked.
+ *   Walking helper chains would attribute a test to every endpoint the helper could reach, which
+ *   is a guess dressed as a fact. The consistency engine reports the missing link instead.
+ * - **The handler must be named by the route.** An endpoint with no identified handler has
+ *   nothing to test against.
+ *
+ * `STRONGLY_INFERRED`: the test genuinely calls the handler, but "this test covers this
+ * endpoint" is an inference about intent, and the evidence recorded is the call site.
+ */
+function addTestFacts(builder: SoftwareGraphBuilder): void {
+  const nodes = builder.allNodes();
+  const testIds = new Set(nodes.filter((node) => node.kind === 'test').map((node) => node.id));
+
+  const handlerToEndpoints = new Map<string, string[]>();
+  for (const edge of builder.allEdges()) {
+    if (edge.kind !== 'calls' || edge.attributes?.derivedFrom !== 'route.handler') continue;
+    const list = handlerToEndpoints.get(edge.to);
+    if (list) list.push(edge.from);
+    else handlerToEndpoints.set(edge.to, [edge.from]);
+  }
+  if (handlerToEndpoints.size === 0) return;
+
+  for (const edge of builder.allEdges()) {
+    if (edge.kind !== 'calls') continue;
+    if (!testIds.has(edge.from) && !isInTestFile(nodes, edge.from)) continue;
+    const endpoints = handlerToEndpoints.get(edge.to);
+    if (!endpoints) continue;
+
+    for (const endpoint of endpoints) {
+      builder.addEdge({
+        from: edge.from,
+        to: endpoint,
+        kind: 'tests',
+        confidence: 'STRONGLY_INFERRED',
+        evidence: edge.evidence,
+        attributes: { viaHandler: edge.attributes?.callee ?? null, hops: 1 },
+      });
+    }
+  }
+}
+
+/**
+ * A function declared in a test file is treated as a test entity for attribution purposes.
+ *
+ * Naming convention only — a file matching `*.test.*`, `*.spec.*` or under `test/`/`tests/`.
+ * It never creates a `test` node; it only widens which callers may hold a `tests` edge.
+ */
+function isInTestFile(nodes: readonly GraphNode[], id: string): boolean {
+  const path = nodes.find((node) => node.id === id)?.path;
+  if (!path) return false;
+  return /(^|\/)(test|tests|__tests__)\//i.test(path) || /\.(test|spec)\.[a-z]+$/i.test(path);
 }
 
 /**

@@ -556,3 +556,100 @@ describe('module content digests', () => {
     expect(graph.nodes.find((node) => node.id === 'module:src/a')?.digest).toBeUndefined();
   });
 });
+
+describe('test attribution', () => {
+  const fn = (name: string, kind: 'function' | 'test' = 'function') => ({
+    kind,
+    name,
+    qualifiedName: name,
+    startLine: 1,
+    endLine: 4,
+    language: 'typescript',
+  });
+
+  it('links a test that calls a route handler to the endpoint that route serves', () => {
+    const { graph } = build([
+      parsedFile('src/routes.ts', {
+        entities: [fn('handleList')],
+        markers: [{ name: 'http.route', line: 1, attributes: { httpMethod: 'GET', path: '/api/reports', handler: 'handleList' } }],
+      }),
+      parsedFile('test/routes.test.ts', {
+        entities: [fn('lists', 'test')],
+        calls: [{ callee: 'handleList', line: 2, fromQualifiedName: 'lists', isLocalIdentifier: true, argCount: 0 }],
+      }),
+    ]);
+
+    const tests = graph.edges.filter((edge) => edge.kind === 'tests');
+    expect(tests).toHaveLength(1);
+    expect(tests[0]?.from).toBe('test:lists');
+    expect(tests[0]?.to).toBe('api_endpoint:get-/api/reports');
+    // The call exists; that the test *covers the endpoint* is an inference about intent.
+    expect(tests[0]?.confidence).toBe('STRONGLY_INFERRED');
+    expect(tests[0]?.evidence.length).toBeGreaterThan(0);
+  });
+
+  it('links a function in a test file that calls a handler', () => {
+    const { graph } = build([
+      parsedFile('src/routes.ts', {
+        entities: [fn('handleList')],
+        markers: [{ name: 'http.route', line: 1, attributes: { httpMethod: 'GET', path: '/api/reports', handler: 'handleList' } }],
+      }),
+      parsedFile('test/routes.spec.ts', {
+        entities: [fn('exercisesHandler')],
+        calls: [{ callee: 'handleList', line: 2, fromQualifiedName: 'exercisesHandler', isLocalIdentifier: true, argCount: 0 }],
+      }),
+    ]);
+
+    expect(graph.edges.filter((edge) => edge.kind === 'tests')).toHaveLength(1);
+  });
+
+  it('does not claim a test for a handler reached only through a helper', () => {
+    // One hop only. Walking the chain would attribute the test to every endpoint the helper
+    // could reach, which is a guess.
+    const { graph } = build([
+      parsedFile('src/routes.ts', {
+        entities: [fn('handleList')],
+        markers: [{ name: 'http.route', line: 1, attributes: { httpMethod: 'GET', path: '/api/reports', handler: 'handleList' } }],
+      }),
+      parsedFile('src/client.ts', {
+        entities: [fn('sendRequest')],
+        calls: [{ callee: 'handleList', line: 2, fromQualifiedName: 'sendRequest', isLocalIdentifier: true, argCount: 0 }],
+      }),
+      parsedFile('test/api.test.ts', {
+        entities: [fn('usesClient', 'test')],
+        calls: [{ callee: 'sendRequest', line: 2, fromQualifiedName: 'usesClient', isLocalIdentifier: true, argCount: 0 }],
+      }),
+    ]);
+
+    expect(graph.edges.filter((edge) => edge.kind === 'tests')).toHaveLength(0);
+  });
+
+  it('does not claim a test when the route names no handler', () => {
+    const { graph } = build([
+      parsedFile('src/routes.ts', {
+        markers: [{ name: 'http.route', line: 1, attributes: { httpMethod: 'GET', path: '/api/reports' } }],
+      }),
+      parsedFile('test/routes.test.ts', {
+        entities: [fn('lists', 'test')],
+        calls: [{ callee: 'handleList', line: 2, fromQualifiedName: 'lists', isLocalIdentifier: true, argCount: 0 }],
+      }),
+    ]);
+
+    expect(graph.edges.filter((edge) => edge.kind === 'tests')).toHaveLength(0);
+  });
+
+  it('does not treat a production function as a test just because it calls a handler', () => {
+    const { graph } = build([
+      parsedFile('src/routes.ts', {
+        entities: [fn('handleList')],
+        markers: [{ name: 'http.route', line: 1, attributes: { httpMethod: 'GET', path: '/api/reports', handler: 'handleList' } }],
+      }),
+      parsedFile('src/warmup.ts', {
+        entities: [fn('warmUp')],
+        calls: [{ callee: 'handleList', line: 2, fromQualifiedName: 'warmUp', isLocalIdentifier: true, argCount: 0 }],
+      }),
+    ]);
+
+    expect(graph.edges.filter((edge) => edge.kind === 'tests')).toHaveLength(0);
+  });
+});

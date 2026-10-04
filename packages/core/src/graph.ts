@@ -16,7 +16,19 @@ import {
   type SoftwareGraph,
 } from './types.js';
 
-export const GRAPH_SCHEMA_VERSION = 2;
+/**
+ * Graph schema version.
+ *
+ * Bumped when the *shape* of the graph changes — a new node kind, a new edge kind, or a new
+ * attribute the projections depend on — because a snapshot written against an older shape
+ * cannot be compared field-by-field with a newer one. Version 3 added `condition` nodes,
+ * `branches`/`loops`/`references` edges, `isAsync` on function entities, SQL `reads`/`writes`,
+ * and DDL primary keys, foreign keys, nullability and uniqueness. Version 3 also introduced
+ * `tests` edges from a test to the endpoint its handler serves.
+ *
+ * Snapshots taken under an older version are reported incomparable rather than silently diffed.
+ */
+export const GRAPH_SCHEMA_VERSION = 3;
 
 export class GraphLimitError extends Error {
   readonly code = 'GRAPH_LIMIT_EXCEEDED';
@@ -147,6 +159,22 @@ export class SoftwareGraphBuilder {
   /** Nodes of a given kind, in insertion order. */
   nodesOfKind(kind: NodeKind): GraphNode[] {
     return [...this.nodes.values()].filter((node) => node.kind === kind);
+  }
+
+  /**
+   * Every node registered so far, in insertion order.
+   *
+   * Exposed so a later pass can reason about nodes added by an earlier pass — the test
+   * attribution pass needs the endpoints that marker facts just created. Read-only view:
+   * callers must not mutate the nodes they receive.
+   */
+  allNodes(): GraphNode[] {
+    return [...this.nodes.values()];
+  }
+
+  /** Every edge registered so far, in insertion order. Same read-only contract as `allNodes`. */
+  allEdges(): GraphEdge[] {
+    return [...this.edges.values()];
   }
 
   /** Edges leaving a node. */

@@ -29,6 +29,10 @@ export type C4ElementKind =
   | 'external_system'
   | 'person';
 
+/** Projections that are not part of the C4 model. */
+export const BEHAVIOUR_VIEWS = ['sequence', 'activity', 'data-flow'] as const;
+export type BehaviourView = (typeof BEHAVIOUR_VIEWS)[number];
+
 export interface ArtifactNode {
   id: string;
   label: string;
@@ -42,6 +46,14 @@ export interface ArtifactNode {
   c4Level?: C4Level;
   /** C4 element kind, set only by the C4 projections. */
   c4Kind?: C4ElementKind;
+  /**
+   * Which non-C4 projection produced this element.
+   *
+   * Separate from `c4Level` because a sequence view and an activity view are not C4
+   * abstraction levels, and labelling them as such would invite a reader to treat a message
+   * arrow as an architectural relationship.
+   */
+  view?: BehaviourView;
   /** Technology named by repository evidence, e.g. an image or language. */
   technology?: string;
   /** Graph nodes this element was derived from. Always non-empty for C4 elements. */
@@ -66,6 +78,8 @@ export interface ArtifactEdge {
   evidence: EvidenceRef[];
   /** C4 abstraction level, set only by the C4 projections. */
   c4Level?: C4Level;
+  /** Which non-C4 projection produced this relationship. */
+  view?: BehaviourView;
   /**
    * Graph edges that justify this architectural relationship.
    *

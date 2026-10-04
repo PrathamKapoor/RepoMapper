@@ -144,11 +144,11 @@ describe('ER diagram projection', () => {
   it('is honestly insufficient when there is no DDL', () => {
     const artifact = buildArtifact(graphFrom([parsedFile('src/a.ts')]), 'er-diagram');
     expect(artifact?.insufficientEvidence).toBe(true);
-    expect(artifact?.scope).toContain('only when the graph holds an explicit edge');
-    // With tables present but no inter-table edges, the omission must say foreign keys
-    // were not inferred rather than implying there are none.
+    expect(artifact?.scope).toContain('none is inferred from a column name');
+    // With tables present but no inter-table edges, the omission must say foreign keys are
+    // not inferred from column names rather than implying there are none.
     const withTable = buildArtifact(RICH_GRAPH, 'er-diagram')!;
-    expect(withTable.omitted.some((entry) => entry.reason.includes('foreign keys are not inferred'))).toBe(true);
+    expect(withTable.omitted.some((entry) => entry.reason.includes('foreign keys are not inferred from column names'))).toBe(true);
   });
 });
 
