@@ -43,6 +43,7 @@ export class ConfigSourceParser implements SourceParser {
         else if (context.language === 'json') parseGenericJson(source, result);
         else if (context.language === 'sql') parseSql(source, result);
         else if (context.language === 'yaml') parseYaml(source, result);
+        else if (context.language === 'markdown') parseMarkdown(source, result);
         break;
     }
 
@@ -318,6 +319,89 @@ function scalarToString(value: unknown): string | null {
   if (typeof value === 'string') return value;
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   return null;
+}
+
+/**
+ * Reads stated requirements from Markdown.
+ *
+ * Only a line that *declares* a requirement is read. Recognised forms:
+ *
+ * - `REQ-012: The system shall ...` — an explicit identifier and a statement;
+ * - a list item whose text begins with a requirement verb: `must`, `shall`, `should`,
+ *   `is required to`, `has to`, `needs to`, `must not`, `may not`.
+ *
+ * Prose that merely describes the system is not read. This is the line between recovering what
+ * a repository states and writing requirements on its behalf, and the second is not this tool's
+ * job. A bullet in a changelog saying "must fix the parser" is a requirement in form only; it
+ * is still recorded, because deciding it is not a requirement would be a judgement the
+ * repository never made. What is *not* done is inferring a requirement from a sentence that
+ * makes no claim of obligation.
+ *
+ * `implementsRef` is captured from a trailing path or backticked symbol on the same line, so
+ * the graph can link the requirement to code that names it. Absence is left as absence: no
+ * reference means no `implements_requirement` relationship.
+ */
+function parseMarkdown(source: string, result: ParsedFile): void {
+  const lines = source.split(/\r?\n/);
+  let inFence = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const raw = lines[index] ?? '';
+    if (/^\s*(```|~~~)/.test(raw)) {
+      inFence = !inFence;
+      continue;
+    }
+    // A requirement inside a code block is an example, not a statement.
+    if (inFence) continue;
+
+    const lineNumber = index + 1;
+    const trimmed = raw.trim();
+    if (trimmed === '' || trimmed.startsWith('#') || trimmed.startsWith('|')) continue;
+
+    const bullet = trimmed.startsWith('-') || trimmed.startsWith('*') || /^\d+\./.test(trimmed);
+    const text = bullet ? trimmed.replace(/^(?:[-*]|\d+\.)\s+/, '') : trimmed;
+    if (text === '') continue;
+
+    const identified = /^([A-Z][A-Z0-9]*-\d+)\s*[:.—-]\s*(.+)$/.exec(text);
+    const obligation = /\b(must not|shall not|may not|must|shall|should|is required to|has to|needs to)\b/i;
+    const sentence = identified?.[2]?.trim() ?? text;
+    if (!identified && !obligation.test(sentence)) continue;
+
+    const { statement, implementsRef } = splitImplementsRef(sentence);
+    if (statement.length === 0) continue;
+
+    result.markers.push({
+      name: 'doc.requirement',
+      line: lineNumber,
+      attributes: {
+        statement,
+        identifier: identified?.[1] ?? null,
+        ...(implementsRef ? { implementsRef } : {}),
+      },
+    });
+  }
+}
+
+/**
+ * Separates a requirement's statement from a trailing implementation reference.
+ *
+ * Only two unambiguous forms are honoured: a path (`src/routes.ts`) and a backticked symbol.
+ * Anything else is left inside the statement, because splitting prose on a guess would change
+ * what the repository said.
+ */
+function splitImplementsRef(sentence: string): { statement: string; implementsRef: string | null } {
+  const backticked = /`([^`]+)`\s*$/.exec(sentence);
+  if (backticked?.[1]) {
+    return { statement: sentence.slice(0, backticked.index).trim(), implementsRef: backticked[1] };
+  }
+
+  const path = /((?:^|\s)(?:[\w.-]+\/)*[\w.-]+\.[a-z]{1,5})\s*$/.exec(sentence);
+  if (path?.[1]) {
+    const reference = path[1].trim();
+    return { statement: sentence.slice(0, path.index).trim(), implementsRef: reference };
+  }
+
+  return { statement: sentence, implementsRef: null };
 }
 
 /**

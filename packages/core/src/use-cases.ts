@@ -252,8 +252,15 @@ function buildUseCase(
     confidence: entry.node.confidence,
     derivation: `Composed from the ${entry.kind} entry point ${entry.node.id} and the ${steps.length} call relationship(s) reachable from it, within a depth of ${MAX_USE_CASE_DEPTH}.`,
     evidence,
+    // A requirement belongs to this use case when the code it names is the entry point or
+    // any node the walk reached. A requirement pointing at the handler is about this
+    // interaction even though it never mentions the route.
     supportsRequirementIds: requirements
-      .filter((requirement) => requirement.supportedByNodeIds.includes(entry.node.id))
+      .filter((requirement) =>
+        requirement.supportedByNodeIds.some(
+          (id) => id === entry.node.id || steps.some((step) => step.nodeId === id),
+        ),
+      )
       .map((requirement) => requirement.id)
       .sort(),
     missing,

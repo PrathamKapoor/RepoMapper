@@ -484,3 +484,69 @@ networks:
     expect(result.markers.some((marker) => marker.name === 'docker.expose')).toBe(true);
   });
 });
+
+describe('markdown requirement extractor', () => {
+  const parser = new ConfigSourceParser();
+  const context = (path: string): ParserContext => ({ path, language: 'markdown', maxProblems: 10, maxCalls: 50 });
+
+  it('reads an identified requirement statement', () => {
+    const result = parser.parse('# Requirements\n\nREQ-001: The system shall expose GET /api/reports\n', context('docs/requirements.md'));
+    const marker = result.markers.find((item) => item.name === 'doc.requirement');
+    expect(marker?.attributes.statement).toBe('The system shall expose GET /api/reports');
+    expect(marker?.attributes.identifier).toBe('REQ-001');
+    expect(marker?.line).toBe(3);
+  });
+
+  it('reads a bullet that states an obligation', () => {
+    const result = parser.parse('- The importer must reject a file larger than 10 MB.\n', context('README.md'));
+    const marker = result.markers.find((item) => item.name === 'doc.requirement');
+    expect(marker?.attributes.statement).toBe('The importer must reject a file larger than 10 MB.');
+    expect(marker?.attributes.identifier).toBeNull();
+  });
+
+  it('reads a numbered requirement', () => {
+    const result = parser.parse('1. Users shall be able to reset a password.\n', context('docs/spec.md'));
+    expect(result.markers.some((item) => item.name === 'doc.requirement')).toBe(true);
+  });
+
+  it('does not read prose that states no obligation', () => {
+    const result = parser.parse(
+      '# Overview\n\nRepoAtlas turns a repository into diagrams.\n\nIt is nice and fast.\n',
+      context('README.md'),
+    );
+    expect(result.markers.filter((item) => item.name === 'doc.requirement')).toHaveLength(0);
+  });
+
+  it('does not read a requirement from inside a fenced code block', () => {
+    const result = parser.parse('```\n- The system must do the thing.\n```\n', context('docs/example.md'));
+    expect(result.markers.filter((item) => item.name === 'doc.requirement')).toHaveLength(0);
+  });
+
+  it('captures a trailing backticked symbol as the implementation reference', () => {
+    const result = parser.parse('REQ-002: The system shall rate limit writes `handleList`\n', context('docs/requirements.md'));
+    const marker = result.markers.find((item) => item.name === 'doc.requirement');
+    expect(marker?.attributes.statement).toBe('The system shall rate limit writes');
+    expect(marker?.attributes.implementsRef).toBe('handleList');
+  });
+
+  it('captures a trailing file path as the implementation reference', () => {
+    const result = parser.parse('- The system must enforce the limit. src/routes.ts\n', context('docs/requirements.md'));
+    const marker = result.markers.find((item) => item.name === 'doc.requirement');
+    expect(marker?.attributes.statement).toBe('The system must enforce the limit.');
+    expect(marker?.attributes.implementsRef).toBe('src/routes.ts');
+  });
+
+  it('leaves a statement without a reference alone', () => {
+    const result = parser.parse('- The system must retain audit logs for 7 days.\n', context('docs/policy.md'));
+    const marker = result.markers.find((item) => item.name === 'doc.requirement');
+    expect(marker?.attributes.implementsRef).toBeUndefined();
+    expect(marker?.attributes.statement).toBe('The system must retain audit logs for 7 days.');
+  });
+
+  it('does not split a sentence on a trailing word that merely ends in a dot', () => {
+    const result = parser.parse('- The system must support the csv format.\n', context('docs/policy.md'));
+    const marker = result.markers.find((item) => item.name === 'doc.requirement');
+    expect(marker?.attributes.statement).toBe('The system must support the csv format.');
+    expect(marker?.attributes.implementsRef).toBeUndefined();
+  });
+});

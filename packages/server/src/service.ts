@@ -1,9 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import {
   AnalysisError,
+  buildRequirements,
+  buildUseCases,
   compareSnapshots,
   createSnapshot,
   describeError,
+  traceAll,
+  traceSubject,
   type AnalysisRecord,
   type AnalysisRequest,
   type AnalysisResult,
@@ -11,8 +15,19 @@ import {
   type CompareOptions,
   type DiagnosticCollector,
   type DriftReport,
+  type RequirementModel,
+  type Traceability,
+  type UseCaseModel,
 } from '@repoatlas/core';
-import { projectAtlas, type AtlasProjection } from '@repoatlas/artifacts';
+import {
+  checkConsistency,
+  DEFAULT_PROJECTION_LIMITS,
+  projectAtlas,
+  traceLineage,
+  type AtlasProjection,
+  type ConsistencyReport,
+  type Lineage,
+} from '@repoatlas/artifacts';
 import { runAnalysis, type RunAnalysisOutput } from './analyze.js';
 import type { ServerConfig } from './config.js';
 import type { Store } from './store.js';
@@ -256,6 +271,49 @@ export class AnalysisService {
       stats: projection.stats,
       projection,
     };
+  }
+
+  /**
+   * Requirements recovered for an analysis, or `null` when the analysis has no graph.
+   *
+   * Re-derived from the stored graph for the same reason artifacts are: a change to the
+   * derivation rules must not require re-analysing the repository.
+   */
+  getRequirements(id: string): RequirementModel | null {
+    const graph = this.store.getGraph(id);
+    return graph ? buildRequirements(graph) : null;
+  }
+
+  /** Use cases recovered for an analysis, sharing the requirement model's output. */
+  getUseCases(id: string): UseCaseModel | null {
+    const graph = this.store.getGraph(id);
+    if (!graph) return null;
+    return buildUseCases(graph, buildRequirements(graph).requirements);
+  }
+
+  /** Cross-artifact consistency report, computed from the same graph as every artifact. */
+  getConsistency(id: string): ConsistencyReport | null {
+    const graph = this.store.getGraph(id);
+    return graph ? checkConsistency({ graph, maxElements: DEFAULT_PROJECTION_LIMITS.maxElements }) : null;
+  }
+
+  /** The requirement → use case → implementation → test chain for one graph entity. */
+  getTraceability(id: string, nodeId: string): Traceability | null {
+    const graph = this.store.getGraph(id);
+    if (!graph) return null;
+    return traceSubject(graph, nodeId);
+  }
+
+  /** The traceability index: one row per entry point with its chain counts. */
+  getTraceabilityIndex(id: string): ReturnType<typeof traceAll> | null {
+    const graph = this.store.getGraph(id);
+    return graph ? traceAll(graph) : null;
+  }
+
+  /** Data lineage for one store or entity, or `null` when the graph cannot answer. */
+  getLineage(id: string, nodeId: string): Lineage | null {
+    const graph = this.store.getGraph(id);
+    return graph ? traceLineage(graph, nodeId) : null;
   }
 
   /** Runs a promise with a hard timeout so one pathological repository cannot hang the API. */

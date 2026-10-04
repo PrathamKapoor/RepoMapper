@@ -208,8 +208,9 @@ describe('requirements', () => {
     expect(model.summary.declared).toBe(1);
   });
 
-  it('drops a declared requirement that nothing implements', () => {
-    // A requirement with no implementation is a gap, not a requirement this model can support.
+  it('keeps a declared requirement that nothing implements, marked partial', () => {
+    // A requirement the repository states and no code implements is the requirement a reviewer
+    // most wants to see. Dropping it would turn the gap into an absence, and the gap is the fact.
     const base = graphOf([parsedFile('src/a.ts')]);
     const withOrphan: ReturnType<typeof graphOf> = {
       ...base,
@@ -220,12 +221,22 @@ describe('requirements', () => {
           kind: 'requirement',
           name: 'ORPHAN',
           qualifiedName: 'ORPHAN',
+          attributes: { statement: 'The system shall do the thing' },
           evidence: base.nodes[0]?.evidence ?? [],
           confidence: 'EXPLICIT',
         },
       ],
     };
-    expect(buildRequirements(withOrphan).requirements.some((requirement) => requirement.origin === 'declared')).toBe(false);
+
+    const declared = buildRequirements(withOrphan).requirements.filter(
+      (requirement) => requirement.origin === 'declared',
+    );
+    expect(declared).toHaveLength(1);
+    expect(declared[0]?.statement).toBe('The system shall do the thing');
+    // Stated, but not evidenced in code: partial, and it says so.
+    expect(declared[0]?.status).toBe('PARTIAL');
+    expect(declared[0]?.supportedByNodeIds).toHaveLength(0);
+    expect(declared[0]?.derivation).toContain('nothing in the graph names code');
   });
 
   it('is deterministic for the same graph', () => {

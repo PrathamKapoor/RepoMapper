@@ -553,6 +553,9 @@ function addMarkerFacts(
         case 'manifest.dependency':
           addDeclaredDependency(builder, evidence, file, moduleId, marker);
           break;
+        case 'doc.requirement':
+          addDeclaredRequirement(builder, evidence, file, moduleId, marker, symbolIndex);
+          break;
         case 'test.suite':
         case 'test.case':
           addTestEntity(builder, evidence, file, moduleId, marker, counters);
@@ -945,6 +948,89 @@ function isInTestFile(nodes: readonly GraphNode[], id: string): boolean {
   const path = nodes.find((node) => node.id === id)?.path;
   if (!path) return false;
   return /(^|\/)(test|tests|__tests__)\//i.test(path) || /\.(test|spec)\.[a-z]+$/i.test(path);
+}
+
+/**
+ * Records a requirement stated in a document.
+ *
+ * This is the only path by which a *declared* requirement enters the graph, and it is
+ * deliberately narrow:
+ *
+ * - The statement is copied from the document. Nothing is paraphrased, summarised or inferred.
+ * - An `implements_requirement` relationship is created only when the document names
+ *   something that resolves to a declared entity — a symbol name or a module path. A
+ *   requirement that mentions nothing resolvable stays unlinked, and the requirement view
+ *   reports it as having no implementation evidence rather than attaching it to whatever
+ *   looked closest.
+ *
+ * `EXPLICIT` for both the requirement and the relationship it states: the document says so.
+ */
+function addDeclaredRequirement(
+  builder: SoftwareGraphBuilder,
+  evidence: EvidenceStore,
+  file: ParsedFileRef,
+  moduleId: string,
+  marker: ParsedFileRef['markers'][number],
+  symbolIndex: ReadonlyMap<string, SymbolRef>,
+): void {
+  const statement = String(marker.attributes.statement ?? '').trim();
+  if (statement.length === 0) return;
+
+  const identifier = typeof marker.attributes.identifier === 'string' ? marker.attributes.identifier : undefined;
+  // Identified requirements keep their identifier so `REQ-014` in prose and in the graph are
+  // the same requirement. Unidentified ones are named after their position in their file.
+  const qualifiedName = identifier ?? `${file.path}#${marker.line}`;
+
+  const markerEvidence = evidence.add({
+    kind: 'DECLARATION',
+    path: file.path,
+    startLine: marker.line,
+    endLine: marker.line,
+    symbol: identifier ?? statement.slice(0, 60),
+    excerpt: statement,
+    producer: file.producer,
+  });
+
+  const requirementId = nodeId('requirement', qualifiedName);
+  builder.addNode({
+    kind: 'requirement',
+    name: identifier ?? statement.slice(0, 80),
+    qualifiedName,
+    path: file.path,
+    startLine: marker.line,
+    evidence: [markerEvidence],
+    confidence: 'EXPLICIT',
+    attributes: { statement, ...(identifier ? { identifier } : {}) },
+  });
+  builder.addEdge({ from: moduleId, to: requirementId, kind: 'declared_in', confidence: 'EXPLICIT', evidence: [markerEvidence] });
+
+  const reference = typeof marker.attributes.implementsRef === 'string' ? marker.attributes.implementsRef : undefined;
+  if (!reference) return;
+
+  // A symbol name the document mentions, or an exact module path it points at. Nothing else
+  // resolves, and an unlinked requirement is preferable to a link to the wrong code.
+  const targetId = symbolIndex.get(reference)?.id ?? moduleByIdFromReference(builder, reference);
+  if (!targetId) return;
+  builder.addEdge({
+    from: requirementId,
+    to: targetId,
+    kind: 'implements_requirement',
+    confidence: 'EXPLICIT',
+    evidence: [markerEvidence],
+    attributes: { statedIn: file.path, reference },
+  });
+}
+
+/**
+ * Resolves a requirement's reference to a module node.
+ *
+ * Only an exact module path matches. A reference that merely resembles one — a directory, a
+ * glob, a file the analysis did not read — resolves to nothing, and an unlinked requirement is
+ * a better answer than a link to the wrong module.
+ */
+function moduleByIdFromReference(builder: SoftwareGraphBuilder, reference: string): string | undefined {
+  const candidate = nodeId('module', toPosixPath(reference));
+  return builder.hasNode(candidate) ? candidate : undefined;
 }
 
 /**

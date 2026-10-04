@@ -7,6 +7,7 @@ import {
   CONFIDENCE_LEVELS,
   EDGE_KINDS,
   NODE_KINDS,
+  USE_CASE_STATUSES,
   type AnalysisRequest,
 } from '@repoatlas/core';
 import { ARTIFACTS } from '@repoatlas/artifacts';
@@ -127,6 +128,17 @@ const graphQuerySchema = z.object({
   confidence: z.enum(CONFIDENCE_LEVELS).optional(),
 });
 
+/**
+ * Use-case filter.
+ *
+ * Status is optional and defaults to *no* filter: a caller asking for use cases wants all of
+ * them, including the ones that are only partially evidenced. Those are the ones a reviewer
+ * needs to see.
+ */
+const useCaseQuerySchema = z.object({
+  status: z.enum(USE_CASE_STATUSES).optional(),
+});
+
 export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyInstance> {
   const config = options.config ?? loadConfig();
   const store = options.store ?? new Store(config.dbPath);
@@ -198,6 +210,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     edgeKinds: EDGE_KINDS,
     confidenceLevels: CONFIDENCE_LEVELS,
     artifacts: ARTIFACTS.map((artifact) => ({ kind: artifact.kind, title: artifact.title })),
+    useCaseStatuses: USE_CASE_STATUSES,
   }));
 
   // -------------------------------------------------------------- analyses
@@ -428,6 +441,144 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       return { error: { code: 'NOT_FOUND', message: `No analysis with id ${id}` } };
     }
     return result.projection.gaps;
+  });
+
+  // --------------------------------------------------- requirements & use cases
+  /**
+   * Requirements recovered from the repository.
+   *
+   * Declared requirements come from documents that state them; derived ones come from fixed
+   * rules over the graph. Both are returned together with their origin, because a reader
+   * deciding how much to trust a statement needs to know which it is.
+   */
+  app.get('/api/analyses/:id/requirements', async (request, reply) => {
+    const { id } = parseOrThrow(idParamsSchema, request.params);
+    const model = service.getRequirements(id);
+    if (!model) {
+      void reply.status(404);
+      return { error: { code: 'NOT_FOUND', message: `No analysis with id ${id}` } };
+    }
+    return model;
+  });
+
+  /**
+   * Use cases recovered from the repository.
+   *
+   * `status` distinguishes a fully traced use case from one whose steps are missing. A use case
+   * with no steps is returned rather than hidden: "this repository does not evidence it" is the
+   * answer, and hiding it would look like an absence of use cases.
+   */
+  app.get('/api/analyses/:id/use-cases', async (request, reply) => {
+    const { id } = parseOrThrow(idParamsSchema, request.params);
+    const query = parseOrThrow(useCaseQuerySchema, request.query ?? {});
+    const model = service.getUseCases(id);
+    if (!model) {
+      void reply.status(404);
+      return { error: { code: 'NOT_FOUND', message: `No analysis with id ${id}` } };
+    }
+
+    const filtered = query.status
+      ? model.useCases.filter((useCase) => useCase.status === query.status)
+      : model.useCases;
+    return {
+      ...model,
+      useCases: filtered,
+      counts: model.counts,
+      filtered: model.useCases.length !== filtered.length,
+      totals: { useCases: model.useCases.length, returned: filtered.length },
+    };
+  });
+
+  /** One use case by id, so a reader can open a single interaction with its evidence. */
+  app.get('/api/analyses/:id/use-cases/:useCaseId', async (request, reply) => {
+    const { id } = parseOrThrow(idParamsSchema, request.params);
+    const { useCaseId } = parseOrThrow(z.object({ useCaseId: z.string().min(1).max(1_024) }), request.params);
+    const model = service.getUseCases(id);
+    if (!model) {
+      void reply.status(404);
+      return { error: { code: 'NOT_FOUND', message: `No analysis with id ${id}` } };
+    }
+    const useCase = model.useCases.find((candidate) => candidate.id === useCaseId);
+    if (!useCase) {
+      void reply.status(404);
+      return { error: { code: 'NOT_FOUND', message: `No use case ${useCaseId} in analysis ${id}` } };
+    }
+    return { useCase, actors: model.actors };
+  });
+
+  // --------------------------------------------------------------- consistency
+  /**
+   * Cross-artifact consistency.
+   *
+   * Every finding names the representations compared, the evidence expected and the evidence
+   * found, so a claim can be checked against the repository by hand. Absent evidence is
+   * reported as absent; `CONTRADICTION` is reserved for two statements that cannot both be true.
+   */
+  app.get('/api/analyses/:id/consistency', async (request, reply) => {
+    const { id } = parseOrThrow(idParamsSchema, request.params);
+    const report = service.getConsistency(id);
+    if (!report) {
+      void reply.status(404);
+      return { error: { code: 'NOT_FOUND', message: `No analysis with id ${id}` } };
+    }
+    return report;
+  });
+
+  // -------------------------------------------------------------- traceability
+  /** Index of every entry point and how far its chain is traceable. */
+  app.get('/api/analyses/:id/traceability', async (request, reply) => {
+    const { id } = parseOrThrow(idParamsSchema, request.params);
+    const index = service.getTraceabilityIndex(id);
+    if (!index) {
+      void reply.status(404);
+      return { error: { code: 'NOT_FOUND', message: `No analysis with id ${id}` } };
+    }
+    return index;
+  });
+
+  /**
+   * The requirement → use case → implementation → test chain for one entity.
+   *
+   * A 404 means the graph does not hold the entity. That is different from a chain with
+   * `breaks`, which means the entity exists and the repository evidences only part of its
+   * story — the distinction a reader needs most.
+   */
+  app.get('/api/analyses/:id/traceability/:nodeId', async (request, reply) => {
+    const { id } = parseOrThrow(idParamsSchema, request.params);
+    const { nodeId } = parseOrThrow(z.object({ nodeId: z.string().min(1).max(1_024) }), request.params);
+
+    if (!store.getAnalysis(id)) {
+      void reply.status(404);
+      return { error: { code: 'NOT_FOUND', message: `No analysis with id ${id}` } };
+    }
+    const trace = service.getTraceability(id, decodeURIComponent(nodeId));
+    if (!trace) {
+      void reply.status(404);
+      return { error: { code: 'NOT_FOUND', message: `No node ${decodeURIComponent(nodeId)} in analysis ${id}` } };
+    }
+    return trace;
+  });
+
+  /** Where a value came from and where it goes. `null` means the graph cannot answer. */
+  app.get('/api/analyses/:id/lineage/:nodeId', async (request, reply) => {
+    const { id } = parseOrThrow(idParamsSchema, request.params);
+    const { nodeId } = parseOrThrow(z.object({ nodeId: z.string().min(1).max(1_024) }), request.params);
+
+    if (!store.getAnalysis(id)) {
+      void reply.status(404);
+      return { error: { code: 'NOT_FOUND', message: `No analysis with id ${id}` } };
+    }
+    const lineage = service.getLineage(id, decodeURIComponent(nodeId));
+    if (!lineage) {
+      void reply.status(404);
+      return {
+        error: {
+          code: 'NOT_FOUND',
+          message: `No data relationship traces to ${decodeURIComponent(nodeId)}; it may exist but no code moves data to or from it.`,
+        },
+      };
+    }
+    return lineage;
   });
 
   app.addHook('onClose', () => {

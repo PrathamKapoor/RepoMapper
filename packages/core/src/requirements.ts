@@ -142,20 +142,36 @@ export function buildRequirements(graph: SoftwareGraph): RequirementModel {
 function declaredRequirements(graph: SoftwareGraph): Requirement[] {
   return graph.nodes
     .filter((node) => node.kind === 'requirement')
-    .map((node) => ({
-      id: `declared:declared:${node.id}`,
-      category: 'declared' as const,
-      statement: node.qualifiedName ?? node.name,
-      status: 'OBSERVED' as const,
-      confidence: node.confidence,
-      origin: 'declared' as const,
-      derivation: 'A requirement entity exists in the graph, which means the repository states it.',
-      evidence: node.evidence,
-      supportedByNodeIds: supportingEntities(graph, node, 'implements_requirement').map((other) => other.id),
-      supportedByEdgeIds: edgesBetween(graph, node, 'implements_requirement').map((edge) => edge.id),
-      ...(node.path ? { declaredInPath: node.path } : {}),
-    }))
-    .filter((requirement) => requirement.supportedByNodeIds.length > 0);
+    .map((node) => {
+      const supportedBy = supportingEntities(graph, node, 'implements_requirement');
+      // The statement is what the document says, copied verbatim. When the node carries no
+      // statement attribute the name is used, which is still the document's own words rather
+      // than a paraphrase.
+      const statement =
+        typeof node.attributes?.statement === 'string' && node.attributes.statement.length > 0
+          ? node.attributes.statement
+          : node.name;
+
+      return {
+        id: `declared:declared:${node.id}`,
+        category: 'declared' as const,
+        statement,
+        // Stated *and* pointing at code is fully evidenced. Stated with nothing in the graph
+        // implementing it is partially evidenced, and dropping it would hide exactly the
+        // requirement a reader most wants to see.
+        status: supportedBy.length > 0 ? ('OBSERVED' as const) : ('PARTIAL' as const),
+        confidence: node.confidence,
+        origin: 'declared' as const,
+        derivation:
+          supportedBy.length > 0
+            ? 'A requirement entity exists in the graph and names code that implements it.'
+            : 'A requirement entity exists in the graph, and nothing in the graph names code that implements it.',
+        evidence: node.evidence,
+        supportedByNodeIds: supportedBy.map((other) => other.id),
+        supportedByEdgeIds: edgesBetween(graph, node, 'implements_requirement').map((edge) => edge.id),
+        ...(node.path ? { declaredInPath: node.path } : {}),
+      };
+    });
 }
 
 /**
