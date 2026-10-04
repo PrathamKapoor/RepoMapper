@@ -427,7 +427,8 @@ describe('evidence drift', () => {
 });
 
 describe('rename detection', () => {
-  const renamedFiles = (from: string, to: string): ParsedFile[] => [
+  /** The base state plus the second file under a new path. */
+  const renamedFiles = (to: string): ParsedFile[] => [
     BASE_FILES[0]!,
     parsedFile(to, {
       entities: [{ kind: 'class', name: 'B', qualifiedName: 'B', startLine: 1, endLine: 4, language: 'typescript' }],
@@ -436,7 +437,7 @@ describe('rename detection', () => {
 
   it('proves a rename when the content is identical', () => {
     const base = snapshotOf(graphOf(BASE_FILES, { 'src/b.ts': 'same-bytes' }));
-    const target = snapshotOf(graphOf(renamedFiles('src/b.ts', 'src/renamed.ts'), { 'src/renamed.ts': 'same-bytes' }));
+    const target = snapshotOf(graphOf(renamedFiles('src/renamed.ts'), { 'src/renamed.ts': 'same-bytes' }));
 
     const report = compareSnapshots(base, target);
     const rename = report.changes.find((change) => change.category === 'NODE_RENAMED');
@@ -455,7 +456,7 @@ describe('rename detection', () => {
 
   it('refuses to call a rename when the content also changed', () => {
     const base = snapshotOf(graphOf(BASE_FILES, { 'src/b.ts': 'bytes-one' }));
-    const target = snapshotOf(graphOf(renamedFiles('src/b.ts', 'src/renamed.ts'), { 'src/renamed.ts': 'bytes-two' }));
+    const target = snapshotOf(graphOf(renamedFiles('src/renamed.ts'), { 'src/renamed.ts': 'bytes-two' }));
     const report = compareSnapshots(base, target);
     expect(count(report, 'NODE_RENAMED')).toBe(0);
     expect(count(report, 'NODE_REMOVED')).toBeGreaterThan(0);
@@ -481,7 +482,7 @@ describe('rename detection', () => {
 
   it('reports removed plus added when no digest was captured at all', () => {
     const base = snapshotOf(graphOf(BASE_FILES));
-    const target = snapshotOf(graphOf(renamedFiles('src/b.ts', 'src/renamed.ts')));
+    const target = snapshotOf(graphOf(renamedFiles('src/renamed.ts')));
     const report = compareSnapshots(base, target);
     expect(count(report, 'NODE_RENAMED')).toBe(0);
     expect(count(report, 'NODE_REMOVED')).toBeGreaterThan(0);

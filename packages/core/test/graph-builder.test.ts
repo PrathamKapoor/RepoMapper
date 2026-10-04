@@ -490,6 +490,46 @@ describe('deployment attribution', () => {
     const attributed = graph.edges.filter((edge) => edge.kind === 'deploys' && edge.to === component?.id);
     expect(attributed.map((edge) => edge.from)).toEqual(['module:docker-compose']);
   });
+
+  it('creates no component for an exposed port, which states no unit', () => {
+    // `EXPOSE 4300` previously produced a deployment component literally named "unknown".
+    const { graph } = build([
+      parsedFile('Dockerfile', {
+        language: 'dockerfile',
+        producer: 'config-scanner',
+        markers: [{ name: 'docker.expose', line: 3, attributes: { ports: '4300' } }],
+      }),
+    ]);
+    expect(graph.nodes.filter((node) => node.kind === 'deployment_component')).toHaveLength(0);
+    expect(graph.nodes.some((node) => node.name === 'unknown')).toBe(false);
+  });
+
+  it('marks a base image as built-from rather than as a declared service', () => {
+    const { graph } = build([
+      parsedFile('Dockerfile', {
+        language: 'dockerfile',
+        producer: 'config-scanner',
+        markers: [
+          { name: 'docker.base_image', line: 1, attributes: { image: 'node:24-bookworm-slim', stage: 'deps' } },
+          { name: 'docker.base_image', line: 9, attributes: { image: 'node:24-bookworm-slim', stage: 'runtime' } },
+        ],
+      }),
+    ]);
+
+    const base = graph.nodes.find((node) => node.kind === 'deployment_component');
+    expect(base?.name).toBe('node:24-bookworm-slim');
+    expect(base?.attributes?.declaredAs).toBe('base_image');
+    // Both stages cite the image, and a base image says nothing about which source is inside
+    // the image built from it, so no module is attributed to it.
+    expect(base?.evidence).toHaveLength(2);
+    expect(graph.edges.filter((edge) => edge.kind === 'deploys' && edge.from.startsWith('module:'))).toHaveLength(1);
+  });
+
+  it('marks a compose service as declared-as-service', () => {
+    const { graph } = build([compose('api', { build: './api' }), parsedFile('api/main.ts')]);
+    const component = graph.nodes.find((node) => node.kind === 'deployment_component');
+    expect(component?.attributes?.declaredAs).toBe('service');
+  });
 });
 
 describe('module content digests', () => {

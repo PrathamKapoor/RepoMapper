@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import {
+  GRAPH_SCHEMA_VERSION,
   type AnalysisRecord,
   type AnalysisResult,
   type AnalysisStatus,
@@ -446,7 +447,11 @@ export class Store {
     const edges = (this.statements.listEdges.all(analysisId) as unknown as EdgeRow[]).map(rowToEdge);
     const evidence = (this.statements.listEvidence.all(analysisId) as unknown as EvidenceRow[]).map(rowToEvidence);
 
-    return { schemaVersion: SCHEMA_VERSION, nodes, edges, evidence };
+    // The *graph model* version, not the database schema version. They are different numbers
+    // that happen to both be called "schema": conflating them made a graph rebuilt from the
+    // store claim a different version from the graph that was stored, so its content digest
+    // did not match the digest recorded at analysis time (D-038).
+    return { schemaVersion: GRAPH_SCHEMA_VERSION, nodes, edges, evidence };
   }
 
   getNode(analysisId: string, nodeId: string): GraphNode | null {

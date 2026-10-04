@@ -134,28 +134,88 @@ function parsePackageJson(source: string, result: ParsedFile, maxProblems: numbe
   }
 }
 
-/** Reads service names and declared ports from a compose file. */
+/**
+ * Reads service names, images, build contexts and declared ports from a compose file.
+ *
+ * Scoped to the `services:` block on purpose. A compose file also declares top-level
+ * `volumes:`, `networks:`, `configs:` and `secrets:` whose entries have the same
+ * two-space indentation as a service, so a pattern that matched "any indented name" reported
+ * a named volume as a deployable unit — a container in the architecture view that cannot run.
+ *
+ * `build:` is accepted in both forms: the short scalar (`build: ./api`) and the long mapping
+ * (`build:\n  context: ./api`), the latter being what Compose writes by default.
+ */
 function parseCompose(source: string, result: ParsedFile): void {
-  const servicePattern = /^ {2}([A-Za-z0-9_.-]+):\s*$/gm;
-  let match: RegExpExecArray | null;
-  while ((match = servicePattern.exec(source)) !== null) {
-    const service = match[1];
-    if (!service) continue;
-    const block = sliceBlock(source, match.index + match[0].length);
-    const image = /^\s+image:\s*(\S+)/m.exec(block)?.[1];
-    const build = /^\s+build:\s*(\S+)/m.exec(block)?.[1];
+  const lines = source.split(/\r?\n/);
+  let inServices = false;
+  let serviceIndent = -1;
+  let current: { service: string; line: number; body: string[] } | null = null;
+  const services: { service: string; line: number; body: string[] }[] = [];
+
+  for (const [index, line] of lines.entries()) {
+    // A top-level key ends the services block. Comments and blank lines do not.
+    const topLevel = /^([A-Za-z0-9_.-]+):\s*(#.*)?$/.exec(line);
+    if (topLevel && line.length > 0 && !/^\s/.test(line)) {
+      inServices = topLevel[1] === 'services';
+      serviceIndent = -1;
+      if (current) {
+        services.push(current);
+        current = null;
+      }
+      continue;
+    }
+    if (!inServices || /^\s*#/.test(line)) continue;
+
+    if (serviceIndent < 0) {
+      // First indented name inside `services:` fixes the indentation services are written at.
+      const header = /^(\s+)([A-Za-z0-9_.-]+):\s*(#.*)?$/.exec(line);
+      if (!header?.[1]) continue;
+      serviceIndent = header[1].length;
+    }
+
+    const name = new RegExp(`^\\s{${serviceIndent}}([A-Za-z0-9_.-]+):\\s*(#.*)?$`).exec(line);
+    if (name?.[1]) {
+      if (current) services.push(current);
+      current = { service: name[1], line: index + 1, body: [] };
+      continue;
+    }
+    current?.body.push(line);
+  }
+  if (current) services.push(current);
+
+  for (const service of services) {
+    const block = service.body.join('\n');
+    const image = /^\s+image:\s*(\S+)/m.exec(block)?.[1] ?? null;
+    const build = buildContextOf(block);
     const ports = [...block.matchAll(/^\s+-\s+["']?(\d+[:/]?\d*)["']?/gm)].map((entry) => entry[1] ?? '');
     result.markers.push({
       name: 'compose.service',
-      line: lineOfIndex(source, match.index),
+      line: service.line,
       attributes: {
-        service,
-        image: image ?? null,
-        build: build ?? null,
+        service: service.service,
+        image,
+        build,
         publishedPorts: ports.filter((port) => port.length > 0).join(','),
       },
     });
   }
+}
+
+/**
+ * The build context of a service, from either supported `build:` form.
+ *
+ * `build: ./api` is a scalar. `build:\n  context: ./api` is a mapping. Returns `null` for a
+ * mapping with no `context:` (the Dockerfile then sits beside the compose file) and for a
+ * scalar that is not a path, which is then not a path this analysis can reason about.
+ */
+function buildContextOf(block: string): string | null {
+  const scalar = /^\s+build:\s*(\S+)\s*$/m.exec(block)?.[1];
+  if (scalar) return scalar;
+  const mapping = /^\s+build:\s*$/m.exec(block);
+  if (!mapping) return null;
+  const tail = block.slice(mapping.index + mapping[0].length);
+  const context = /^\s+context:\s*(\S+)\s*$/m.exec(tail)?.[1];
+  return context ?? null;
 }
 
 /** Reads the base image and exposed ports from a Dockerfile. */
@@ -375,12 +435,6 @@ function splitTopLevel(input: string): string[] {
   }
   if (current.trim().length > 0) parts.push(current);
   return parts;
-}
-
-function sliceBlock(source: string, fromIndex: number): string {
-  const nextService = /^ {2}[A-Za-z0-9_.-]+:\s*$/m.exec(source.slice(fromIndex));
-  if (!nextService) return source.slice(fromIndex);
-  return source.slice(fromIndex, fromIndex + nextService.index);
 }
 
 function lineOfIndex(source: string, index: number): number {

@@ -39,21 +39,28 @@ npm run verify     # lint -> typecheck -> build -> test
 |---|---|---|
 | Lint | `npm run lint` | **0 problems.** Type-aware ESLint 9 with `typescript-eslint` 8 |
 | Typecheck | `npm run typecheck` | **0 errors.** `tsc --noEmit` over source *and* tests in all 6 packages |
-| Build | `npm run build` | **Success.** 5 backend packages via `tsc`; web bundled by Vite in ~3.8 s |
-| Tests | `npm run test` | **215 passed, 8 files, 0 failed** |
+| Build | `npm run build` | **Success.** 5 backend packages via `tsc`; web bundled by Vite |
+| Tests | `npm run test` | **329 passed, 12 files, 0 failed** |
 
 ### Test breakdown
 
 | File | Tests | Covers |
 |---|---|---|
 | `packages/core/test/core.test.ts` | 42 | Confidence algebra, id stability, limits, redaction, evidence store, graph builder, diagnostics |
-| `packages/core/test/graph-builder.test.ts` | 23 | Module naming, import and callee resolution, every graph relationship kind, determinism, limits |
+| `packages/core/test/graph-builder.test.ts` | 35 | Module naming, import and callee resolution, every graph relationship kind, deployment attribution, base-image classification, digests, determinism, limits |
+| `packages/core/test/drift.test.ts` | 34 | Snapshot identity and serialisation, node/edge/evidence/confidence drift, truncation, rename rules, determinism |
 | `packages/ingest/test/ingest.test.ts` | 32 | Path containment, symlink escapes, allow-list, archive entries, language detection, binary sniffing, ignore stack, discovery limits |
-| `packages/parsers/test/parsers.test.ts` | 33 | TS entities, imports, calls, routes, tests, syntax errors; Python entities, imports, continuations, docstrings; config, manifests, SQL, compose, Dockerfile |
-| `packages/artifacts/test/artifacts.test.ts` | 27 | All four projections, mermaid rendering, cycle detection, omission log, gap analysis invariants |
+| `packages/parsers/test/parsers.test.ts` | 37 | TS entities, imports, calls, routes, tests, syntax errors; Python entities, imports, continuations, docstrings; config, manifests, SQL, compose scoping and both `build:` forms, Dockerfile |
+| `packages/artifacts/test/artifacts.test.ts` | 27 | Dependency, module, class and ER projections, mermaid rendering, cycle detection, omission log, gap analysis invariants |
+| `packages/artifacts/test/c4.test.ts` | 32 | C4 context/container/component mapping, evidence and confidence, base-image exclusion, relationship integrity, determinism, cross-artifact consistency |
 | `packages/server/test/analyze.test.ts` | 26 | Full pipeline on TS and Python fixtures, error paths, truncation, secret redaction, determinism, configuration |
-| `packages/server/test/api.test.ts` | 25 | Every endpoint, status codes, validation, graph integrity, persistence round trip, stored-analysis limit |
+| `packages/server/test/api.test.ts` | 25 | Every Phase 1 endpoint, status codes, validation, graph integrity, persistence round trip, stored-analysis limit |
+| `packages/server/test/drift-api.test.ts` | 15 | Snapshot identity over HTTP, drift detection through the real store, rename, ordering, validation, failed-analysis refusal, reproducibility |
+| `packages/web/test/presentation.test.ts` | 17 | The decisions behind the C4 and Drift views: which snapshot a change belongs to, report state classification, relationship support, default comparison |
 | `e2e/self-analysis.test.ts` | 7 | This repository analysed for real; invariants only |
+
+**What the web tests do not cover.** There is no DOM or browser test in this repository.
+`presentation.test.ts` covers the logic those views make, not their rendering. See §5.
 
 ### Tests that found real defects
 
@@ -69,17 +76,20 @@ Recorded because a test suite that has never caught anything is not evidence of 
 | D-017 ambiguous `kind` parameter | `api.test.ts` "filters the graph by node kind" |
 | D-018 artifacts dropping edge kind | `artifacts.test.ts` dependency-graph assertion |
 | D-019 unstable ids from repeated separators | `core.test.ts` slugify assertion |
+| D-031 snapshot provenance reported an empty id | `drift-api.test.ts` snapshot-route assertion |
+| D-032 a failed analysis compared as a deletion | `drift-api.test.ts` "will not compare a failed analysis" |
 | `.tsx` missing from the language map | `ingest.test.ts` language detection |
 | `REPOSITORY_EMPTY` firing on unanalyzable files | `ingest.test.ts` "warns when the repository has nothing analyzable" |
 | Binary files misclassified as unsupported | `ingest.test.ts` skip-reason assertions |
 
-Two further defects were found **only** by building and running the container, and are
-covered by the CI `image` job rather than a unit test:
+Defects found by **real repository and container verification** rather than by a unit test:
 
 | Defect | Symptom |
 |---|---|
 | D-013 | Container exited 1: `Not found handler already set` — only when `staticDir` was configured, which only happens in production |
 | D-014 | Linux image failed to build: `ignore` not callable under NodeNext, while Windows succeeded |
+| D-038 | Container reported `schemaVersion: 1` and a digest that did not match the one recorded at analysis time — the store stamped rebuilt graphs with the *database* schema version |
+| D-039 | C4 container level of this repository contained a named compose **volume** and a Docker **base image**, plus a component literally named `unknown` from `EXPOSE` |
 
 ---
 
@@ -92,14 +102,14 @@ node packages/server/dist/cli.js .
 ```
 
 Output against this repository, run **after the initial commit** so that git history was
-available:
+available (Phase 1 figures, retained for comparison):
 
 ```
 Repository       RepoMapper  (C:\Projects\RepoMapper)
 Commit           23301a072c125e6c39a011a3f268d39db48186f2  branch=main
 Files            92 discovered, 86 analyzable, 8 skipped
 Languages        typescript=55, json=19, markdown=7, unknown=6, yaml=2,
-                 javascript=2, dockerfile=1
+                  javascript=2, dockerfile=1
 Graph            1689 nodes, 2842 edges, 3793 evidence records
 Explicit share   nodes 100.0%, edges 68.0%
 Duration         6571 ms
@@ -111,6 +121,10 @@ Edge kinds  contains=1611, calls=904, configures=126, depends_on=71, imports=63,
             re_exports=30, exposes=13, declared_in=13, deploys=4,
             extends=3, implements=3, authored_by=1
 ```
+
+The same command re-run in Phase 2 against the grown tree produced **2173 nodes, 3769 edges,
+5280 evidence records**. The growth is from Phase 2's own code plus the `deploys` edges
+created by build-context attribution (D-034).
 
 Findings that demonstrate real extraction rather than hard-coded output:
 
@@ -151,6 +165,86 @@ pipeline and asserts invariants, not counts:
 Analysing the same repository twice produces byte-identical node id lists, node counts and
 edge counts. Asserted both in the e2e test and in `analyze.test.ts` ("is deterministic
 across repeated runs of the same repository").
+
+### 3d. Snapshots and drift — VERIFIED
+
+Two consecutive analyses of an unchanged repository, then a real change, then a third
+analysis. The change set was introduced deliberately: a **new module**, a **pure rename**
+with content untouched, and a **comment-only edit** to a third file. Performed against an
+isolated copy of this repository under a temporary directory, with its own Git history, so
+nothing in the working tree was disturbed.
+
+**Unchanged content → one identity.**
+
+```
+state A   snap_ea4aa18150f22ff8   2045 nodes, 3502 edges, 5018 evidence
+state A'  snap_ea4aa18150f22ff8   identical
+GET /api/analyses/:id/drift → identical: true, comparable: true, totalChanges: 0
+```
+
+**After the change set:**
+
+```
+state A   snap_990760c77824bfea   commit 56152651
+state B   snap_48c9d2b5c3d15ad4   commit 56152651
+identical false | comparable true | targetIncomplete false | removalConfidence EXPLICIT
+
+nodesAdded 5   nodesRemoved 0   nodesModified 20   nodesRenamed 1
+relationshipsAdded 27   relationshipsRemoved 21   relationshipsModified 0
+evidenceAdded 33  evidenceRemoved 25  evidenceChanged 25  confidenceChanged 0
+totalChanges 157      change records 157      reproducible true
+```
+
+Observed change records, each traced back to a real location:
+
+| Category | Entity | Claim | Evidence before | Evidence after |
+|---|---|---|---|---|
+| `NODE_RENAMED` | `module:packages/core/src/diagnostics` → `…/diagnostic-log` | `STRONGLY_INFERRED` | `packages/core/src/diagnostics.ts:1` | `packages/core/src/diagnostic-log.ts:1` |
+| `NODE_ADDED` | `class:snapshotledger` | `EXPLICIT` | — | `packages/core/src/snapshot-extra/helper.ts:6` |
+| `NODE_ADDED` | `function:digestof` | `EXPLICIT` | — | `packages/core/src/snapshot-extra/helper.ts:2` |
+| `NODE_MODIFIED` | `class:analysiserror` | `EXPLICIT` | `…/diagnostics.ts:106` | `…/diagnostic-log.ts:106` |
+| `EDGE_ADDED` | `function:digestof\|calls\|constant:detailfortype.parts` | `EXPLICIT` | — | `…/snapshot-extra/helper.ts:3` |
+| `EVIDENCE_CHANGED` | `class:analysiserror` | `EXPLICIT` | `…/diagnostics.ts:106` | `…/diagnostic-log.ts:106` |
+
+Observations:
+
+- The rename was reported **once**, as a rename. The same file did not also appear as a
+  removal and an addition — the rename pairing consumed both.
+- Entities declared in the renamed file are reported as modified, with their citations on both
+  sides, which is how a reader follows a moved declaration.
+- `nodesRemoved 0` is correct: the class and constant nodes declared in the renamed file kept
+  their identity because their qualified names did not change. Only the containing module
+  changed identity, and that was the rename.
+- The commit hash is the same on both sides because the change was made in the working tree
+  without committing. This is the documented behaviour: `headCommit` is `HEAD`, not a dirty
+  tree hash.
+
+### 3e. C4 architecture recovery — VERIFIED
+
+`GET /api/analyses/:id/artifacts/c4-*` against **this repository** (2173 nodes, 3769 edges):
+
+| Level | Nodes | Relationships | Honest state |
+|---|---|---|---|
+| `c4-context` | 1 (the software system) | 0 | `insufficientEvidence: true`. No external system recovered: the one declared service image is this project's own image. Records the omission for the unrecognised image, for the base image, and for human actors. |
+| `c4-container` | 2 (software system + `repoatlas`) | 1 | One container, `EXPLICIT`, image `repoatlas:0.1.0`, cited to `docker-compose.yml:7`. 25 third-party packages excluded with the reason recorded. |
+| `c4-component` | 96 | 181 | Every module the compose build context (`context: .`) places in the image, plus the container for context. Each `contains` relationship carries the real `deploys` graph edge id at `STRONGLY_INFERRED` and cites `docker-compose.yml`. |
+
+Sample relationships, showing that each one names the graph edge behind it:
+
+```
+contains repository:repomapper -> deployment_component:repoatlas  EXPLICIT
+        support: node deployment_component:repoatlas   evidence: docker-compose.yml:7
+contains deployment_component:repoatlas -> module:decisions  STRONGLY_INFERRED
+        support: edge module:decisions|deploys|deployment_component:repoatlas
+depends_on module:packages/web/src/app -> module:packages/web/src/drift  EXPLICIT
+        support: edge module:packages/web/src/app|imports|module:packages/web/src/drift
+        evidence: packages/web/src/app.tsx:15
+```
+
+**Not recovered, and recorded as omitted rather than invented:** human actors (nothing in the
+graph describes who uses the system), external systems (no datastore or broker image is
+declared), third-party packages as containers, and any component for a container that declares
+no build context.
 
 ---
 
@@ -211,6 +305,39 @@ docker run -d --name repoatlas-verify -p 127.0.0.1:4321:4300 \
 The database row counts matching the API response confirms persistence round-trips
 correctly through the container's volume.
 
+### 4c. Phase 2 in the container — VERIFIED
+
+Container rebuilt from the Phase 2 tree and re-run. Both the read-only self-analysis mount
+and a writable isolated fixture were used, the second so a real change could be introduced
+between two analyses from the host.
+
+| Check | Result |
+|---|---|
+| `docker build` | **Success** |
+| `GET /api/health` | 200 — `ok`, `pathAllowListEnforced: true`, `allowedRootCount: 1` |
+| `GET /api/meta` | 200 — **7 artifacts**, now including `c4-context`, `c4-container`, `c4-component` |
+| `GET /` | 200 `text/html` |
+| `GET /some/spa/route` (`Accept: text/html`) | 200 `text/html` — SPA fallback |
+| `GET /api/nope` | **404 JSON** |
+| `POST {"/etc"}` | **403** `PATH_NOT_ALLOWED` |
+| `POST {"/repos/fixture/../.."}` | **403** `PATH_NOT_ALLOWED` — traversal refused |
+| `POST {"/repos/RepoMapper"}` | **201** — 2172 nodes, 3772 edges, 5280 evidence |
+| `GET .../snapshot` | 200 — `snap_fe95c5da68e5a259`, `graphSchemaVersion: 2`, `extractorVersion: 1.0.0` |
+| `GET .../graph` | 200 — `schemaVersion: 2` (D-038 fixed; was `1`) |
+| `GET .../artifacts/c4-container` | 200 — 2 nodes, 1 relationship, cited to `docker-compose.yml:7` |
+| `GET .../artifacts/c4-component` | 200 — 96 nodes, 181 relationships |
+| Two analyses of unchanged content | `identical: true`, `totalChanges: 0`, same snapshot id |
+| Analysis after a new module was added | `totalChanges: 15`; `class:ledger` added at `packages/core/src/extra/ledger.ts:1` |
+| Analysis after a real rename | `nodesRenamed: 1` — `module:core/src/diagnostics` → `module:core/src/diagnostics-renamed`, `claimConfidence: STRONGLY_INFERRED`, evidence on both sides, **0 removals and 0 additions for the same file** |
+| Drift of an analysis against itself | 200, `identical: true` |
+| Container logs | No errors; warnings only |
+
+One environment-specific observation, reported rather than worked around: the writable fixture
+and the read-only self-analysis mount are owned by the host user, so `git` refuses them inside
+the container with *"detected dubious ownership in repository"*. RepoAtlas recorded
+`GIT_UNAVAILABLE`, left `headCommit` empty and continued — the documented degradation path.
+See D-040 for why this is not silently disabled.
+
 ---
 
 ## 5. Not verified — read this
@@ -219,38 +346,46 @@ Stated plainly. None of these are claimed as working.
 
 | Item | Status | Why |
 |---|---|---|
-| **Browser rendering of the UI** | **Unknown** | The API and the built bundle were verified, and the HTML shell is served, but the UI was never opened in a real browser. A React runtime error would not be caught by any current check. Run `npm run dev:web` and open `localhost:5173`. |
-| **Git-backed facts** (commits, contributors, ownership) | **Verified** | Confirmed against real history after the initial commit: `branch=main`, HEAD resolved, and `commit`, `contributor` and `authored_by` entities produced. Only one commit existed at that point, so `modifies` edges from multi-commit history are covered by unit tests rather than observed here. |
-| **C4, sequence, DFD, use-case, activity, deployment diagrams** | **Not implemented** | Each needs graph facts that do not exist yet. Deliberately absent rather than drawn from guesses. |
+| **Browser rendering of the UI** | **Unknown** | The API, the built bundle and the served HTML shell are verified, and the C4 and Drift views' decision logic is unit-tested, but the UI has **never been opened in a real browser**. A React runtime error, a layout failure or a broken React Flow canvas would not be caught by any current check. Run `npm run dev:web` and open `localhost:5173`. |
+| **C4 rendering in a browser** | **Unknown** | The C4 model, its evidence, its confidence and its exports are verified through the API and in tests. Whether the C4 canvas, level selector and element panel render correctly on screen is unverified, for the same reason as the row above. |
+| **Drift rendering in a browser** | **Unknown** | Same. The report payload, every state it can be in, and the drill-through from a change row to the entity inspector are covered by tests at the logic level; the rendering is not. |
+| **Git-backed facts** (commits, contributors, ownership) | **Verified** | Confirmed against real history after the initial commit: `branch=main`, HEAD resolved, and `commit`, `contributor` and `authored_by` entities produced. `modifies` edges from multi-commit history are covered by unit tests. **Exception:** inside the container, a bind-mounted repository owned by another user is refused by `git` as dubious ownership, so no history is read there (D-040). |
+| **Sequence, DFD, use-case, activity and deployment diagrams** | **Not implemented** | Each needs graph facts that do not exist yet. Deliberately absent rather than drawn from guesses. C4 context, container and component levels **are** implemented and verified (§3e). |
 | **Requirements extraction and traceability** | **Not implemented** | Needs document-structure parsing. |
-| **Consistency and drift engine** | **Not implemented** | Needs two comparable analyses. Deterministic ids are the prerequisite and are in place. |
+| **In-graph consistency checking** | **Not implemented** | Drift answers "what changed between two states". It does not look for contradictions *inside* one graph — a route with no handler, an import nothing calls, a table no code reads. |
+| **Symbol-level rename detection** | **Not implemented** | A class moved between files is reported as removed plus added. Only whole-file renames with unchanged content are proved (D-029). |
+| **Git-corroborated rename detection** | **Not implemented** | `git log --follow` would corroborate a rename where history exists; not used, because a snapshot must be comparable without Git. |
 | **Archive upload over HTTP** | **Not implemented** | `extractTarArchive()` is implemented and unit-tested (unsafe paths, empty archive, size ceiling, real tarball). No route reaches it. |
 | **CORS** | **Parsed but not applied** | `REPOATLAS_CORS_ORIGIN` is validated by configuration but never wired into the Fastify instance. Cross-origin browser clients will be blocked. |
-| **Rate limiting / API authentication** | **Not implemented** | Known gap. Documented in `docs/deployment.md`. |
-| **Performance characteristics at scale** | **Not measured** | No benchmark suite. One observed data point: 91 files / 5 500 ms on this machine. That is a single observation, not a benchmark, and says nothing about a 40 000-file monorepo. |
+| **Rate limiting / API authentication** | **Not implemented** | Known gap. Documented in `docs/deployment.md`. The service must not be described as production-secure. |
+| **Performance characteristics at scale** | **Not measured** | No benchmark suite. The observations in §6 are single runs, not benchmarks, and say nothing about a 40 000-file monorepo. |
 | **Memory profile** | **Not measured** | No instrumentation. |
 | **Symlink tests on Windows** | **Partially covered** | Creating symlinks needs elevation, so those two tests early-return. The traversal logic is covered by non-symlink cases; real symlink coverage happens in Linux CI. |
 | **Code coverage percentage** | **Not measured** | `npm run test:coverage` is available but was not run, so no percentage is claimed. |
-| **Node versions other than 24** | **Not verified** | `engines` requires >= 22.5 because of `node:sqlite`. Only 24.19.0 and the container's 24.21.0 were exercised. |
+| **Node versions other than 24** | **Not verified** | `engines` requires >= 22.5 because of `node:sqlite`. Only 24.19.0 and the container's version were exercised. |
 | **Non-Windows, non-Linux hosts** | **Not verified** | Path handling is written to be platform-neutral and is exercised on Windows and in Linux containers, but no macOS run was performed. |
 | **Large-repository limits in practice** | **Not verified** | Limits are unit-tested at small values. Whether 20 000 files / 512 MB completes acceptably in wall-clock time is unknown. |
+| **Drift across an extractor or schema change** | **Implemented, deliberately not diffed** | Two snapshots whose extractor or schema versions differ return `comparable: false` with an explanation and zero changes. Covered by tests; no real cross-version pair exists to compare. |
 
 ---
 
 ## 6. Performance observation — NOT a benchmark
 
-One run, on the machine in §1, warm filesystem cache, `includeGitHistory: false`:
+Single runs on the machine in §1, warm filesystem cache. Every number below is **one
+observation**. None was repeated, variance was not measured, and none was taken on a cold
+cache or under load. They are existence proofs that the pipeline completes, nothing more.
 
-| Metric | Value |
-|---|---|
-| Files discovered / analyzable | 92 / 86 |
-| Nodes / edges / evidence records | 1689 / 2842 / 3793 |
-| Wall clock | 6571 ms |
+| Metric | Phase 1 run | Phase 2 run |
+|---|---|---|
+| Files discovered / analyzable | 92 / 86 | 96 / 90 |
+| Nodes / edges / evidence records | 1689 / 2842 / 3793 | 2173 / 3769 / 5280 |
+| Wall clock, CLI | 6571 ms | — |
+| Wall clock, `POST /api/analyses` (in process) | — | 1.7–1.9 s |
+| `GET /api/analyses/:id/drift` over 2173 nodes / 3769 edges | — | 245–305 ms |
 
-This is reported because it is the one number that was actually observed. It is **not** a
-benchmark: it was not repeated, variance was not measured, and it was not taken on a cold
-cache or under concurrent load. Treat it as an existence proof that the pipeline completes
-in seconds on a small repository, and nothing more.
+The drift figure covers loading both graphs from SQLite, recomputing both content digests
+(O(nodes + edges + evidence)) and comparing them. It is one measurement on one machine and
+must not be quoted as a throughput characteristic.
 
 Breakdown by stage was not instrumented. If stage-level timings are needed, they must be
 added before any claim about where time is spent.
@@ -260,16 +395,24 @@ added before any claim about where time is spent.
 ## 7. Honest summary
 
 **Working and verified:** the pipeline from a repository path to a fully-cited knowledge
-graph; evidence and confidence on every fact; four artifact projections with honest
-omission reporting; gap analysis with auditable `NOT_FOUND` claims; SQLite persistence; the
-HTTP API with correct status codes and containment; the built web bundle and its served
-shell; a working container image; 215 passing tests; clean lint and typecheck.
+graph; evidence and confidence on every fact; seven artifact projections — including three
+C4 levels — with honest omission reporting; gap analysis with auditable `NOT_FOUND` claims;
+immutable, content-addressed snapshots; deterministic drift detection over nodes, edges,
+citations and confidence, with rename proved rather than guessed and removals withheld when
+the target analysis was incomplete; SQLite persistence; the HTTP API with correct status
+codes and containment; the built web bundle and its served shell; a working container image
+verified through Phase 2; 329 passing tests; clean lint and typecheck.
 
 **Partial and labelled as such:** language coverage (TS/JS solid, Python structural);
-call resolution (name-based, never labelled explicit); inline analysis (holds a
-connection); persistence (single-writer).
+call resolution (name-based, never labelled explicit); C4 component boundaries (derived from
+a declared build context, which is an inference); rename detection (whole-file, content-
+identical only); inline analysis (holds a connection); persistence (single-writer); the web
+UI (logic tested, rendering unverified).
 
-**Not built:** the artifact types listed in §5, requirements, consistency and drift, the
-archive-upload endpoint, CORS, rate limiting, API authentication.
+**Not built:** sequence, DFD, use-case, activity and deployment diagrams; requirements
+extraction and traceability; in-graph consistency checking; symbol-level and
+Git-corroborated renames; the archive-upload endpoint; CORS; rate limiting; API
+authentication.
 
-**Unknown:** browser rendering, performance at scale, memory profile, coverage percentage.
+**Unknown:** browser rendering of every screen including C4 and Drift; performance at scale;
+memory profile; coverage percentage.

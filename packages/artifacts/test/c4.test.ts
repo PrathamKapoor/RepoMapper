@@ -208,6 +208,53 @@ describe('C4 level 2 — container', () => {
     expect(artifact.nodes.some((node) => node.label === 'express')).toBe(false);
     expect(artifact.omitted.some((entry) => entry.reason.includes('third-party packages are excluded'))).toBe(true);
   });
+  it('does not treat a Docker base image as a container of this system', () => {
+    // `FROM node:24-bookworm-slim` states what an image is built from, not a runtime unit.
+    // Drawing it would put a dependency in the architecture beside the system itself.
+    const graph = graphFrom([
+      parsedFile('Dockerfile', {
+        language: 'dockerfile',
+        producer: 'config-scanner',
+        markers: [{ name: 'docker.base_image', line: 1, attributes: { image: 'node:24-bookworm-slim', stage: 'runtime' } }],
+      }),
+      parsedFile('src/a.ts'),
+    ]);
+
+    const artifact = c4Of(graph, 'container');
+    expect(artifact.nodes.some((node) => node.label === 'node:24-bookworm-slim')).toBe(false);
+    expect(artifact.insufficientEvidence).toBe(true);
+    expect(artifact.omitted.some((entry) => entry.reason.includes('only base images were declared'))).toBe(true);
+  });
+
+  it('does not treat a base image as an external system at context level', () => {
+    const graph = graphFrom([
+      parsedFile('Dockerfile', {
+        language: 'dockerfile',
+        producer: 'config-scanner',
+        markers: [{ name: 'docker.base_image', line: 1, attributes: { image: 'postgres:16', stage: 'runtime' } }],
+      }),
+    ]);
+    const artifact = c4Of(graph, 'context');
+    // A build dependency is not something the running system communicates with.
+    expect(artifact.nodes.filter((node) => node.c4Kind === 'external_system')).toHaveLength(0);
+    expect(artifact.omitted.some((entry) => entry.reason.includes('base images are not external systems'))).toBe(true);
+  });
+
+  it('records a base image as an omission rather than dropping it silently', () => {
+    const graph = graphFrom([
+      parsedFile('Dockerfile', {
+        language: 'dockerfile',
+        producer: 'config-scanner',
+        markers: [{ name: 'docker.base_image', line: 1, attributes: { image: 'node:24-bookworm-slim', stage: 'runtime' } }],
+      }),
+      composeFile([{ service: 'api', build: './api' }]),
+      parsedFile('api/main.ts'),
+    ]);
+    const artifact = c4Of(graph, 'container');
+    const omission = artifact.omitted.find((entry) => entry.reason.includes('base images are not containers'));
+    expect(omission?.count).toBe(1);
+    expect(omission?.examples).toEqual(['node:24-bookworm-slim']);
+  });
 });
 
 describe('C4 level 3 — component', () => {

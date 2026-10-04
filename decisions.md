@@ -756,6 +756,144 @@ Rules for this file:
   already builds before testing.
 - **Files:** `handoff.md`, `packages/*/package.json`, `vitest.config.ts`
 
+### D-036: The UI's decisions live in testable functions, because no browser test exists
+
+- **Date / phase / commit:** Phase 2
+- **Context:** Phase 1 recorded honestly that browser rendering is **unverified**: there is no
+  DOM test, no headless browser and no visual check in this repository. That is the state in
+  which untested UI logic does most of its damage, because nothing exercises it until a person
+  opens the page.
+- **Decision:** The C4 and Drift views keep their decisions in `packages/web/src/presentation.ts`
+  as pure functions — which analysis a drift change belongs to, how a report's state is
+  classified, what justifies a projected relationship, which analysis to compare against by
+  default — and the components call those functions. `packages/web/test/presentation.test.ts`
+  covers them.
+- **Why:** These are the decisions where a wrong answer *misleads* rather than merely looking
+  wrong. Inspecting a removal in the target snapshot 404s and reads as a broken link. Rendering
+  a failed request as "nothing changed" is the single most damaging thing a drift view can do.
+  Both are testable without a browser; whether React draws the result is not.
+- **Alternatives considered:**
+  - **Add jsdom + testing-library and render the components:** rejected for now. It adds a DOM
+    dependency and still does not verify layout, fonts or the React Flow canvas, so it would
+    convert an honest "unverified" into a misleading "partially verified" while adding
+    maintenance surface. Revisit when browser verification is on the table.
+- **Consequences:** `packages/web/tsconfig.json` now includes `test`, so the type-aware linter
+  covers the new file (D-024). The honest claim remains: **UI logic is unit-tested; UI rendering
+  is not verified.**
+- **Files:** `packages/web/src/presentation.ts`, `packages/web/test/presentation.test.ts`,
+  `packages/web/src/c4.tsx`, `packages/web/src/drift.tsx`, `packages/web/tsconfig.json`
+
+### D-037: C4 and drift are their own tabs, not extra buttons on existing ones
+
+- **Date / phase / commit:** Phase 2
+- **Context:** Drift needs a *second* analysis selected, which no existing tab has room for.
+  C4 needs progressive disclosure across three levels, which the existing single-select
+  `ProjectionTab` expresses as a flat row of buttons — fine for two views of the same kind, not
+  for three levels of one model.
+- **Decision:** `C4Tab` and `DriftTab` (`packages/web/src/c4.tsx`, `packages/web/src/drift.tsx`)
+  are separate tabs. C4 uses a level selector that reads as a progression; Drift uses a
+  base-analysis selector defaulting to the previous analysis. `EntityDrawer` now takes its own
+  `analysisId` rather than inheriting the sidebar's.
+- **Why:** Mixing three abstraction levels into the Architecture tab would invite reading a
+  module as an architecture, and would make the omission reporting — the part that carries the
+  honesty of these views — impossible to see. Giving the drawer an explicit analysis id is what
+  lets a base-state removal be inspected at all.
+- **Consequences:** Eight tabs. The sidebar is unchanged; the inspector is opened from C4 and
+  from Drift as well as from the entity tables.
+- **Files:** `packages/web/src/app.tsx`, `packages/web/src/c4.tsx`,
+  `packages/web/src/drift.tsx`, `packages/web/src/entity-drawer.tsx`
+
+### D-038: Bug — the store stamped rebuilt graphs with the database schema version
+
+- **Date / phase / commit:** Phase 2
+- **Symptom:** In the container, `GET /api/analyses/:id/snapshot` reported
+  `graphSchemaVersion: 1` while the same analysis reported `2` at analysis time, and the
+  content digest recomputed from the stored graph
+  (`5eb90d4fc2411ae3…`) did **not** match the digest recorded during the analysis
+  (`fd93acbaeb0b0c1e…`). `GET /graph` also reported `schemaVersion: 1`.
+- **Root cause:** `Store.getGraph()` returned `{ schemaVersion: SCHEMA_VERSION, … }` where
+  `SCHEMA_VERSION` is the **SQLite schema** version in `packages/server/src/store.ts`. Two
+  different numbers, both called "schema", collided on the same field name. The collision was
+  invisible until Phase 2 made the graph's version part of the content digest — the digest
+  covers `schemaVersion`, so a graph that claimed a different version hashed differently from
+  the very graph it was stored from.
+- **Why it mattered:** The persisted `analyses.graph_digest` was unusable: it did not describe
+  the graph that came back out of the database. Drift still worked, because both sides of a
+  comparison are rebuilt the same way — but a stored digest that disagrees with a recomputed
+  one is a trap for anything that later trusts it.
+- **Fix:** `getGraph()` stamps `GRAPH_SCHEMA_VERSION` from `@repoatlas/core`. The two versions
+  are now separate names for separate things.
+- **Why the container and not the tests caught it:** the Phase 2 API tests use `:memory:`, where
+  the round trip is fast enough to have passed while the assertion was absent — there simply
+  was no assertion comparing the stored digest with the recomputed one.
+- **Regression test:** `packages/server/test/drift-api.test.ts` — "recomputes the same identity
+  from the stored graph as from the analysed one", which compares the stored digest, the
+  recomputed digest and the `/graph` schema version against `GRAPH_SCHEMA_VERSION`.
+- **Files:** `packages/server/src/store.ts`, `packages/server/test/drift-api.test.ts`
+
+### D-039: Bug — compose volumes and Docker base images were reported as containers
+
+- **Date / phase / commit:** Phase 2
+- **Symptom:** Running C4 against this repository produced a container level containing four
+  containers: `node:24-bookworm-slim` (a base image), `repoatlas` (the real service),
+  `repoatlas-data` (a **named volume** from the `volumes:` block) and `unknown` (created from
+  an `EXPOSE 4300` line, which names nothing). Component level was empty, because the compose
+  file writes `build:` in its long mapping form and the parser only understood the short one.
+- **Root cause:** three separate extraction faults, all in the same area.
+  1. `parseCompose()` matched **any** two-space-indented `name:` in the file. `volumes:`,
+     `networks:`, `configs:` and `secrets:` entries are indented identically to services.
+  2. `parseCompose()` read `build:` only as a scalar (`build: ./api`). Compose's default form
+     is a mapping (`build:\n  context: ./api`), which produced `build: null` — so no module
+     could ever be attributed to a container, and C4 level 3 was empty for every real
+     repository.
+  3. `addDeploymentComponent()` created a `deployment_component` for every marker, so
+     `docker.base_image` and `docker.expose` each became a component. An `EXPOSE` line carries
+     no service name and no image, hence the node literally called `unknown`.
+- **Fix:**
+  - `parseCompose()` is scoped to the `services:` block and tracks the indentation services are
+    written at, so top-level sections cannot contribute names. It accepts both `build:` forms
+    and reads `context:` from the long one.
+  - `docker.expose` creates no component. It states a port on an image, not a unit.
+  - Every component records `attributes.declaredAs` — `'service'` or `'base_image'` — and the
+    C4 projection draws only runtime units, recording the rest in `omitted[]`. `FROM x` is a
+    build dependency; drawing it beside the system would place a dependency in the
+    architecture as if it were part of the system.
+  - Build-context attribution now runs only for `compose.service`, since a base image says
+    nothing about which source is inside the image built from it.
+- **Why it matters beyond cosmetics:** this is precisely the fabrication failure the product
+  exists to prevent, and it was happening silently in our own repository. It was found by
+  running C4 against a real repository, not by a test — no test asserted that a volume is not
+  a container, because nobody had looked.
+- **Regression tests:** `parsers.test.ts` — "does not report a named volume or network as a
+  service", "reads the build context from both the short and the long form", "reports no build
+  context when the mapping form omits it", "records the line each service is declared on";
+  `graph-builder.test.ts` — "creates no component for an exposed port", "marks a base image as
+  built-from rather than as a declared service"; `c4.test.ts` — three cases covering base-image
+  exclusion at context and container level.
+- **Files:** `packages/parsers/src/config.ts`, `packages/core/src/graph-builder.ts`,
+  `packages/artifacts/src/c4.ts`
+
+### D-040: Git's "dubious ownership" guard is not disabled
+
+- **Date / phase / commit:** Phase 2
+- **Symptom:** Analysing a bind-mounted repository from inside the container produced
+  `headCommit: null` and a `GIT_UNAVAILABLE` diagnostic. `git -C /repos/fixture rev-parse HEAD`
+  inside the container printed *"fatal: detected dubious ownership in repository"*.
+- **Root cause:** git refuses a repository whose owner differs from the process user. The
+  container runs as `node`; a bind mount from Windows is owned by root.
+- **Decision:** do **not** pass `-c safe.directory=*`. The guard exists because a repository
+  owned by another user is a known way to make a git client execute something it should not.
+  RepoAtlas already neutralises hooks, credential helpers, external diff drivers and protocol
+  allow-lists (`packages/ingest/src/git.ts`), and it reads only — but silently switching off a
+  git safety check to make a number look better is exactly the kind of change that should be an
+  operator's decision, not a default.
+- **Consequences:** History is unavailable for repositories the container does not own. The
+  analysis still succeeds, the diagnostic says why, and every other fact is unaffected — which
+  is what was observed. The remedy is documented in `docs/deployment.md`: run the container
+  with the repository owned by the same uid, or add a `safe.directory` entry in the image.
+- **Files:** `packages/ingest/src/git.ts` (unchanged), `docs/deployment.md`,
+  `docs/verification.md`
+
 ---
 
 ## Deferred, with reasons

@@ -752,6 +752,10 @@ function addDeploymentComponent(
   marker: ParsedFileRef['markers'][number],
   moduleByPath: ReadonlyMap<string, string>,
 ): void {
+  // `EXPOSE 4300` states a port on an image, not a unit that runs. Creating a component for it
+  // produced a deployment component literally named "unknown" in the architecture view.
+  if (marker.name === 'docker.expose') return;
+
   const name = String(marker.attributes.service ?? marker.attributes.image ?? 'unknown');
   const markerEvidence = evidence.add({
     kind: 'INFRASTRUCTURE_FILE',
@@ -772,11 +776,21 @@ function addDeploymentComponent(
     startLine: marker.line,
     evidence: [markerEvidence],
     confidence: 'EXPLICIT',
-    attributes: { ...marker.attributes },
+    attributes: {
+      ...marker.attributes,
+      // `FROM x` says what an image is built from; a compose service says what runs. The
+      // distinction decides whether this belongs in a container view at all, so it is recorded
+      // as a fact rather than re-derived by whichever projection needs it.
+      declaredAs: marker.name === 'compose.service' ? 'service' : 'base_image',
+    },
   });
   builder.addEdge({ from: moduleId, to: componentId, kind: 'deploys', confidence: 'EXPLICIT', evidence: [markerEvidence] });
 
-  attributeBuildContext(builder, file, marker, componentId, markerEvidence, moduleByPath);
+  // Only a service states a build context. A base image says nothing about which source is
+  // inside the image built from it.
+  if (marker.name === 'compose.service') {
+    attributeBuildContext(builder, file, marker, componentId, markerEvidence, moduleByPath);
+  }
 }
 
 /**

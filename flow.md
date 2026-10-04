@@ -491,21 +491,52 @@ Notes that matter:
 
 ```
 main.tsx → App                                        packages/web/src/app.tsx
- ├─ api.ts          every fetch, typed against the server contract
- ├─ Tabs
- │    Overview        stats, languages, view availability, evidence coverage
- │    Architecture    dependency-graph and er-diagram
- │    Structure       module-graph and class-diagram
- │    Evidence        entity index + evidence records
- │    Gaps            gap report with status, observations, checked list
- │    Diagnostics     every diagnostic from the run
- └─ EntityDrawer                                     packages/web/src/entity-drawer.tsx
-      Any entity, anywhere → node + relationships + evidence + confidence
+  ├─ api.ts          every fetch, typed against the server contract
+  ├─ Tabs
+  │    Overview        stats, languages, view availability, evidence coverage
+  │    Architecture    dependency-graph and er-diagram
+  │    C4              c4-context → c4-container → c4-component, progressive disclosure
+  │    Structure       module-graph and class-diagram
+  │    Drift           drift report for two selected analyses
+  │    Evidence        entity index + evidence records
+  │    Gaps            gap report with status, observations, checked list
+  │    Diagnostics     every diagnostic from the run
+  ├─ EntityDrawer                                     packages/web/src/entity-drawer.tsx
+  │      Any entity, anywhere → node + relationships + evidence + confidence
+  ├─ c4.tsx                                          packages/web/src/c4.tsx
+  │      level selector → GraphView → C4ElementPanel (derivation, evidence, relationships)
+  ├─ drift.tsx                                       packages/web/src/drift.tsx
+  │      base/target selectors → summary → ChangeRow (evidence before | after)
+  └─ presentation.ts                                 packages/web/src/presentation.ts
+         analysisForChange() · driftState() · describeSupport() · defaultComparisonId()
 ```
 
 `graph.tsx` renders an artifact deterministically (D-021) with confidence encoded as
 solid versus dashed edges. Clicking a node opens the inspector, which is where a selected
 entity connects across representations.
+
+### 9a. The chain the UI must preserve
+
+```
+C4 element  ──derivation, graphNodeIds──▶  graph entity  ──▶  relationships
+                                                            ──▶  evidence  ──▶  file:line
+
+drift item  ──entityId──▶  entity in the snapshot it belongs to  ──▶  evidence before / after
+```
+
+Two rules make that chain honest:
+
+- **The inspector carries its own analysis id.** A drift row that is a removal belongs to the
+  *base* snapshot, whose entity does not exist in the analysis selected in the sidebar.
+  `analysisForChange()` picks the side; opening the wrong one would 404 and read as a broken
+  link rather than a correct answer.
+- **Unknown is never rendered as unchanged.** `driftState()` returns `identical`,
+  `incomparable`, `changed` or `unknown`, and the four render differently. A failed request and
+  a report with no differences must not look the same.
+
+`presentation.ts` holds these decisions as pure functions so they can be tested without a DOM.
+There is no browser test in this repository, so nothing verifies that React renders these
+screens — see `docs/verification.md`.
 
 ---
 

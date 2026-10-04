@@ -163,15 +163,36 @@ export interface ArtifactNode {
   detail?: string;
   path?: string;
   evidence: EvidenceRef[];
+  /** C4 abstraction level. Present only on C4 elements. */
+  c4Level?: C4Level;
+  /** C4 element kind. Present only on C4 elements. */
+  c4Kind?: C4ElementKind;
+  /** Technology named by repository evidence, e.g. a declared image. */
+  technology?: string;
+  /** Graph nodes this element was derived from. Never empty on a C4 element. */
+  graphNodeIds?: string[];
+  /** The explicit rule that produced this element, in words. */
+  derivation?: string;
 }
+
+export type C4Level = 'context' | 'container' | 'component';
+
+export type C4ElementKind = 'software_system' | 'container' | 'component' | 'external_system' | 'person';
 
 export interface ArtifactEdge {
   id: string;
+  kind: string;
   source: string;
   target: string;
   label?: string;
   confidence: Confidence;
   evidence: EvidenceRef[];
+  c4Level?: C4Level;
+  /** Graph edges that justify this relationship. */
+  supportingEdgeIds?: string[];
+  /** Graph nodes that justify this relationship where no edge does. */
+  supportingNodeIds?: string[];
+  derivation?: string;
 }
 
 export interface Artifact {
@@ -259,6 +280,98 @@ export interface MetaResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Snapshots and drift
+// ---------------------------------------------------------------------------
+
+/**
+ * Identity of one repository state.
+ *
+ * `snapshotId` and `graphDigest` are content-derived: two analyses of unchanged content
+ * share them, which is what makes "nothing changed" decidable. Provenance fields are
+ * recorded but deliberately excluded from the identity.
+ */
+export interface SnapshotReference {
+  snapshotId: string;
+  analysisId: string;
+  repositoryName: string;
+  repositoryPath: string;
+  sourceRevision: string | null;
+  branch: string | null;
+  createdAt: string;
+  graphDigest: string;
+  extractorVersion: string;
+  graphSchemaVersion: number;
+  truncated: boolean;
+}
+
+export interface SnapshotResponse {
+  snapshot: SnapshotReference;
+  stats: GraphStats;
+}
+
+export type DriftCategory =
+  | 'NODE_ADDED'
+  | 'NODE_REMOVED'
+  | 'NODE_MODIFIED'
+  | 'NODE_RENAMED'
+  | 'EDGE_ADDED'
+  | 'EDGE_REMOVED'
+  | 'EDGE_MODIFIED'
+  | 'EVIDENCE_ADDED'
+  | 'EVIDENCE_REMOVED'
+  | 'EVIDENCE_CHANGED'
+  | 'CONFIDENCE_CHANGED';
+
+/** How strongly the drift claim itself is supported, independent of the entity's confidence. */
+export type DriftClaimConfidence = 'EXPLICIT' | 'STRONGLY_INFERRED' | 'INDETERMINATE';
+
+export interface DriftChange {
+  category: DriftCategory;
+  entityKind: 'node' | 'edge' | 'evidence';
+  entityId: string;
+  previousEntityId?: string;
+  label: string;
+  changedFields?: string[];
+  nodeKind?: string;
+  edgeKind?: string;
+  evidenceBefore: EvidenceRef[];
+  evidenceAfter: EvidenceRef[];
+  confidence: Confidence;
+  claimConfidence: DriftClaimConfidence;
+  /** True when the change could not be determined with certainty, for example under truncation. */
+  indeterminate: boolean;
+  reason?: string;
+}
+
+export interface DriftSummary {
+  nodesAdded: number;
+  nodesRemoved: number;
+  nodesModified: number;
+  nodesRenamed: number;
+  relationshipsAdded: number;
+  relationshipsRemoved: number;
+  relationshipsModified: number;
+  evidenceAdded: number;
+  evidenceRemoved: number;
+  evidenceChanged: number;
+  confidenceChanged: number;
+  totalChanges: number;
+}
+
+export interface DriftReport {
+  base: SnapshotReference;
+  target: SnapshotReference;
+  identical: boolean;
+  comparable: boolean;
+  incomparabilityReason: string | null;
+  targetIncomplete: boolean;
+  removalConfidence: DriftClaimConfidence;
+  counts: Record<DriftCategory, number>;
+  summary: DriftSummary;
+  changes: DriftChange[];
+}
+
+// ---------------------------------------------------------------------------
 // Endpoints
 // ---------------------------------------------------------------------------
 
@@ -305,6 +418,21 @@ export const api = {
 
   getArtifact: (analysisId: string, kind: string) =>
     request<Artifact>(`/api/analyses/${analysisId}/artifacts/${encodeURIComponent(kind)}`),
+
+  getSnapshot: (analysisId: string) => request<SnapshotResponse>(`/api/analyses/${analysisId}/snapshot`),
+
+  /**
+   * Compares two analyses.
+   *
+   * `against` is required by the server: a drift report with one side has no meaning, and
+   * defaulting to "the previous analysis" would silently pick whichever row sorted first.
+   */
+  getDrift: (analysisId: string, against: string, options: { limit?: number; includeChanges?: boolean } = {}) => {
+    const search = new URLSearchParams({ against });
+    if (options.limit) search.set('limit', String(options.limit));
+    if (options.includeChanges === false) search.set('includeChanges', 'false');
+    return request<DriftReport>(`/api/analyses/${analysisId}/drift?${search.toString()}`);
+  },
 
   getGaps: (analysisId: string) => request<GapReport>(`/api/analyses/${analysisId}/gaps`),
 

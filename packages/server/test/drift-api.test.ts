@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { GRAPH_SCHEMA_VERSION } from '@repoatlas/core';
 import { buildApp } from '../src/app.js';
 import { loadConfig, type ServerConfig } from '../src/config.js';
 import { AnalysisService } from '../src/service.js';
@@ -131,6 +132,30 @@ describe('snapshot identity over HTTP', () => {
     });
     expect(response.statusCode).toBe(404);
     expect((response.json() as { error: { code: string } }).error.code).toBe('NOT_FOUND');
+  });
+
+  it('recomputes the same identity from the stored graph as from the analysed one', async () => {
+    // The digest is persisted for convenience, so it must equal what is recomputed on read.
+    // A graph rebuilt from rows that claimed a different schema version would silently
+    // produce a different digest and make the stored one unusable (D-038).
+    const repo = await fixture(SAMPLE_TS_PROJECT);
+    const { app } = await testApp();
+    const id = await analyse(app, repo.root);
+
+    const detail = (await app.inject({ method: 'GET', url: `/api/analyses/${id}` })).json() as {
+      analysis: { graphDigest: string; graphSchemaVersion: number };
+    };
+    const snapshot = (await app.inject({ method: 'GET', url: `/api/analyses/${id}/snapshot` })).json() as {
+      snapshot: { graphDigest: string; graphSchemaVersion: number };
+    };
+    const graph = (await app.inject({ method: 'GET', url: `/api/analyses/${id}/graph` })).json() as {
+      schemaVersion: number;
+    };
+
+    expect(snapshot.snapshot.graphDigest).toBe(detail.analysis.graphDigest);
+    expect(snapshot.snapshot.graphSchemaVersion).toBe(GRAPH_SCHEMA_VERSION);
+    expect(detail.analysis.graphSchemaVersion).toBe(GRAPH_SCHEMA_VERSION);
+    expect(graph.schemaVersion).toBe(GRAPH_SCHEMA_VERSION);
   });
 });
 

@@ -89,6 +89,8 @@ than assumed away.
 | Unknown-field rejection | `packages/server/src/app.ts` | `zod` `.strict()` — a typo is an error, not a silent default |
 | Internal error text hidden in production | `packages/server/src/app.ts` | Unexpected errors are logged, not echoed |
 | Non-root container user | `Dockerfile` | `USER node` |
+| Snapshot/drift read no filesystem | `packages/core/src/drift.ts` | `/drift` and `/snapshot` take analysis ids only, so they cannot widen the allow-list |
+| Untrusted build context ignored | `packages/core/src/graph-builder.ts` | An absolute or repository-escaping `build:` is dropped; only paths already inside the analysed repository are compared |
 
 ### What is not implemented — read before exposing
 
@@ -99,6 +101,7 @@ than assumed away.
 | **CORS parsed but not applied** | Browser clients on another origin will be blocked by the same-origin policy | Same-origin deployment works; a cross-origin deployment needs a proxy |
 | **Results are not tenant-scoped** | Every stored analysis is readable by every client | Single-operator deployment assumption |
 | **No archive-upload route** | Archive extraction exists and is tested, but there is no HTTP endpoint yet | Not reachable, therefore not exposed |
+| **Git history may be unavailable for foreign-owned repositories** | Inside the container, a bind-mounted repository owned by another user is refused by git's dubious-ownership guard; commit facts are absent | Documented under *Git history inside the container*; the guard is not disabled by default |
 
 **Recommended posture:** run with `REPOATLAS_ALLOWED_ROOTS` set, bind to `127.0.0.1`, and
 put it behind an authenticating reverse proxy if it must be reachable from anywhere else.
@@ -166,13 +169,54 @@ id=$(curl -fsS -X POST http://127.0.0.1:4300/api/analyses \
 curl -fsS "http://127.0.0.1:4300/api/analyses/$id/graph?limit=5000" \
   | sed -E 's/.*"totals":\{"nodes":([0-9]+).*/nodes: \1/'
 
+# snapshot identity of this state
+curl -fsS "http://127.0.0.1:4300/api/analyses/$id/snapshot" \
+  | sed -E 's/.*"snapshotId":"([^"]+)".*/snapshot: \1/'
+
+# what changed since an earlier analysis (after making a change and re-analysing)
+id2=$(curl -fsS -X POST http://127.0.0.1:4300/api/analyses \
+  -H 'content-type: application/json' \
+  -d '{"repositoryPath":"/repos/target"}' | sed -E 's/.*"id":"([^"]+)".*/\1/')
+
+curl -fsS "http://127.0.0.1:4300/api/analyses/$id2/drift?against=$id" \
+  | sed -E 's/.*"totalChanges":([0-9]+).*/total changes: \1/'
+
+# C4 levels
+curl -fsS "http://127.0.0.1:4300/api/analyses/$id2/artifacts/c4-container" \
+  | sed -E 's/.*"insufficientEvidence":(true|false).*/insufficient: \1/'
+
 # must be refused
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:4300/api/analyses \
   -H 'content-type: application/json' -d '{"repositoryPath":"/etc"}'
 # expect 403
 ```
 
+`/drift` requires `against`; without it the server answers 400 rather than guessing which
+analysis to compare against. Direction is decided by analysis time, so passing the ids in
+either order produces the same report.
+
 The container health check runs the same `/api/health` request every 30 s.
+
+### Git history inside the container
+
+`git` refuses a repository whose owner differs from the process user, and a bind mount from
+Windows is owned by root while the container runs as `node`. The result is
+`GIT_UNAVAILABLE`: the analysis still succeeds, `headCommit` is empty, and commit, contributor
+and ownership facts are absent.
+
+RepoAtlas deliberately does **not** pass `-c safe.directory=*` to suppress this — that guard
+exists because a repository owned by another user is a known way to make a git client do
+something it should not (`decisions.md`, D-040). Two supported remedies:
+
+- mount the repository so its uid matches the container user (`--user "$(id -u):$(id -g)"`
+  together with a matching `REPOATLAS_DB_PATH`, or a `chown` in a derived image), or
+- add the exception in the image:
+
+  ```dockerfile
+  RUN git config --global --add safe.directory /repos
+  ```
+
+Only do the second when every mounted repository is one you already trust to read.
 
 ---
 

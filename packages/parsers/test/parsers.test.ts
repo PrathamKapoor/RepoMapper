@@ -405,6 +405,77 @@ CREATE TABLE IF NOT EXISTS shares (
     expect(services[0]?.attributes).toMatchObject({ service: 'api', image: 'node:22-alpine' });
   });
 
+  it('does not report a named volume or network as a service', () => {
+    // Both have the same two-space indentation as a service, so a pattern that matched any
+    // indented name produced a container in the architecture view that cannot run.
+    const result = parser.parse(
+      `services:
+  api:
+    image: node:22-alpine
+    volumes:
+      - api-data:/data
+
+volumes:
+  api-data:
+
+networks:
+  backend:
+    driver: bridge
+`,
+      context('docker-compose.yml', 'yaml'),
+    );
+    const services = result.markers.filter((marker) => marker.name === 'compose.service');
+    expect(services.map((marker) => marker.attributes.service)).toEqual(['api']);
+  });
+
+  it('reads the build context from both the short and the long form', () => {
+    const long = parser.parse(
+      `services:
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile.Dockerfile
+    image: repo/api:1
+`,
+      context('docker-compose.yml', 'yaml'),
+    );
+    expect(long.markers[0]?.attributes.build).toBe('./api');
+
+    const short = parser.parse(
+      `services:
+  api:
+    build: ./api
+`,
+      context('docker-compose.yml', 'yaml'),
+    );
+    expect(short.markers[0]?.attributes.build).toBe('./api');
+  });
+
+  it('reports no build context when the mapping form omits it', () => {
+    const result = parser.parse(
+      `services:
+  api:
+    build:
+      dockerfile: Dockerfile
+`,
+      context('docker-compose.yml', 'yaml'),
+    );
+    expect(result.markers[0]?.attributes.build).toBeNull();
+  });
+
+  it('records the line each service is declared on', () => {
+    const result = parser.parse(
+      `services:
+  api:
+    image: node:22-alpine
+  worker:
+    image: node:22-alpine
+`,
+      context('docker-compose.yml', 'yaml'),
+    );
+    expect(result.markers.map((marker) => marker.line)).toEqual([2, 4]);
+  });
+
   it('reads Dockerfile base images and exposed ports', () => {
     const result = parser.parse('FROM node:22-alpine AS build\nRUN npm ci\nFROM alpine\nEXPOSE 3000\n', context('Dockerfile', 'dockerfile'));
     const images = result.markers.filter((marker) => marker.name === 'docker.base_image');

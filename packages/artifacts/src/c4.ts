@@ -145,7 +145,12 @@ function buildContext(context: ProjectionContext): Artifact {
   ];
   const edges: ArtifactEdge[] = [];
 
-  const components = graph.nodes.filter((node) => node.kind === 'deployment_component');
+  const declared = graph.nodes.filter((node) => node.kind === 'deployment_component');
+  // Only declared services are considered here. A base image is a build dependency; presenting
+  // it as a system this one *communicates with* would assert a runtime relationship the
+  // repository never states.
+  const components = declared.filter(isRuntimeUnit);
+  const baseImages = declared.filter((node) => !isRuntimeUnit(node));
   const unrecognised: GraphNode[] = [];
 
   for (const component of components) {
@@ -191,6 +196,15 @@ function buildContext(context: ProjectionContext): Artifact {
     });
   }
 
+  if (baseImages.length > 0) {
+    omitted.push({
+      reason:
+        'base images are not external systems at this level: a `FROM` line states what an image is built from, not what the running system talks to',
+      count: baseImages.length,
+      examples: baseImages.slice(0, 3).map((node) => node.name),
+    });
+  }
+
   // Recorded unconditionally rather than only when actors exist, because the absence is
   // itself a statement about what this repository can and cannot evidence.
   omitted.push({
@@ -223,6 +237,18 @@ function buildContext(context: ProjectionContext): Artifact {
   });
 }
 
+/**
+ * Deployment components that state something that *runs*.
+ *
+ * `FROM node:24-bookworm-slim` states what an image is built from, not a deployable unit of
+ * this system. The graph records the distinction (`attributes.declaredAs`), and this filter is
+ * where it is applied: drawing a base image as a container would put a dependency in the
+ * architecture beside the system that depends on it.
+ */
+function isRuntimeUnit(component: GraphNode): boolean {
+  return component.attributes?.declaredAs !== 'base_image';
+}
+
 // ---------------------------------------------------------------------------
 // Level 2 — Container
 // ---------------------------------------------------------------------------
@@ -232,7 +258,9 @@ function buildContainer(context: ProjectionContext): Artifact {
   const omitted: Artifact['omitted'] = [];
 
   const repository = graph.nodes.find((node) => node.kind === 'repository');
-  const components = graph.nodes.filter((node) => node.kind === 'deployment_component');
+  const declared = graph.nodes.filter((node) => node.kind === 'deployment_component');
+  const components = declared.filter(isRuntimeUnit);
+  const baseImages = declared.filter((node) => !isRuntimeUnit(node));
 
   const nodes: ArtifactNode[] = [];
   const edges: ArtifactEdge[] = [];
@@ -258,9 +286,11 @@ function buildContainer(context: ProjectionContext): Artifact {
       omitted: [
         {
           reason:
-            'no deployment configuration was found. A compose file, Dockerfile or infrastructure manifest would establish container boundaries explicitly',
-          count: 1,
-          examples: [],
+            baseImages.length > 0
+              ? 'only base images were declared. A `FROM` line states what an image is built from, not a deployable unit of this system'
+              : 'no deployment configuration was found. A compose file, Dockerfile or infrastructure manifest would establish container boundaries explicitly',
+          count: Math.max(baseImages.length, 1),
+          examples: baseImages.slice(0, 3).map((node) => node.name),
         },
       ],
       insufficient: true,
@@ -346,6 +376,15 @@ function buildContainer(context: ProjectionContext): Artifact {
         'deployment files that declare a container are not shown as running inside it; a compose file describes the service, it is not part of it',
       count: declaringFileIds.size,
       examples: [],
+    });
+  }
+
+  if (baseImages.length > 0) {
+    omitted.push({
+      reason:
+        'base images are not containers. A `FROM` line states what an image is built from, which is a dependency of the system rather than a runtime unit of it',
+      count: baseImages.length,
+      examples: baseImages.slice(0, 3).map((node) => node.name),
     });
   }
 

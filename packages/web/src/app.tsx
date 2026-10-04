@@ -11,6 +11,8 @@ import {
   type GraphResponse,
   type HealthResponse,
 } from './api';
+import { C4Tab } from './c4';
+import { DriftTab } from './drift';
 import { EntityDrawer } from './entity-drawer';
 import { GraphView } from './graph';
 import {
@@ -30,14 +32,20 @@ import {
  * Every screen reads from the API — there is no sample data anywhere in this UI. If the
  * API is unreachable the application says so instead of rendering an empty atlas, which
  * would be indistinguishable from "this repository has no structure".
+ *
+ * The UI is a reader, not a source of truth. It shows the canonical graph, the architecture
+ * projected from it, and what changed between two of its states; every one of those views can
+ * be followed back to a file and a line.
  */
 
-type TabId = 'overview' | 'architecture' | 'structure' | 'evidence' | 'gaps' | 'diagnostics';
+type TabId = 'overview' | 'architecture' | 'c4' | 'structure' | 'drift' | 'evidence' | 'gaps' | 'diagnostics';
 
 const TABS: { id: TabId; label: string }[] = [
   { id: 'overview', label: 'Overview' },
   { id: 'architecture', label: 'Architecture' },
+  { id: 'c4', label: 'C4' },
   { id: 'structure', label: 'Structure' },
+  { id: 'drift', label: 'Drift' },
   { id: 'evidence', label: 'Evidence' },
   { id: 'gaps', label: 'Gaps' },
   { id: 'diagnostics', label: 'Diagnostics' },
@@ -50,9 +58,18 @@ export function App(): React.ReactElement {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<AnalysisDetail | null>(null);
   const [tab, setTab] = useState<TabId>('overview');
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  // The inspector carries its own analysis id: a drift row can be a fact about the *base*
+  // snapshot, whose entity does not exist in the analysis currently selected in the sidebar.
+  const [inspect, setInspect] = useState<{ analysisId: string; nodeId: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const selectNode = useCallback(
+    (nodeId: string) => {
+      if (selectedId) setInspect({ analysisId: selectedId, nodeId });
+    },
+    [selectedId],
+  );
 
   const refreshAnalyses = useCallback(async () => {
     try {
@@ -144,7 +161,7 @@ export function App(): React.ReactElement {
                       className={analysis.id === selectedId ? 'active' : ''}
                       onClick={() => {
                         setSelectedId(analysis.id);
-                        setSelectedNodeId(null);
+                        setInspect(null);
                       }}
                     >
                       <div className="spread">
@@ -190,12 +207,16 @@ export function App(): React.ReactElement {
 
                 {tab === 'overview' ? <OverviewTab detail={detail} /> : null}
                 {tab === 'architecture' ? (
-                  <ProjectionTab analysisId={selectedId} artifactKinds={['dependency-graph', 'er-diagram']} onSelectNode={setSelectedNodeId} />
+                  <ProjectionTab analysisId={selectedId} artifactKinds={['dependency-graph', 'er-diagram']} onSelectNode={selectNode} />
                 ) : null}
+                {tab === 'c4' ? <C4Tab analysisId={selectedId} onSelectNode={selectNode} /> : null}
                 {tab === 'structure' ? (
-                  <ProjectionTab analysisId={selectedId} artifactKinds={['module-graph', 'class-diagram']} onSelectNode={setSelectedNodeId} />
+                  <ProjectionTab analysisId={selectedId} artifactKinds={['module-graph', 'class-diagram']} onSelectNode={selectNode} />
                 ) : null}
-                {tab === 'evidence' ? <EvidenceTab analysisId={selectedId} onSelectNode={setSelectedNodeId} /> : null}
+                {tab === 'drift' ? (
+                  <DriftTab analyses={analyses} analysisId={selectedId} onInspectNode={(id, nodeId) => setInspect({ analysisId: id, nodeId })} />
+                ) : null}
+                {tab === 'evidence' ? <EvidenceTab analysisId={selectedId} onSelectNode={selectNode} /> : null}
                 {tab === 'gaps' ? <GapsTab gaps={detail.gaps} /> : null}
                 {tab === 'diagnostics' ? <DiagnosticsTab analysisId={selectedId} /> : null}
               </>
@@ -204,8 +225,8 @@ export function App(): React.ReactElement {
         </div>
       </div>
 
-      {selectedId ? (
-        <EntityDrawer analysisId={selectedId} nodeId={selectedNodeId} onClose={() => setSelectedNodeId(null)} />
+      {inspect ? (
+        <EntityDrawer analysisId={inspect.analysisId} nodeId={inspect.nodeId} onClose={() => setInspect(null)} />
       ) : null}
     </div>
   );
