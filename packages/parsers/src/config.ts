@@ -514,6 +514,25 @@ function parseSql(source: string, result: ParsedFile): void {
     });
   }
 
+  // `ALTER TABLE … ADD [CONSTRAINT …] FOREIGN KEY (col) REFERENCES table(col)` is how a
+// foreign key is added to a table that already exists, and how migration files express it.
+// Reading it is what keeps the ER diagram honest for a schema that was evolved rather than
+// written in one statement.
+const alterPattern =
+  /ALTER\s+TABLE\s+(?:ONLY\s+)?["'`]?([\w.]+)["'`]?\s+ADD\s+(?:CONSTRAINT\s+[\w"`]+\s+)?FOREIGN\s+KEY\s*\(([^)]*)\)\s*REFERENCES\s+["'`]?([\w.]+)["'`]?(?:\s*\(\s*["'`]?(\w+)["'`]?\s*\))?/gi;
+while ((match = alterPattern.exec(source)) !== null) {
+  const [, table, columnList, target, targetColumn] = match;
+  if (!table || !target) continue;
+  const alterLine = lineOfIndex(source, match.index);
+  for (const name of columnNameList(`FOREIGN KEY (${columnList ?? ''})`, 'FOREIGN\\s+KEY') ?? []) {
+    foreignKeyMarkers.push({
+      name: 'schema.foreign_key',
+      line: alterLine,
+      attributes: { table, column: name, referencesTable: target, ...(targetColumn ? { referencesColumn: targetColumn } : {}) },
+    });
+  }
+}
+
   result.markers.push(...tableMarkers, ...columnMarkers, ...foreignKeyMarkers);
 }
 

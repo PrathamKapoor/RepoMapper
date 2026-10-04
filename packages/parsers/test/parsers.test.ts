@@ -631,3 +631,57 @@ describe('inline route handlers', () => {
     expect(result.markers.some((marker) => marker.name === 'http.route')).toBe(false);
   });
 });
+
+describe('ALTER TABLE foreign keys', () => {
+  const parser = new ConfigSourceParser();
+  const context = (): ParserContext => ({ path: 'schema.sql', language: 'sql', maxProblems: 10, maxCalls: 10 });
+
+  const foreignKeys = (sql: string) =>
+    parser
+      .parse(sql, context())
+      .markers.filter((marker) => marker.name === 'schema.foreign_key');
+
+  it('reads a foreign key added by ALTER TABLE', () => {
+    const [marker] = foreignKeys(
+      [
+        'CREATE TABLE users (id TEXT PRIMARY KEY);',
+        'CREATE TABLE reports (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL);',
+        'ALTER TABLE reports ADD FOREIGN KEY (owner_id) REFERENCES users (id);',
+      ].join('\n'),
+    );
+    expect(marker?.attributes).toMatchObject({ table: 'reports', column: 'owner_id', referencesTable: 'users', referencesColumn: 'id' });
+  });
+
+  it('reads a named constraint and a quoted table', () => {
+    const [marker] = foreignKeys(
+      ['CREATE TABLE "orders" (id TEXT);', 'ALTER TABLE ONLY "orders" ADD CONSTRAINT fk_orders_user FOREIGN KEY (user_id) REFERENCES "users" (id);'].join('\n'),
+    );
+    expect(marker?.attributes).toMatchObject({ table: 'orders', column: 'user_id', referencesTable: 'users' });
+  });
+
+  it('reads a composite foreign key', () => {
+    const markers = foreignKeys(
+      ['ALTER TABLE reports ADD FOREIGN KEY (owner_id, tenant_id) REFERENCES users (id, tenant_id);'].join('\n'),
+    );
+    expect(markers).toHaveLength(2);
+    expect(markers.map((entry) => entry.attributes.column)).toEqual(['owner_id', 'tenant_id']);
+  });
+
+  it('records the line the ALTER statement is on, not the line of the table', () => {
+    const [marker] = foreignKeys(
+      [
+        'CREATE TABLE users (id TEXT PRIMARY KEY);',
+        '',
+        '',
+        'ALTER TABLE reports ADD FOREIGN KEY (owner_id) REFERENCES users (id);',
+      ].join('\n'),
+    );
+    expect(marker?.line).toBe(4);
+  });
+
+  it('does not invent a foreign key from an ALTER that adds a column', () => {
+    expect(
+      foreignKeys(['ALTER TABLE reports ADD COLUMN owner_id TEXT REFERENCES users (id);'].join('\n')),
+    ).toHaveLength(0);
+  });
+});
