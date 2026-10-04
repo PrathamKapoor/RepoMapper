@@ -1707,9 +1707,14 @@ function addReturnStatements(
       ...(returned.awaited ? { returnsAwaited: true } : {}),
     });
 
-    // Return relationship: callee → caller, for a `return <call>`.
+// Return relationship: callee → caller, for a `return <call>`.
     if (!returned.name) continue;
     const callee = symbolIndex.get(returned.name);
+    // A relationship from a function to itself asserts nothing: a function does not hand its
+    // value to itself. It appears when a name resolves to the declaration that encloses the use,
+    // which is what a builtin shadowed by a method name does - `return list(...)` inside a method
+    // called `list`. Drawing it would put a loop in a sequence view that the code never states.
+    if (callee && callee.id === scope.id) continue;
     const candidates = calleesByCaller.get(returned.fromQualifiedName!) ?? new Set<string>();
     // The returned call is the one whose result this statement returns. Matching by name is
     // resolved against declared entities, so a returned expression that names nothing declared
@@ -1776,7 +1781,9 @@ function addThrowRelationships(
       producer: file.producer,
     });
 
-    for (const callerId of callersByCallee.get(scope.id) ?? []) {
+for (const callerId of callersByCallee.get(scope.id) ?? []) {
+      // A function cannot fail on itself; see the note on self-directed returns.
+      if (callerId === scope.id) continue;
       builder.addEdge({
         from: scope.id,
         to: callerId,

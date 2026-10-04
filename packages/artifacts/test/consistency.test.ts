@@ -318,3 +318,145 @@ describe('recorded agreement', () => {
     expect(finding(report, 'agreement:data-traced')?.class).toBe('CONSISTENT');
   });
 });
+
+describe('return, failure and response support', () => {
+  /** A handler that calls `load`, and `load` returning the call and throwing. */
+  function returnGraph() {
+    return graphOf([
+      parsedFile('src/routes.ts', {
+        entities: [fn('handler', 1, 6)],
+        calls: [
+          { callee: 'load', line: 4, fromQualifiedName: 'handler', isLocalIdentifier: true },
+        ],
+        markers: [{ name: 'http.route', line: 1, attributes: { httpMethod: 'GET', path: '/reports', handler: 'handler' } }],
+        bindings: [{ name: 'rows', callee: 'load', line: 4, awaited: true, fromQualifiedName: 'handler' }],
+        returns: [{ line: 5, fromQualifiedName: 'handler', kind: 'identifier', name: 'rows', expression: 'rows' }],
+        responses: [{ line: 6, method: 'json', status: 200 }],
+      }),
+      parsedFile('src/service.ts', {
+        entities: [fn('load', 1, 4)],
+        throws: [{ line: 2, fromQualifiedName: 'load', via: 'throw', expression: "new Error('boom')" }],
+      }),
+    ]);
+  }
+
+  it('finds no unsupported inference in a graph whose returns and throws follow real calls', () => {
+    const report = checkConsistency({ graph: returnGraph(), maxElements: 5_000 });
+    expect(report.counts.UNSUPPORTED_INFERENCE).toBe(0);
+  });
+
+  it('reports a return relationship the call graph does not support', () => {
+    const graph = returnGraph();
+    // A hand-back asserted between two functions that never call each other.
+    graph.edges.push({
+      id: 'function:load|returns|function:unrelated',
+      from: 'function:load',
+      to: 'function:unrelated',
+      kind: 'returns',
+      confidence: 'STRONGLY_INFERRED',
+      evidence: [],
+      attributes: { returnKind: 'call' },
+    });
+
+    const report = checkConsistency({ graph, maxElements: 5_000 });
+    const item = finding(report, 'return-unsupported:function:load|returns|function:unrelated');
+    expect(item?.class).toBe('UNSUPPORTED_INFERENCE');
+    expect(item?.severity).toBe('warning');
+    expect(report.counts.UNSUPPORTED_INFERENCE).toBe(1);
+  });
+
+  it('reports a failure relationship the call graph does not support', () => {
+    const graph = returnGraph();
+    graph.edges.push({
+      id: 'function:load|throws|function:unrelated',
+      from: 'function:load',
+      to: 'function:unrelated',
+      kind: 'throws',
+      confidence: 'STRONGLY_INFERRED',
+      evidence: [],
+      attributes: { via: 'throw' },
+    });
+
+    expect(
+      finding(checkConsistency({ graph, maxElements: 5_000 }), 'return-unsupported:function:load|throws|function:unrelated')
+        ?.class,
+    ).toBe('UNSUPPORTED_INFERENCE');
+  });
+
+  it('reports a response paired with something that is not an endpoint', () => {
+    const graph = returnGraph();
+    graph.edges.push({
+      id: 'function:handler|returns|function:unrelated',
+      from: 'function:handler',
+      to: 'function:unrelated',
+      kind: 'returns',
+      confidence: 'EXPLICIT',
+      evidence: [],
+      attributes: { httpResponse: true, method: 'json' },
+    });
+
+    expect(
+      finding(checkConsistency({ graph, maxElements: 5_000 }), 'response-unpaired:function:handler|returns|function:unrelated')
+        ?.class,
+    ).toBe('UNSUPPORTED_INFERENCE');
+  });
+
+  it('reports a query expression recorded as a stored table', () => {
+    const graph = graphOf([
+      parsedFile('src/q.ts', { entities: [fn('load', 1, 4)] }),
+      parsedFile('src/q.sql', {
+        markers: [
+          {
+            name: 'sql.cte',
+            line: 1,
+            attributes: { names: 'recent_orders', scope: 'load', statement: 'select orders' },
+          },
+        ],
+      }),
+    ]);
+    const cte = graph.nodes.find((node) => node.attributes?.queryExpression === true)!;
+    expect(cte.kind).toBe('constant');
+    graph.edges.push({
+      id: `function:load|reads|${cte.id}`,
+      from: 'function:load',
+      to: cte.id,
+      kind: 'reads',
+      confidence: 'STRONGLY_INFERRED',
+      evidence: [],
+    });
+
+    const item = finding(checkConsistency({ graph, maxElements: 5_000 }), `cte-as-store:function:load|reads|${cte.id}`);
+    expect(item?.class).toBe('CONTRADICTION');
+    expect(item?.artifacts).toEqual(['data-flow', 'er-diagram']);
+  });
+
+  it('reports statements that were read but not classified', () => {
+    const graph = graphOf([
+      parsedFile('src/migrate.ts', {
+        entities: [fn('merge', 1, 4)],
+        markers: [
+          {
+            name: 'sql.statement',
+            line: 2,
+            attributes: { summary: 'merge statement', unsupported: 'MERGE is not classified', scope: 'merge' },
+          },
+        ],
+      }),
+    ]);
+
+    const item = finding(checkConsistency({ graph, maxElements: 5_000 }), 'data-access:unclassified-statements');
+    expect(item?.class).toBe('PARTIAL_EVIDENCE');
+    expect(item?.severity).toBe('info');
+    expect(item?.evidenceFound).toContain('1 statement(s)');
+  });
+
+  it('says nothing about statements when every query classified', () => {
+    const graph = graphOf([
+      parsedFile('src/q.ts', {
+        entities: [fn('load', 1, 4)],
+        markers: [{ name: 'sql.query', line: 2, attributes: { table: 'users', operation: 'read', role: 'from', statement: 'select users' } }],
+      }),
+    ]);
+    expect(ids(checkConsistency({ graph, maxElements: 5_000 }))).not.toContain('data-access:unclassified-statements');
+  });
+});

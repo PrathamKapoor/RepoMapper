@@ -72,6 +72,39 @@ const SQL_KEYWORDS = new Set([
 const JOIN_WORDS = new Set(['JOIN']);
 const JOIN_PREFIXES = ['INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'NATURAL', 'OUTER', 'STRAIGHT_JOIN', 'LATERAL'];
 
+/** What a DDL or privilege verb needs before the text is a statement rather than a sentence. */
+const SCHEMA_OBJECT_WORDS = new Set([
+  'TABLE', 'VIEW', 'INDEX', 'DATABASE', 'SCHEMA', 'USER', 'ROLE', 'FUNCTION', 'PROCEDURE',
+  'TRIGGER', 'SEQUENCE', 'ON',
+]);
+
+/**
+ * What a transaction verb needs.
+ *
+ * `'commit'` is one of the most common words in a code string - a git helper, a log label, a
+ * column name - and none of those are transactions.
+ */
+const TRANSACTION_WORDS = new Set(['TRANSACTION', 'WORK']);
+
+/** The clause each verb needs before its text is treated as a statement. */
+const VERB_CLAUSE_REQUIREMENTS: Record<string, ReadonlySet<string>> = {
+  INSERT: new Set(['INTO', 'VALUES', 'SELECT', 'OVERWRITE']),
+  UPDATE: new Set(['SET', 'FROM']),
+  DELETE: new Set(['FROM', 'USING']),
+  REPLACE: new Set(['INTO']),
+  UPSERT: new Set(['INTO', 'ON']),
+  GRANT: new Set(['ON']),
+  REVOKE: new Set(['ON']),
+  USE: new Set(['DATABASE', 'SCHEMA']),
+  CREATE: SCHEMA_OBJECT_WORDS,
+  ALTER: SCHEMA_OBJECT_WORDS,
+  DROP: SCHEMA_OBJECT_WORDS,
+  TRUNCATE: SCHEMA_OBJECT_WORDS,
+  BEGIN: TRANSACTION_WORDS,
+  COMMIT: TRANSACTION_WORDS,
+  ROLLBACK: TRANSACTION_WORDS,
+};
+
 /**
  * Splits SQL into tokens, discarding comments.
  *
@@ -297,6 +330,23 @@ function analyzeOne(segment: string): SqlStatementAnalysis | null {
   const head = tokens[position];
   const keyword = head?.kind === 'word' ? head.value.toUpperCase() : undefined;
   if (!keyword || !SQL_KEYWORDS.has(keyword)) return null;
+
+  // A keyword on its own does not make text SQL. Code strings are full of words that are also
+  // SQL keywords - `console.log('revoke:', ...)`, a note reading "Create content targeting this
+  // keyword" - and treating either as a statement puts a non-statement in the omission log, where
+  // it reads as something the analyser failed to understand.
+  //
+  // The requirement is the clause the verb actually needs. `SELECT` is absent deliberately:
+  // `SELECT 1` is a real statement that reads nothing, and it belongs in the log. A sentence
+  // beginning "Select" is rare enough that the false positive costs less than losing real
+  // statements.
+  const requiredClause = VERB_CLAUSE_REQUIREMENTS[keyword];
+  if (
+    requiredClause &&
+    !tokens.some((token) => token.kind === 'word' && requiredClause.has(token.value.toUpperCase()))
+  ) {
+    return null;
+  }
 
   if (keyword !== 'SELECT' && keyword !== 'INSERT' && keyword !== 'UPDATE' && keyword !== 'DELETE') {
     return {

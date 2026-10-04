@@ -833,6 +833,24 @@ describe('return, throw and response relationships', () => {
     expect(graph.nodes.find((node) => node.id === 'function:load')?.attributes?.hasReturn).toBe(true);
   });
 
+  it('creates no relationship from a function to itself', () => {
+    // Found in a real Python repository: `return list(...)` inside a method called `list`
+    // resolved the builtin to the enclosing declaration. A function does not hand its value to
+    // itself, and a self-directed arrow would draw a loop the code never states.
+    const graph = build([
+      parsedFile('src/repositories.py', {
+        entities: [{ ...functionEntity('list', 60), language: 'python' }],
+        calls: [{ callee: 'list', line: 65, fromQualifiedName: 'list', isLocalIdentifier: true }],
+        returns: [{ line: 65, fromQualifiedName: 'list', kind: 'call', name: 'list', expression: 'list(self.session.scalars(...))' }],
+        throws: [{ line: 66, fromQualifiedName: 'list', via: 'throw', expression: 'ValueError()' }],
+      }),
+    ]).graph;
+
+    expect(graph.edges.some((edge) => edge.kind === 'returns' || edge.kind === 'throws')).toBe(false);
+    // The return statement is still a fact about the function.
+    expect(graph.nodes.find((node) => node.id === 'function:list')?.attributes?.hasReturn).toBe(true);
+  });
+
   it('links a throw from the callee to callers in other files', () => {
     const graph = build([
       parsedFile('src/a.ts', {

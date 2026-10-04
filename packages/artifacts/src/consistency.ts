@@ -108,6 +108,10 @@ export function checkConsistency(context: ProjectionContext): ConsistencyReport 
     ...entryPointCoverage(useCases, c4),
     ...untouchedStores(graph),
     ...untestedEntryPoints(useCases.useCases, graph),
+    ...returnRelationshipSupport(graph),
+    ...responseEndpointPairing(graph),
+    ...queryExpressionAsStore(graph),
+    ...unclassifiedStatements(graph),
     ...agreement(useCases, sequence, dataFlow),
   ];
 
@@ -405,12 +409,164 @@ function untouchedStores(graph: ProjectionContext['graph']): ConsistencyFinding[
       evidenceExpected: 'A reads or writes relationship from code to this table.',
       evidenceFound: 'None.',
       derivation:
-        'Only a single-table SQL statement in a string literal produces a data relationship. An ORM, a query builder or a stored procedure would not produce one, so this is a limit of the extraction, not evidence that the table is unused.',
+        'A data relationship comes from a table name in a SQL statement the extractor read, including every table in a join, a subquery or a set operation. An ORM, a query builder or a stored procedure produces none, so this is a limit of the extraction rather than evidence that the table is unused.',
       confidence: 'EXPLICIT',
     });
   }
 
   return findings;
+}
+
+/**
+ * Checks each return and failure relationship against the call it claims to describe.
+ *
+ * A `returns` arrow says "this callee hands its value to this caller", and a `throws` arrow says
+ * "this caller may see this failure". Both are only meaningful when the caller actually calls the
+ * callee. If that call is absent, the arrow asserts a hand-back or a failure that nothing in the
+ * code supports, which is the class of step this engine exists to catch.
+ *
+ * HTTP responses are excluded: they are written by the handler and paired with the endpoint that
+ * calls it, which is a different relationship and is checked separately.
+ */
+function returnRelationshipSupport(graph: ProjectionContext['graph']): ConsistencyFinding[] {
+  const findings: ConsistencyFinding[] = [];
+  // Keyed `caller->callee`, the direction a call is recorded in. A return or failure
+  // relationship is recorded the other way round, so the check reads the pair reversed.
+  const calls = new Set(
+    graph.edges.filter((edge) => edge.kind === 'calls').map((edge) => `${edge.from}->${edge.to}`),
+  );
+
+  for (const edge of graph.edges) {
+    if (edge.kind !== 'returns' && edge.kind !== 'throws') continue;
+    if (edge.kind === 'returns' && edge.attributes?.httpResponse === true) continue;
+    if (calls.has(`${edge.to}->${edge.from}`)) continue;
+
+    findings.push({
+      id: `return-unsupported:${edge.id}`,
+      rule: 'return-support',
+      class: 'UNSUPPORTED_INFERENCE',
+      severity: 'warning',
+      title: `${edge.kind === 'returns' ? 'A return' : 'A failure'} relationship is not backed by a call`,
+      detail: `${edge.from} → ${edge.to} is recorded, but no call from ${edge.to} to ${edge.from} exists in the graph.`,
+      artifacts: ['sequence', 'use-cases'],
+      nodeIds: [edge.from, edge.to],
+      edgeIds: [edge.id],
+      evidenceExpected: 'A calls relationship from the receiving function to the function it is recorded as receiving from.',
+      evidenceFound: 'No such call was recorded.',
+      derivation:
+        'The relationship was created from a return or failure record scoped to the receiving function. The call itself was not resolved, so the hand-back cannot be followed from the code and is reported rather than trusted.',
+      confidence: 'UNKNOWN',
+    });
+  }
+
+  return findings;
+}
+
+/**
+ * Checks that a recorded response is paired with an endpoint, not with an arbitrary node.
+ *
+ * The response arrow points at the requester. If the other end is not an endpoint, the pairing
+ * came from something other than a route, and drawing it would put a response in a sequence where
+ * no request arrives.
+ */
+function responseEndpointPairing(graph: ProjectionContext['graph']): ConsistencyFinding[] {
+  const findings: ConsistencyFinding[] = [];
+  const endpoints = new Set(graph.nodes.filter((node) => node.kind === 'api_endpoint').map((node) => node.id));
+
+  for (const edge of graph.edges) {
+    if (edge.kind !== 'returns' || edge.attributes?.httpResponse !== true) continue;
+    if (endpoints.has(edge.to)) continue;
+
+    findings.push({
+      id: `response-unpaired:${edge.id}`,
+      rule: 'response-pairing',
+      class: 'UNSUPPORTED_INFERENCE',
+      severity: 'warning',
+      title: 'A recorded response is not paired with an API endpoint',
+      detail: `${edge.from} records a response, but ${edge.to} is not an endpoint.`,
+      artifacts: ['sequence'],
+      nodeIds: [edge.from, edge.to],
+      edgeIds: [edge.id],
+      evidenceExpected: 'The other end of a response relationship to be an endpoint that calls the handler.',
+      evidenceFound: `${edge.to} is not an endpoint.`,
+      derivation:
+        'Responses are paired with the endpoint a route names. A response whose other end is not an endpoint did not come from that pairing, so it is reported instead of drawn.',
+      confidence: 'UNKNOWN',
+    });
+  }
+
+  return findings;
+}
+
+/**
+ * Checks that a query expression was never turned into a stored table.
+ *
+ * A CTE name is not a table: it exists only inside one statement. If one reaches a table node, or
+ * a reads or writes relationship, the multi-table extractor has confused a name for a store, and
+ * the data-flow view would then draw a flow to something that does not exist.
+ */
+function queryExpressionAsStore(graph: ProjectionContext['graph']): ConsistencyFinding[] {
+  const findings: ConsistencyFinding[] = [];
+  const expressions = new Set(
+    graph.nodes.filter((node) => node.attributes?.queryExpression === true).map((node) => node.id),
+  );
+  if (expressions.size === 0) return findings;
+
+  for (const edge of graph.edges) {
+    if (edge.kind !== 'reads' && edge.kind !== 'writes') continue;
+    if (!expressions.has(edge.to)) continue;
+
+    findings.push({
+      id: `cte-as-store:${edge.id}`,
+      rule: 'query-expression-scope',
+      class: 'CONTRADICTION',
+      severity: 'warning',
+      title: 'A query expression is recorded as a stored table',
+      detail: `${edge.from} ${edge.kind} ${edge.to}, which is a query expression rather than a table.`,
+      artifacts: ['data-flow', 'er-diagram'],
+      nodeIds: [edge.from, edge.to],
+      edgeIds: [edge.id],
+      evidenceExpected: 'No reads or writes relationship to a query expression.',
+      evidenceFound: `A ${edge.kind} relationship to a query expression exists.`,
+      derivation:
+        'A CTE or subquery name has no storage behind it. A relationship to one means the statement scope was lost, so the flow is contradicted rather than reported as unknown.',
+      confidence: 'EXPLICIT',
+    });
+  }
+
+  return findings;
+}
+
+/**
+ * Reports SQL statements that were read but not classified as data access.
+ *
+ * The omission log names them; this makes the consequence visible where claims about data flow are
+ * assessed: a repository whose queries are all unclassified has no evidenced read or write, and
+ * that is a limit of this analyser rather than a finding about the code.
+ */
+function unclassifiedStatements(graph: ProjectionContext['graph']): ConsistencyFinding[] {
+  const unclassified = graph.nodes.filter((node) => node.attributes?.unclassifiedStatement === true);
+  if (unclassified.length === 0) return [];
+
+  return [
+    {
+      id: 'data-access:unclassified-statements',
+      rule: 'data-classification',
+      class: 'PARTIAL_EVIDENCE',
+      severity: 'info',
+      title: `${unclassified.length} SQL statement(s) were read but not classified as data access`,
+      detail:
+        'These statements were recorded with the reason they were not classified, and they produce no reads or writes relationship.',
+      artifacts: ['data-flow'],
+      nodeIds: unclassified.map((node) => node.id),
+      edgeIds: [],
+      evidenceExpected: 'Every SQL statement in the repository to classify as a read, a write, or neither.',
+      evidenceFound: `${unclassified.length} statement(s) fall outside the patterns this analyser classifies.`,
+      derivation:
+        'Classification is limited to the statement forms listed in the data-access documentation. An unclassified statement is reported as an omission rather than guessed at, so the data-flow view for these statements is incomplete by construction.',
+      confidence: 'EXPLICIT',
+    },
+  ];
 }
 
 function untestedEntryPoints(useCases: readonly UseCase[], graph: ProjectionContext['graph']): ConsistencyFinding[] {

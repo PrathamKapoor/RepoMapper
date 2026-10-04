@@ -269,4 +269,30 @@ describe('summary and determinism', () => {
     const sql = 'WITH recent AS (SELECT * FROM orders) SELECT * FROM recent JOIN users ON users.id = recent.user_id';
     expect(JSON.stringify(analysis(sql))).toBe(JSON.stringify(analysis(sql)));
   });
+
+  it('records a statement with no table as a statement', () => {
+    // A health probe is real SQL that reads nothing. It belongs in the omission log.
+    const probe = analysis('SELECT 1');
+    expect(probe?.statement).toBe('select');
+    expect(probe?.tables).toEqual([]);
+    expect(probe?.operation).toBe('read');
+  });
+
+  it('reports nothing for prose that opens with a SQL verb', () => {
+    // Each of these was found in a real repository, in a string literal rather than in SQL.
+    // Treating them as statements would put a non-statement in the omission log.
+    expect(analysis('Insert rel=canonical on all 5 indexable pages.')).toBeNull();
+    expect(analysis('Update the docs and ship')).toBeNull();
+    expect(analysis('revoke:')).toBeNull();
+    expect(analysis('Create content targeting this keyword')).toBeNull();
+    expect(analysis('commit')).toBeNull();
+    expect(analysis('BEGIN TRANSACTION')).not.toBeNull();
+  });
+
+  it('still reports a verb that carries the clause it needs', () => {
+    expect(analysis('Delete old rows from the queue')?.statement).toBe('delete');
+    expect(analysis('INSERT INTO reports VALUES (1)')?.statement).toBe('insert');
+    expect(analysis('CREATE TABLE reports (id TEXT)')?.unsupportedReason).toContain('CREATE');
+    expect(analysis('GRANT SELECT ON reports TO alice')?.unsupportedReason).toContain('GRANT');
+  });
 });
