@@ -1,3 +1,4 @@
+import { buildRequirements, buildUseCases } from '@repoatlas/core';
 import type { EvidenceStatus, GraphEdge, GraphNode, SoftwareGraph } from '@repoatlas/core';
 
 /**
@@ -58,7 +59,7 @@ export function analyseGaps(graph: SoftwareGraph): GapReport {
     testCoverage(nodesByKind, edgesByKind, graph),
     documentation(nodesByKind, graph),
     ownership(nodesByKind, edgesByKind, graph),
-    requirements(nodesByKind, edgesByKind, graph),
+    requirements(edgesByKind, graph),
     dependencyHygiene(graph),
     parseHealth(graph),
   ].filter((gap): gap is Gap => gap !== null);
@@ -403,13 +404,19 @@ function ownership(
   };
 }
 
-function requirements(nodes: Map<string, number>, edges: Map<string, number>, graph: SoftwareGraph): Gap {
-  const requirements = get(nodes, 'requirement');
-  const useCases = get(nodes, 'use_case');
+function requirements(edges: Map<string, number>, graph: SoftwareGraph): Gap {
+  const model = buildRequirements(graph);
+  const useCases = buildUseCases(graph, model.requirements);
+  // The models, not node counts: a use case is a projection over entry points and calls, so it
+  // has no node of its own, and counting `use_case` nodes would report zero for every
+  // repository including the ones with twenty endpoints.
+  const stated = model.requirements.filter((requirement) => requirement.origin === 'declared').length;
+  const derived = model.requirements.length - stated;
   const implemented = get(edges, 'implements_requirement');
-  const checked = ['requirement nodes', 'use_case nodes', 'implements_requirement relationships'];
+  const traced = model.requirements.filter((requirement) => requirement.supportedByNodeIds.length > 0).length;
+  const checked = ['documents stating a requirement', 'derived requirement rules', 'use-case entry points and calls'];
 
-  if (requirements === 0 && useCases === 0) {
+  if (model.requirements.length === 0 && useCases.useCases.length === 0) {
     return {
       id: 'requirements',
       title: 'Requirements traceability',
@@ -430,10 +437,14 @@ function requirements(nodes: Map<string, number>, edges: Map<string, number>, gr
     id: 'requirements',
     title: 'Requirements traceability',
     status: implemented > 0 ? 'EXPLICIT' : 'PARTIALLY_EVIDENCED',
-    whatWouldResolve: implemented > 0 ? 'Nothing.' : 'Links from requirements to the code that implements them.',
+    whatWouldResolve:
+      implemented > 0
+        ? 'Nothing.'
+        : 'Documents that name the code implementing a requirement, so the link is stated rather than matched by name.',
     observations: [
-      `${requirements} requirement(s) and ${useCases} use case(s) extracted.`,
-      `${implemented} requirement-to-implementation relationship(s) recorded.`,
+      `${stated} requirement(s) stated by a document, ${derived} derived from the code by a fixed rule.`,
+      `${useCases.useCases.length} use case(s) recovered from entry points and the calls relationships reachable from them.`,
+      `${traced} of ${model.requirements.length} requirement(s) name code that implements them; ${implemented} relationship(s) recorded in the graph.`,
     ],
     checked,
     relatedNodeIds: nodeIdsOfKind(graph, 'requirement'),

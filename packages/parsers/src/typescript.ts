@@ -57,11 +57,12 @@ export class TypeScriptSourceParser implements SourceParser {
       }
     }
 
-    const ctx: WalkContext = {
+const ctx: WalkContext = {
       sourceFile,
       result,
       maxCalls: context.maxCalls,
       stack: [],
+      inlineHandlers: new Map(),
     };
 
     for (const statement of sourceFile.statements) {
@@ -79,6 +80,13 @@ interface WalkContext {
   maxCalls: number;
   /** Enclosing entity qualified names, outermost first. */
   stack: string[];
+  /**
+   * Inline route handler nodes already named by a registration seen earlier in the walk.
+   *
+   * Keyed by node identity: the source file is parsed without parent pointers, so the arrow
+   * cannot discover its own registration after the fact.
+   */
+  inlineHandlers: Map<ts.Node, InlineHandler>;
 }
 
 /**
@@ -141,6 +149,38 @@ interface DeclarationDescription {
 }
 
 /** Returns an entity for named declarations, or `undefined` for everything else. */
+/**
+ * The name given to an inline route handler.
+ *
+ * `app.get('/reports', async (request, response) => { … })` is the most common shape in
+ * Express, Fastify and Hono code, and an anonymous arrow in a call argument is not a
+ * declaration the walker would otherwise record. Without a name, the calls inside that arrow
+ * are attributed to the module and the endpoint has nothing behind it — no sequence message,
+ * no use-case step, nothing traceable to a file and a line.
+ *
+ * The name is derived from the registration the source already contains, and it is the same
+ * string in the route marker and in the function entity, so the two resolve to each other. It
+ * is not a claim that the author named the function; the entity records `routeHandler`, which
+ * is how the graph knows why this name exists.
+ */
+export function inlineRouteHandlerName(method: string, path: string): string {
+  return `${method.toUpperCase()} ${path} handler`;
+}
+
+interface InlineHandler {
+  name: string;
+  method: string;
+  path: string;
+}
+
+/**
+ * Names inline route handlers found while walking.
+ *
+ * Recorded rather than re-derived: the source file is parsed without parent pointers, for
+ * speed, so an arrow function cannot ask what call it belongs to. The route registration is
+ * seen first during the walk, so it registers the handler node by identity and the declaration
+ * pass looks it up.
+ */
 function describeDeclaration(node: ts.Node, ctx: WalkContext): DeclarationDescription | undefined {
   const base = (
     kind: ExtractedEntity['kind'],
@@ -152,6 +192,23 @@ function describeDeclaration(node: ts.Node, ctx: WalkContext): DeclarationDescri
     entity: buildEntity(kind, name, target, ctx, extra),
     opensScope,
   });
+
+  // An inline route handler is a function the source does contain; only its name is ours.
+  const inline = ctx.inlineHandlers.get(node);
+  if (inline) {
+    const async = hasAsyncModifier(node);
+    return base(
+      'function',
+      inline.name,
+      node,
+      {
+        modifiers: async ? ['async'] : undefined,
+        isAsync: async,
+        attributes: { routeHandler: true, method: inline.method, path: inline.path },
+      },
+      true,
+    );
+  }
 
   if (ts.isFunctionDeclaration(node) && node.name) {
     const modifiers = modifiersOf(node);
@@ -335,7 +392,20 @@ function handleCallExpression(node: ts.CallExpression, ctx: WalkContext): void {
   if (query) ctx.result.markers.push(query);
 
 const route = routeMarker(node, ctx);
-  if (route) ctx.result.markers.push(route);
+  if (route) {
+    ctx.result.markers.push(route);
+    // Name an inline handler now, while the registration is in hand. The declaration pass runs
+    // over the same nodes later and looks the name up by identity.
+    const registration = routeRegistration(node);
+    const handler = registration?.handler;
+    if (registration && handler && isArrowOrFunction(handler) && route.attributes.handlerDerived === true) {
+      ctx.inlineHandlers.set(handler, {
+        name: String(route.attributes.handler),
+        method: registration.method.toUpperCase(),
+        path: registration.path,
+      });
+    }
+  }
 
   const middleware = middlewareMarker(node, ctx);
   if (middleware) ctx.result.markers.push(middleware);
@@ -433,12 +503,16 @@ const ROUTE_HOLDERS = new Set([
 ]);
 
 /**
- * Recognises Express/Fastify/Hono route registration.
+ * The route registration a call expression performs, if any.
  *
- * Only method-plus-string-literal calls on a known router variable qualify, so a
+ * Shared by the route marker and by inline-handler naming so the two can never disagree about
+ * which call is a route.
+ *
+ * Only a method-plus-string-literal call on a known router variable qualifies, so a
  * `store.get('/x')` call is not mistaken for an HTTP endpoint.
  */
-function routeMarker(node: ts.CallExpression, ctx: WalkContext): Marker | undefined {
+function routeRegistration(node: ts.Node): { method: string; path: string; handler: ts.Expression | undefined } | undefined {
+  if (!ts.isCallExpression(node)) return undefined;
   const callee = node.expression;
   if (!ts.isPropertyAccessExpression(callee)) return undefined;
 
@@ -451,9 +525,26 @@ function routeMarker(node: ts.CallExpression, ctx: WalkContext): Marker | undefi
   const first = node.arguments[0];
   if (!first || !ts.isStringLiteralLike(first)) return undefined;
 
-  const attributes: Marker['attributes'] = { httpMethod: method.toUpperCase(), path: first.text };
-  const handler = node.arguments[1];
-  if (handler) attributes.handler = handler.getText(ctx.sourceFile).replace(/\s+/g, ' ').slice(0, 120);
+  return { method, path: first.text, handler: node.arguments[1] };
+}
+
+function routeMarker(node: ts.CallExpression, ctx: WalkContext): Marker | undefined {
+  const registration = routeRegistration(node);
+  if (!registration) return undefined;
+
+  const attributes: Marker['attributes'] = { httpMethod: registration.method.toUpperCase(), path: registration.path };
+  const handler = registration.handler;
+  if (handler) {
+    if (isArrowOrFunction(handler)) {
+      // Name the handler from the registration, so the endpoint resolves to the function that
+      // serves it. Keeping the arrow's source text instead resolves to nothing, and an
+      // endpoint with no handler is an endpoint with no behaviour behind it.
+      attributes.handler = inlineRouteHandlerName(registration.method, registration.path);
+      attributes.handlerDerived = true;
+    } else {
+      attributes.handler = handler.getText(ctx.sourceFile).replace(/\s+/g, ' ').slice(0, 120);
+    }
+  }
 
   return { name: 'http.route', line: lineOf(ctx, safeStart(node, ctx)), attributes };
 }

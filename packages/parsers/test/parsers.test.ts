@@ -550,3 +550,84 @@ describe('markdown requirement extractor', () => {
     expect(marker?.attributes.implementsRef).toBeUndefined();
   });
 });
+
+describe('inline route handlers', () => {
+  const parser = new TypeScriptSourceParser();
+  const context = (path: string): ParserContext => ({ path, language: 'typescript', maxProblems: 10, maxCalls: 50 });
+
+  const INLINE_ROUTE = [
+    "const app = express();",
+    "app.get('/reports', async (request, response) => {",
+    '  const rows = await findAll();',
+    '  response.json(rows);',
+    '});',
+  ].join('\n');
+
+  it('names an inline arrow handler after its registration', () => {
+    const result = parser.parse(INLINE_ROUTE, context('src/routes.ts'));
+    const handler = result.entities.find((entity) => entity.name === 'GET /reports handler');
+    expect(handler).toBeDefined();
+    expect(handler?.attributes?.routeHandler).toBe(true);
+    expect(handler?.isAsync).toBe(true);
+  });
+
+  it('points the route marker at the same name, so the endpoint resolves to the function', () => {
+    const result = parser.parse(INLINE_ROUTE, context('src/routes.ts'));
+    const route = result.markers.find((marker) => marker.name === 'http.route');
+    expect(route?.attributes.handler).toBe('GET /reports handler');
+    expect(route?.attributes.handlerDerived).toBe(true);
+
+    const names = new Set(result.entities.map((entity) => entity.name));
+    expect(names.has(String(route?.attributes.handler))).toBe(true);
+  });
+
+  it('attributes calls inside the handler to the handler, not to the module', () => {
+    const result = parser.parse(INLINE_ROUTE, context('src/routes.ts'));
+    const inside = result.calls.filter((call) => call.callee === 'findAll');
+    expect(inside[0]?.fromQualifiedName).toBe('GET /reports handler');
+  });
+
+  it('marks a synchronous inline handler as not async rather than leaving it unstated', () => {
+    const result = parser.parse(
+      ["const app = express();", "app.post('/reports', (request, response) => {", '  save(request.body);', '});'].join('\n'),
+      context('src/routes.ts'),
+    );
+    const handler = result.entities.find((entity) => entity.name === 'POST /reports handler');
+    expect(handler?.isAsync).toBe(false);
+  });
+
+  it('names a function-expression handler too', () => {
+    const result = parser.parse(
+      ["const app = express();", "app.put('/reports', function (request, response) {", '  update();', '});'].join('\n'),
+      context('src/routes.ts'),
+    );
+    expect(result.entities.some((entity) => entity.name === 'PUT /reports handler')).toBe(true);
+  });
+
+  it('leaves a named handler reference as the source names it', () => {
+    const result = parser.parse(
+      ["const app = express();", 'function handleReports() { return list(); }', "app.get('/reports', handleReports);"].join('\n'),
+      context('src/routes.ts'),
+    );
+    const route = result.markers.find((marker) => marker.name === 'http.route');
+    expect(route?.attributes.handler).toBe('handleReports');
+    expect(route?.attributes.handlerDerived).toBeUndefined();
+  });
+
+  it('does not name a callback that is not a route handler', () => {
+    const result = parser.parse(
+      ["const app = express();", "app.use('/reports', async (request, response, next) => {", '  next();', '});'].join('\n'),
+      context('src/routes.ts'),
+    );
+    // `use` is a mount, not a route registration: naming it would invent an endpoint handler.
+    expect(result.entities.some((entity) => entity.name.includes('handler'))).toBe(false);
+  });
+
+  it('does not treat a store.get call as a route', () => {
+    const result = parser.parse(
+      ["const store = new Store();", "store.get('/reports', async () => {", '  return load();', '});'].join('\n'),
+      context('src/store.ts'),
+    );
+    expect(result.markers.some((marker) => marker.name === 'http.route')).toBe(false);
+  });
+});

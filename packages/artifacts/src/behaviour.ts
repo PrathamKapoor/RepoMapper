@@ -70,6 +70,8 @@ export function buildSequence(context: ProjectionContext, options: SequenceOptio
   const edges: ArtifactEdge[] = [];
   const omitted: Artifact['omitted'] = [];
   const flows: { id: string; title: string; messages: number }[] = [];
+  let cappedMessages = 0;
+  const cappedFlows: string[] = [];
 
   if (entryPoints.length === 0) {
     return finish({
@@ -107,11 +109,10 @@ export function buildSequence(context: ProjectionContext, options: SequenceOptio
     const truncated = messages.length > MAX_SEQUENCE_MESSAGES;
     const drawn = messages.slice(0, MAX_SEQUENCE_MESSAGES);
     if (truncated) {
-      omitted.push({
-        reason: `messages beyond ${MAX_SEQUENCE_MESSAGES} in this flow; the interaction is longer than a readable diagram`,
-        count: messages.length - MAX_SEQUENCE_MESSAGES,
-        examples: [entry.name],
-      });
+      // Aggregated rather than repeated per flow: one note counting the cut-off messages is
+      // more useful than the same sentence twenty times.
+      cappedMessages += messages.length - MAX_SEQUENCE_MESSAGES;
+      cappedFlows.push(entry.name);
     }
 
     flows.push({ id: entry.id, title: entry.name, messages: drawn.length });
@@ -147,6 +148,15 @@ export function buildSequence(context: ProjectionContext, options: SequenceOptio
     edges,
     omitted: [
       ...omitted,
+      ...(cappedMessages > 0
+        ? [
+            {
+              reason: `messages beyond ${MAX_SEQUENCE_MESSAGES} in a flow; the interaction is longer than a readable diagram, and the cut is at the limit rather than in the graph`,
+              count: cappedMessages,
+              examples: cappedFlows.slice(0, 3),
+            },
+          ]
+        : []),
       {
         reason:
           'return messages and error responses: the graph records call relationships and explicit handler conditions, not return values or thrown errors, so none are drawn',
@@ -262,16 +272,11 @@ export function buildActivity(context: ProjectionContext): Artifact {
 
   const units = graph.nodes.filter((node) => node.kind === 'function' || node.kind === 'test');
   const withControlFlow = units.filter((node) => controlEdgesOf(graph, node).length > 0);
+  let drawn = 0;
 
   for (const unit of withControlFlow) {
-    if (nodes.length >= limit) {
-      omitted.push({
-        reason: `units with control flow beyond the ${limit}-element limit; raise the projection limit to include them`,
-        count: withControlFlow.length - nodes.length,
-        examples: [],
-      });
-      break;
-    }
+    if (drawn >= limit) break;
+    drawn += 1;
 
     const conditions = controlEdgesOf(graph, unit);
     if (conditions.length === 0) continue;
@@ -331,6 +336,17 @@ export function buildActivity(context: ProjectionContext): Artifact {
         'functions with no recorded branch, loop or handler. A call graph is not a workflow, so none is given a single-stage activity',
       count: withoutControlFlow,
       examples: [],
+    });
+  }
+
+  // Counted after the loop, from the units actually drawn, so the number can never go
+  // negative or exceed the number of units that have control flow.
+  const cutOff = withControlFlow.length - drawn;
+  if (cutOff > 0) {
+    omitted.push({
+      reason: `units with control flow beyond the ${limit}-unit limit; raise the projection limit to include them`,
+      count: cutOff,
+      examples: withControlFlow.slice(drawn, drawn + 3).map((node) => node.qualifiedName ?? node.name),
     });
   }
 
