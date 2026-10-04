@@ -4,11 +4,13 @@ import type { EvidenceStore } from './evidence.js';
 import { SoftwareGraphBuilder } from './graph.js';
 import { nodeId, toPosixPath } from './ids.js';
 import type {
+  AttributeValue,
   CommitRecord,
   DiscoveredFile,
   EvidenceRef,
   ExtractedEntity,
   GraphNode,
+  Marker,
   ParsedFile,
   RepositoryRef,
   SoftwareGraph,
@@ -404,6 +406,9 @@ export function buildGraph(input: GraphBuildInput): GraphBuildResult {
 
 // ------------------------------------------------------------------- markers
   addMarkerFacts(input, builder, moduleByPath, symbolIndex, counters);
+
+  // ---------------------------------------------------------------- return facts
+  addReturnFacts(builder, evidence, input.parsed, symbolIndex);
 
   // ---------------------------------------------------------------- test facts
   addTestFacts(builder);
@@ -1516,3 +1521,369 @@ function truncate(value: string, max: number): string {
 }
 
 export { extname };
+/**
+ * Phase 4: what an interaction hands back.
+ *
+ * A call relationship says A invoked B. It does not say B handed anything back, and drawing a
+ * return arrow from it would be the single easiest way to make a sequence diagram confident and
+ * wrong. So returns and throws come from `return`, `await`, `throw` and response statements in
+ * the source, recorded at the site that states them.
+ *
+ * Three relationship kinds are produced, and the direction is what makes them meaningful:
+ *
+ * - `returns`, callee → caller. At `return service.find(id)` the caller hands the callee's value
+ *   to *its* caller, so the arrow points at the caller. It is created only when the callee
+ *   resolves to a declared entity: an unresolved callee has no node to point from.
+ * - `throws`, callee → caller. Created when the callee's body contains an explicit failure site.
+ *   The evidence is the throw statement inside the callee, which is what establishes the claim.
+ * - `http.response`, function → endpoint. The endpoint node is the requester side, so the arrow
+ *   from the handler back to the endpoint is what a response is, in graph terms.
+ */
+function addReturnFacts(
+  builder: SoftwareGraphBuilder,
+  evidence: EvidenceStore,
+  parsed: readonly ParsedFile[],
+  symbolIndex: ReadonlyMap<string, SymbolRef>,
+): void {
+  const staged: StagedAttributes = new Map();
+
+  for (const file of parsed) {
+    addReturnStatements(builder, evidence, file, symbolIndex, staged);
+    addBindingReturns(builder, evidence, file, symbolIndex);
+    addThrowRelationships(builder, evidence, file, symbolIndex, staged);
+    addHttpResponses(builder, evidence, file, symbolIndex, staged);
+  }
+  flushAttributes(builder, staged);
+}
+
+/**
+ * Staged node-attribute updates, keyed by node id.
+ *
+ * `addNode` keeps whatever attributes a node already has, so a count written from two passes
+ * silently keeps only the first value. Updates are collected here and written once per node, which
+ * is also why the counts can be trusted to be counts.
+ */
+type StagedAttributes = Map<string, Record<string, AttributeValue>>;
+
+function stageAttributes(staged: StagedAttributes, id: string, patch: Record<string, AttributeValue>): void {
+  const existing = staged.get(id);
+  staged.set(id, existing ? { ...existing, ...patch } : patch);
+}
+
+function flushAttributes(builder: SoftwareGraphBuilder, staged: StagedAttributes): void {
+  for (const [id, patch] of staged) {
+    const node = builder.getNode(id);
+    if (!node) continue;
+    builder.addNode({ ...node, attributes: { ...(node.attributes ?? {}), ...patch } });
+  }
+}
+
+/**
+ * Connects a returned local to the call its value came from.
+ *
+ * `const rows = await findAll(); return rows;` names neither the callee nor a type in the return
+ * statement, so the connection is an inference rather than a stated return — and it is labelled
+ * that way: `WEEKLY_INFERRED`, `inferred: true`, with the variable named so a reader can check
+ * it. A direct `return findAll()` stays `STRONGLY_INFERRED` because the return statement names
+ * the callee.
+ *
+ * Only a variable with exactly one binding is used. If `rows` is assigned twice, the value that
+ * is returned is not established, and no relationship is created.
+ */
+function addBindingReturns(
+  builder: SoftwareGraphBuilder,
+  evidence: EvidenceStore,
+  file: ParsedFile,
+  symbolIndex: ReadonlyMap<string, SymbolRef>,
+): void {
+  const bindingsByName = new Map<string, { callee: string; awaited: boolean; line: number; scope: string }[]>();
+  for (const binding of file.bindings ?? []) {
+    if (!binding.fromQualifiedName) continue;
+    const key = `${binding.fromQualifiedName}::${binding.name}`;
+    const list = bindingsByName.get(key);
+    const entry = { callee: binding.callee, awaited: binding.awaited === true, line: binding.line, scope: binding.fromQualifiedName };
+    if (list) list.push(entry);
+    else bindingsByName.set(key, [entry]);
+  }
+  if (bindingsByName.size === 0) return;
+
+  for (const returned of file.returns ?? []) {
+    if (!returned.fromQualifiedName || returned.kind !== 'identifier' || !returned.name) continue;
+    const candidates = bindingsByName.get(`${returned.fromQualifiedName}::${returned.name}`) ?? [];
+    if (candidates.length !== 1) continue;
+
+    const binding = candidates[0]!;
+    const callee = resolveCallee(binding.callee, symbolIndex);
+    const caller = symbolIndex.get(binding.scope);
+    if (!callee || !caller) continue;
+
+    const bindingEvidence = evidence.add({
+      kind: 'CALL_SITE',
+      path: file.path,
+      startLine: binding.line,
+      endLine: binding.line,
+      symbol: returned.name,
+      excerpt: `const ${returned.name} = ${binding.awaited ? 'await ' : ''}${binding.callee}(…)`,
+      producer: file.producer,
+    });
+
+    builder.addEdge({
+      from: callee.id,
+      to: caller.id,
+      kind: 'returns',
+      // Weaker than a direct `return callee()`: the return statement names a variable, and the
+      // link to this call runs through its assignment.
+      confidence: 'WEEKLY_INFERRED',
+      evidence: [bindingEvidence, ...(returned.line !== binding.line
+        ? [
+            evidence.add({
+              kind: 'CALL_SITE',
+              path: file.path,
+              startLine: returned.line,
+              endLine: returned.line,
+              symbol: returned.name,
+              excerpt: `return ${returned.expression ?? returned.name}`,
+              producer: file.producer,
+            }),
+          ]
+        : [])],
+      attributes: {
+        returnKind: 'identifier',
+        inferred: true,
+        via: returned.name,
+        ...(binding.awaited || returned.awaited ? { awaited: true } : {}),
+      },
+    });
+  }
+}
+
+/**
+ * Records what each function returns, and the return relationship a `return <call>` establishes.
+ *
+ * `hasReturn` and `returnCount` are recorded on the function so "returns nothing" and "returns
+ * something this extractor could not read" are different facts in the graph rather than the same
+ * absence.
+ */
+function addReturnStatements(
+  builder: SoftwareGraphBuilder,
+  evidence: EvidenceStore,
+  file: ParsedFile,
+  symbolIndex: ReadonlyMap<string, SymbolRef>,
+  staged: StagedAttributes,
+): void {
+  // Caller → callee, so a `return callee(…)` can be turned into a callee → caller relationship.
+  const calleesByCaller = new Map<string, Set<string>>();
+  for (const call of file.calls) {
+    if (!call.fromQualifiedName) continue;
+    const caller = symbolIndex.get(call.fromQualifiedName);
+    const callee = resolveCallee(call.callee, symbolIndex);
+    if (!caller || !callee) continue;
+    const set = calleesByCaller.get(call.fromQualifiedName);
+    if (set) set.add(callee.id);
+    else calleesByCaller.set(call.fromQualifiedName, new Set([callee.id]));
+  }
+
+  for (const returned of file.returns ?? []) {
+    const scope = returned.fromQualifiedName ? symbolIndex.get(returned.fromQualifiedName) : undefined;
+    if (!scope) continue;
+
+    const returnEvidence = evidence.add({
+      kind: 'CALL_SITE',
+      path: file.path,
+      startLine: returned.line,
+      endLine: returned.line,
+      symbol: returned.name ?? 'return',
+      excerpt: `return ${returned.expression ?? returned.kind}`,
+      producer: file.producer,
+    });
+
+// Function-level fact: this function has a return, and what shape it returned. Staged, so a
+    // second return statement in the same function raises the count instead of being dropped.
+    const stagedFor = staged.get(scope.id);
+    stageAttributes(staged, scope.id, {
+      hasReturn: true,
+      returnCount: (Number(stagedFor?.returnCount ?? 0) || 0) + 1,
+      returnsShape: returned.kind,
+      ...(returned.awaited ? { returnsAwaited: true } : {}),
+    });
+
+    // Return relationship: callee → caller, for a `return <call>`.
+    if (!returned.name) continue;
+    const callee = symbolIndex.get(returned.name);
+    const candidates = calleesByCaller.get(returned.fromQualifiedName!) ?? new Set<string>();
+    // The returned call is the one whose result this statement returns. Matching by name is
+    // resolved against declared entities, so a returned expression that names nothing declared
+    // simply produces no relationship rather than a guessed one.
+    if (callee && candidates.has(callee.id)) {
+      builder.addEdge({
+        from: callee.id,
+        to: scope.id,
+        kind: 'returns',
+        // The return statement is explicit; which value it hands back is not resolved to a
+        // type, so the relationship is strong inference rather than explicit.
+        confidence: 'STRONGLY_INFERRED',
+        evidence: [returnEvidence],
+        attributes: {
+          returnKind: returned.kind,
+          ...(returned.awaited ? { awaited: true } : {}),
+          ...(returned.expression ? { expression: returned.expression } : {}),
+        },
+      });
+    }
+  }
+}
+
+/**
+ * Records that a function can fail, and links it to the callers that may see the failure.
+ *
+ * Only explicit failure sites count: `throw`, `reject`, `Promise.reject`, `raise`. A function
+ * with no throw record is not asserted to be safe — it is only asserted to have no *recorded*
+ * failure site, which is what the omission log says.
+ */
+function addThrowRelationships(
+  builder: SoftwareGraphBuilder,
+  evidence: EvidenceStore,
+  file: ParsedFile,
+  symbolIndex: ReadonlyMap<string, SymbolRef>,
+  staged: StagedAttributes,
+): void {
+  // Callers come from the call graph, not from this file's own calls. A callee that throws is
+  // almost always called from somewhere else — reading callers from `file.calls` would find
+  // nothing and silently drop the relationship.
+  const callersByCallee = new Map<string, Set<string>>();
+  for (const edge of builder.allEdges()) {
+    if (edge.kind !== 'calls') continue;
+    const set = callersByCallee.get(edge.to);
+    if (set) set.add(edge.from);
+    else callersByCallee.set(edge.to, new Set([edge.from]));
+  }
+  if (callersByCallee.size === 0) return;
+
+  const throwSites = new Map<string, number>();
+
+  for (const thrown of file.throws ?? []) {
+    const scope = thrown.fromQualifiedName ? symbolIndex.get(thrown.fromQualifiedName) : undefined;
+    if (!scope) continue;
+    throwSites.set(scope.id, (throwSites.get(scope.id) ?? 0) + 1);
+
+    const throwEvidence = evidence.add({
+      kind: 'CALL_SITE',
+      path: file.path,
+      startLine: thrown.line,
+      endLine: thrown.line,
+      symbol: thrown.expression ?? thrown.via,
+      excerpt: thrown.via === 'throw' ? `throw ${thrown.expression ?? ''}`.trim() : `reject ${thrown.expression ?? ''}`.trim(),
+      producer: file.producer,
+    });
+
+    for (const callerId of callersByCallee.get(scope.id) ?? []) {
+      builder.addEdge({
+        from: scope.id,
+        to: callerId,
+        kind: 'throws',
+        confidence: 'STRONGLY_INFERRED',
+        evidence: [throwEvidence],
+        attributes: {
+          via: thrown.via,
+          ...(thrown.inAsyncFunction ? { rejects: true } : {}),
+          ...(thrown.expression ? { expression: thrown.expression } : {}),
+        },
+      });
+    }
+  }
+
+// The count lives on the function so a reader can see how many failure sites were found
+  // without traversing to every caller.
+  for (const [functionId, count] of throwSites) {
+    stageAttributes(staged, functionId, { throwSites: count });
+  }
+}
+
+/**
+ * Records an HTTP response as a fact about the handler that wrote it.
+ *
+ * The arrow points from the handler to the endpoint node when the handler is the one a route
+ * names, because the endpoint is the requester side of the interaction. A response written by
+ * a function no route names is recorded on the function alone, with no relationship, because
+ * there is no requester in the graph to point at.
+ */
+function addHttpResponses(
+  builder: SoftwareGraphBuilder,
+  evidence: EvidenceStore,
+  file: ParsedFile,
+  symbolIndex: ReadonlyMap<string, SymbolRef>,
+  staged: StagedAttributes,
+): void {
+  if ((file.responses?.length ?? 0) === 0) return;
+
+  // Endpoint → handler, from the route.handler edges the marker pass already created.
+  const handlerEndpoints = new Map<string, string[]>();
+  for (const edge of builder.allEdges()) {
+    if (edge.kind !== 'calls' || edge.attributes?.derivedFrom !== 'route.handler') continue;
+    const list = handlerEndpoints.get(edge.to);
+    if (list) list.push(edge.from);
+    else handlerEndpoints.set(edge.to, [edge.from]);
+  }
+
+  const markersByScope = new Map<string, Marker[]>();
+  for (const marker of file.markers) {
+    if (marker.name !== 'http.response') continue;
+    const scope = typeof marker.attributes.scope === 'string' ? marker.attributes.scope : undefined;
+    if (!scope) continue;
+    const list = markersByScope.get(scope);
+    if (list) list.push(marker);
+    else markersByScope.set(scope, [marker]);
+  }
+
+  for (const [scopeName, markers] of markersByScope) {
+    const scope = symbolIndex.get(scopeName);
+    if (!scope) continue;
+
+    for (const marker of markers) {
+      const responseEvidence = evidence.add({
+        kind: 'ROUTE_DECLARATION',
+        path: file.path,
+        startLine: marker.line,
+        endLine: marker.line,
+        symbol: scopeName,
+        excerpt: `${String(marker.attributes.method ?? 'response')}${marker.attributes.status ? ` ${String(marker.attributes.status)}` : ''}`,
+        producer: file.producer,
+      });
+
+      const endpoints = handlerEndpoints.get(scope.id) ?? [];
+      for (const endpoint of endpoints) {
+        builder.addEdge({
+          from: scope.id,
+          to: endpoint,
+          kind: 'returns',
+          confidence: 'EXPLICIT',
+          evidence: [responseEvidence],
+          attributes: {
+            httpResponse: true,
+            method: marker.attributes.method ?? 'response',
+            ...(marker.attributes.status ? { status: marker.attributes.status } : {}),
+            ...(marker.attributes.payload ? { payload: marker.attributes.payload } : {}),
+            ...(marker.attributes.payloadKind ? { payloadKind: marker.attributes.payloadKind } : {}),
+          },
+        });
+      }
+
+if (endpoints.length === 0) {
+        // No route names this function, so there is no requester to point at. The response is
+        // still a fact about the code and is counted on the function node - otherwise a response
+        // written outside any route handler would leave no trace in the graph at all.
+      }
+
+      const stagedFor = staged.get(scope.id);
+      const known = typeof stagedFor?.httpResponseStatuses === 'string' ? stagedFor.httpResponseStatuses : '';
+      const status = marker.attributes.status;
+      const statusText = status === undefined ? '' : String(status);
+      stageAttributes(staged, scope.id, {
+        httpResponses: (Number(stagedFor?.httpResponses ?? 0) || 0) + 1,
+        ...(statusText && !known.split(',').includes(statusText)
+          ? { httpResponseStatuses: known ? `${known},${statusText}` : statusText }
+          : {}),
+      });
+    }
+  }
+}

@@ -43,6 +43,10 @@ export function emptyResult(context: ParserContext, producer: string): ParsedFil
     entities: [],
     calls: [],
     markers: [],
+    responses: [],
+    throws: [],
+    returns: [],
+    bindings: [],
     problems: [],
     durationMs: 0,
   };

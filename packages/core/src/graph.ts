@@ -26,9 +26,14 @@ import {
  * and DDL primary keys, foreign keys, nullability and uniqueness. Version 3 also introduced
  * `tests` edges from a test to the endpoint its handler serves.
  *
+ * Version 4 adds `returns` and `throws` edges, `role`/`statement` on data-access edges, and the
+ * function attributes behind them (`hasReturn`, `returnCount`, `throws`). A sequence drawn from
+ * a version 3 graph and one drawn from a version 4 graph would disagree about what an
+ * interaction hands back, so the two must not be diffed against each other.
+ *
  * Snapshots taken under an older version are reported incomparable rather than silently diffed.
  */
-export const GRAPH_SCHEMA_VERSION = 3;
+export const GRAPH_SCHEMA_VERSION = 4;
 
 export class GraphLimitError extends Error {
   readonly code = 'GRAPH_LIMIT_EXCEEDED';

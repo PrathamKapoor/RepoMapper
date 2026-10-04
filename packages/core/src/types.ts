@@ -226,6 +226,10 @@ export const EDGE_KINDS = [
   'branches',
   'loops',
   'references',
+  // Phase 4. What an interaction hands back, and where it can fail. Both are drawn from a
+  // return statement or a throw in the source, never from the existence of a call.
+  'returns',
+  'throws',
 ] as const;
 
 export type EdgeKind = (typeof EDGE_KINDS)[number];
@@ -363,9 +367,81 @@ export interface ParsedFile {
   calls: CallRecord[];
   /** Free-form facts such as framework markers or route tables. */
   markers: Marker[];
+  /**
+   * Phase 4. HTTP responses the file produces, one per response-producing call.
+   *
+   * Optional because `ParsedFile` is a producer contract: a parser that predates Phase 4, or one
+   * written outside this repository, may not supply it. Absence means *no evidence was recorded*,
+   * which every consumer must report as such rather than as "there is no response here".
+   */
+  responses?: HttpResponseRecord[];
+  /** Phase 4. Throw and reject sites, one per explicit statement. Absent means none recorded. */
+  throws?: ThrowRecord[];
+  /** Phase 4. Return statements. Absent means none recorded. */
+  returns?: ReturnRecord[];
+  /**
+   * Phase 4. A local binding whose initialiser is a call.
+   *
+   * `const rows = await findAll()` is the common shape, and `return rows` names neither the
+   * callee nor a type. This is what lets the graph say "this value came from that call" —
+   * as a clearly weaker inference than a direct `return findAll()`.
+   */
+  bindings?: BindingRecord[];
   /** Non-fatal problems: syntax errors, unsupported syntax, truncation. */
   problems: ParseProblem[];
   durationMs: number;
+}
+
+/** An explicit failure site: `throw`, `Promise.reject`, or a rejection forwarded by `await`. */
+export interface ThrowRecord {
+  line: number;
+  /** Enclosing function qualified name when resolvable. */
+  fromQualifiedName?: string;
+  /** Expression thrown, truncated. Absent for a bare `throw;`. */
+  expression?: string;
+  /** How the failure is signalled: `throw`, `reject`. */
+  via: 'throw' | 'reject';
+  /** True when the throw is inside an `async` function, where it becomes a rejection. */
+  inAsyncFunction?: boolean;
+}
+
+/**
+ * A `return` statement and the shape of what it returns.
+ *
+ * Recorded per statement so that "this function returns nothing" and "this function's returns
+ * are all unresolved expressions" are different facts. The first is a statement about the code;
+ * the second is a limit of what the extractor could read.
+ */
+export interface ReturnRecord {
+  line: number;
+  /** Enclosing function qualified name when resolvable. */
+  fromQualifiedName?: string;
+  /**
+   * Shape of the returned expression, or `bare` for `return;`.
+   *
+   * `bare` is recorded rather than skipped: a function that returns nothing explicitly and a
+   * function with no return statement are different facts about the code.
+   */
+  kind: CallResult['kind'] | 'bare';
+  /** Name it refers to, when the shape carries one. */
+  name?: string;
+  /** True when the returned expression is awaited. */
+  awaited?: boolean;
+  /** The expression as written, truncated, for a reader and for evidence. */
+  expression?: string;
+}
+
+/** A local variable assigned from a call, with the line that says so. */
+export interface BindingRecord {
+  /** Variable name as declared. */
+  name: string;
+  /** Callee the value came from, as written. */
+  callee: string;
+  line: number;
+  /** True when the initialiser is `await <call>`. */
+  awaited?: boolean;
+  /** Enclosing function qualified name when resolvable. */
+  fromQualifiedName?: string;
 }
 
 export interface ImportRecord {
@@ -427,6 +503,59 @@ export interface CallRecord {
   argCount?: number;
   /** True when the callee is a local identifier (no member access, no import). */
   isLocalIdentifier: boolean;
+  /**
+   * Phase 4. What the source does with this call's result.
+   *
+   * Recorded per call *site* rather than per callee because that is where the evidence is:
+   * `return service.find(id)` says the caller hands back the callee's value, while
+   * `service.find(id)` on its own says nothing about what happens next. Absence means the
+   * source says nothing, which is not the same as "returns nothing".
+   */
+  result?: CallResult;
+  /** Phase 4. True when the call is the operand of `await`. */
+  awaited?: boolean;
+}
+
+/**
+ * What a call's result is used for at its call site.
+ *
+ * `return` and `awaited` are independent on purpose: `return await service.find(id)` is both,
+ * and the sequence must show an asynchronous call whose value comes back.
+ */
+export interface CallResult {
+  /** The returned expression's shape. */
+  kind: 'identifier' | 'call' | 'constructor' | 'literal' | 'expression' | 'awaited_call';
+  /**
+   * Name the expression refers to, when it is a bare identifier, a call, or a constructor:
+   * `user`, `findById`, `User`. Resolved against declared entities by the graph builder;
+   * left unresolved here rather than guessed.
+   */
+  name?: string;
+  /** Line of the `return` statement, which is the evidence for a returned value. */
+  line?: number;
+  /** True when the returned expression is an awaited call. */
+  awaited?: boolean;
+}
+
+/**
+ * An HTTP response produced by a handler.
+ *
+ * Observed from the response object's own method call — `res.status(201).json(order)` — never
+ * from the route name, so nothing here is inferred from what an endpoint is called.
+ */
+export interface HttpResponseRecord {
+  /** Line of the response-producing call. */
+  line: number;
+  /** The method used: `json`, `send`, `status`, `redirect`, `write`, `end`. */
+  method: string;
+  /** Numeric status when the code states a literal, e.g. `status(201)`. */
+  status?: number;
+  /** Expression handed to the response, when it is an identifier, call or constructor. */
+  payload?: string;
+  /** Payload shape, as for `CallResult`. */
+  payloadKind?: CallResult['kind'];
+  /** True when the handler returned the response rather than calling a method on it. */
+  returned?: boolean;
 }
 
 export interface Marker {

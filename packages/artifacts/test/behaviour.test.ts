@@ -31,6 +31,9 @@ function parsedFile(path: string, overrides: Partial<ParsedFile> = {}): ParsedFi
     entities: [],
     calls: [],
     markers: [],
+    responses: [],
+    throws: [],
+    returns: [],
     problems: [],
     durationMs: 0,
     ...overrides,
@@ -122,10 +125,14 @@ describe('sequence projection', () => {
     expect(first?.target).toBe('function:handlelist');
   });
 
-  it('never draws a return message, because the graph records no return', () => {
+  it('draws no return message when the graph records none', () => {
+    // Phase 4 removed the blanket refusal to draw a return, not the requirement for evidence.
+    // A call whose result the source never uses still produces no return arrow, and the view
+    // says why rather than drawing an empty one.
     const artifact = sequenceOf();
-    expect(artifact.edges.every((edge) => edge.kind === 'calls')).toBe(true);
-    expect(artifact.omitted.some((entry) => entry.reason.includes('return messages'))).toBe(true);
+    expect(artifact.edges.every((edge) => edge.kind !== 'returns')).toBe(true);
+    expect(artifact.omitted.some((entry) => entry.reason.includes('calls with no return drawn'))).toBe(true);
+    expect(artifact.scope).toContain('A call with no recorded return is drawn as a call with no return');
   });
 
   it('marks an asynchronous call only where the declaration says so', () => {

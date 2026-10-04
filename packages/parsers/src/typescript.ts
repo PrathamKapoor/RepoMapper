@@ -1,5 +1,5 @@
 import ts from 'typescript';
-import type { CallRecord, ExtractedEntity, ImportRecord, Marker, ParsedFile } from '@repoatlas/core';
+import type { CallRecord, CallResult, ExtractedEntity, ImportRecord, Marker, ParsedFile } from '@repoatlas/core';
 import { addProblem, emptyResult, type ParserContext, type SourceParser } from './contract.js';
 import { analyzeSql } from './sql.js';
 
@@ -64,11 +64,17 @@ const ctx: WalkContext = {
       maxCalls: context.maxCalls,
       stack: [],
       inlineHandlers: new Map(),
+      awaitedCalls: new Set(),
+      returnedExpressions: new Map(),
+      responseStatus: new Map(),
+      pendingResponseStatus: [],
     };
 
     for (const statement of sourceFile.statements) {
       visit(statement, ctx);
     }
+
+    resolveChainedResponseStatuses(ctx);
 
     result.durationMs = Math.round(performance.now() - started);
     return result;
@@ -88,6 +94,20 @@ interface WalkContext {
    * cannot discover its own registration after the fact.
    */
   inlineHandlers: Map<ts.Node, InlineHandler>;
+  /**
+   * Phase 4. Return and await context, recorded by node identity during the walk.
+   *
+   * The source file is parsed without parent pointers, so a call cannot ask whether it is
+   * `await`ed or what a `return` statement does with its value. The `await` and `return` nodes
+   * are visited first — a parent is always visited before its children — so they register the
+   * fact and the call reads it.
+   */
+  awaitedCalls: Set<ts.Node>;
+  returnedExpressions: Map<ts.Node, CallResult>;
+  /** Status literals from configuring calls, keyed by the call that carries them. */
+  responseStatus: Map<ts.Node, number>;
+  /** `res.status(201).json(…)` pairs awaiting the status their configuring call records. */
+  pendingResponseStatus: { producer: ts.Node; configurer: ts.Node }[];
 }
 
 /**
@@ -98,6 +118,14 @@ interface WalkContext {
  * Without that, a sibling method would inherit the previous method's name as its parent.
  */
 function visit(node: ts.Node, ctx: WalkContext): void {
+  // Phase 4. Recorded before anything else, because both facts are about a *descendant* and a
+  // parent is always visited before its children.
+  recordAwait(node, ctx);
+  recordBinding(node, ctx);
+  recordReturn(node, ctx);
+  recordThrow(node, ctx);
+  recordHttpResponse(node, ctx);
+
   if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
     ctx.result.imports.push(makeImport(node.moduleSpecifier.text, node, ctx, node.importClause?.isTypeOnly ? 'type_only' : 'static'));
     return;
@@ -422,6 +450,15 @@ const route = routeMarker(node, ctx);
     };
     const enclosing = ctx.stack.at(-1);
     if (enclosing) call.fromQualifiedName = enclosing;
+
+    // Phase 4. The call's result context, recorded by the `await` and `return` statements that
+    // were visited before this call. Absent means the source says nothing about the result,
+    // which is preserved rather than defaulted to "returns nothing".
+    if (ctx.awaitedCalls.has(node)) call.awaited = true;
+    const returned = ctx.returnedExpressions.get(node);
+    if (returned) call.result = returned;
+    else if (ctx.awaitedCalls.has(node)) call.result = { kind: 'awaited_call', line: call.line, awaited: true };
+
     ctx.result.calls.push(call);
   }
 }
@@ -834,4 +871,296 @@ function scriptKindFor(path: string): ts.ScriptKind {
   if (path.endsWith('.js') || path.endsWith('.mjs') || path.endsWith('.cjs')) return ts.ScriptKind.JS;
   if (path.endsWith('.json')) return ts.ScriptKind.JSON;
   return ts.ScriptKind.TS;
+}
+
+/**
+ * Phase 4: what an interaction hands back.
+ *
+ * These helpers record three facts the sequence view needs and the call graph alone cannot
+ * supply: a call that is `await`ed, a `return` statement's use of a call's value, and an HTTP
+ * response written by a handler. Each is recorded at the *site* that states it, because that
+ * is where the evidence is: `return service.find(id)` says the caller hands back the callee's
+ * value, while `service.find(id)` on its own says nothing about the result.
+ *
+ * Absence is preserved. A call with no recorded result is a call the source says nothing about,
+ * which is not the same as a call that returns nothing, and the sequence view says so rather
+ * than drawing an empty return.
+ */
+
+/** Response methods whose call *is* the response. */
+const RESPONSE_METHODS = new Set(['json', 'jsonp', 'send', 'sendFile', 'sendStatus', 'download', 'redirect', 'write', 'end']);
+
+/** Methods that configure a response rather than produce it. */
+const RESPONSE_CONFIGURERS = new Set(['status', 'statusCode', 'set', 'header', 'setHeader', 'type', 'contentType', 'location']);
+
+/**
+ * Records that a call is the operand of `await`.
+ *
+ * `await service.get(id)` resumes with a value; `service.get(id)` on its own says nothing about
+ * what happens next. Drawing a return for the second would be a claim the source never made.
+ */
+function recordAwait(node: ts.Node, ctx: WalkContext): void {
+  if (!ts.isAwaitExpression(node)) return;
+  const operand = unwrapParens(node.expression);
+  if (ts.isCallExpression(operand)) ctx.awaitedCalls.add(operand);
+}
+
+/**
+ * Records what a `return` statement does with its expression.
+ *
+ * Only the outer expression is classified. `return a + b` is recorded as an expression with no
+ * name, because naming a value there would mean inventing one; `return findById(id)` names the
+ * callee, because that name is written in the source.
+ */
+function recordReturn(node: ts.Node, ctx: WalkContext): void {
+  if (!ts.isReturnStatement(node)) return;
+
+  // `return;` returns nothing, and that is still a return statement. Recording it keeps "returns
+  // nothing explicitly" distinct from "has no return statement at all".
+  if (!node.expression) {
+    (ctx.result.returns ??= []).push({
+      line: lineOf(ctx, safeStart(node, ctx)),
+      ...(ctx.stack.at(-1) ? { fromQualifiedName: ctx.stack.at(-1) } : {}),
+      kind: 'bare',
+    });
+    return;
+  }
+
+  const expression = unwrapParens(node.expression);
+  const line = lineOf(ctx, safeStart(node, ctx));
+  const result = classifyReturnedExpression(expression, line, ctx);
+  if (!result) return;
+
+  ctx.returnedExpressions.set(expression, result);
+  (ctx.result.returns ??= []).push({
+    line,
+    ...(ctx.stack.at(-1) ? { fromQualifiedName: ctx.stack.at(-1) } : {}),
+    kind: result.kind,
+    ...(result.name ? { name: result.name } : {}),
+    ...(result.awaited ? { awaited: true } : {}),
+    expression: clip(expression.getText(ctx.sourceFile), 120),
+  });
+}
+
+/**
+ * Records a local binding whose initialiser is a call.
+ *
+ * `const rows = await findAll()` followed by `return rows` is the most common way a handler
+ * returns something, and the return statement names neither the callee nor a type. Recording the
+ * binding is what lets the graph connect the two — as an explicitly weaker inference than a
+ * direct `return findAll()`.
+ */
+function recordBinding(node: ts.Node, ctx: WalkContext): void {
+  if (!ts.isVariableDeclaration(node) || !ts.isIdentifier(node.name) || !node.initializer) return;
+
+  const awaited = ts.isAwaitExpression(node.initializer);
+  const initializer = awaited ? unwrapParens(node.initializer.expression) : node.initializer;
+  if (!ts.isCallExpression(initializer)) return;
+
+  const callee = calleeName(initializer.expression);
+  if (!callee) return;
+
+  (ctx.result.bindings ??= []).push({
+    name: node.name.text,
+    callee,
+    line: lineOf(ctx, safeStart(node, ctx)),
+    ...(awaited ? { awaited: true } : {}),
+    ...(ctx.stack.at(-1) ? { fromQualifiedName: ctx.stack.at(-1) } : {}),
+  });
+}
+
+/** Records an explicit failure site: `throw`, or a rejection the source constructs. */
+function recordThrow(node: ts.Node, ctx: WalkContext): void {
+  if (ts.isThrowStatement(node)) {
+    (ctx.result.throws ??= []).push({
+      line: lineOf(ctx, safeStart(node, ctx)),
+      ...(ctx.stack.at(-1) ? { fromQualifiedName: ctx.stack.at(-1) } : {}),
+      ...(node.expression ? { expression: clip(node.expression.getText(ctx.sourceFile), 120) } : {}),
+      via: 'throw',
+      ...(isInAsyncScope(ctx) ? { inAsyncFunction: true } : {}),
+    });
+    return;
+  }
+
+  // `Promise.reject(…)` and a bare `reject(…)` are failures the source states rather than
+  // thrown exceptions. Both are recorded; the difference matters to a caller reading them.
+  if (ts.isCallExpression(node)) {
+    const name = calleeName(node.expression);
+    if (name !== 'Promise.reject' && name !== 'reject') return;
+    (ctx.result.throws ??= []).push({
+      line: lineOf(ctx, safeStart(node, ctx)),
+      ...(ctx.stack.at(-1) ? { fromQualifiedName: ctx.stack.at(-1) } : {}),
+      ...(node.arguments[0] ? { expression: clip(node.arguments[0].getText(ctx.sourceFile), 120) } : {}),
+      via: 'reject',
+      ...(isInAsyncScope(ctx) ? { inAsyncFunction: true } : {}),
+    });
+  }
+}
+
+/**
+ * True when any enclosing scope was declared `async`.
+ *
+ * A throw inside an async function becomes a rejected promise, which is a different observable
+ * behaviour from a synchronous exception. Recording it separately stops a sequence view drawing
+ * a synchronous error arrow for a function that can only reject.
+ */
+function isInAsyncScope(ctx: WalkContext): boolean {
+  return ctx.stack.some((qualifiedName) =>
+    ctx.result.entities.some((entity) => entity.qualifiedName === qualifiedName && entity.isAsync === true),
+  );
+}
+
+function classifyReturnedExpression(expression: ts.Expression, line: number, ctx: WalkContext): CallResult | undefined {
+  const awaitedByAwait = ts.isAwaitExpression(expression);
+  const inner = awaitedByAwait ? unwrapParens(expression.expression) : expression;
+
+  if (ts.isCallExpression(inner)) {
+    return {
+      kind: awaitedByAwait ? 'awaited_call' : 'call',
+      ...(calleeName(inner.expression) ? { name: calleeName(inner.expression)! } : {}),
+      line,
+      ...(awaitedByAwait ? { awaited: true } : {}),
+    };
+  }
+  if (ts.isNewExpression(inner)) {
+    const name = calleeName(inner.expression);
+    return { kind: 'constructor', ...(name ? { name } : {}), line };
+  }
+  if (ts.isIdentifier(inner)) return { kind: 'identifier', name: inner.text, line };
+  if (isLiteralExpression(inner)) return { kind: 'literal', line };
+  return { kind: 'expression', line, ...(ctx.stack.at(-1) ? {} : {}) };
+}
+
+function isLiteralExpression(node: ts.Expression): boolean {
+  return (
+    ts.isObjectLiteralExpression(node) ||
+    ts.isArrayLiteralExpression(node) ||
+    ts.isStringLiteralLike(node) ||
+    ts.isNumericLiteral(node) ||
+    ts.isNoSubstitutionTemplateLiteral(node) ||
+    node.kind === ts.SyntaxKind.TrueKeyword ||
+    node.kind === ts.SyntaxKind.FalseKeyword ||
+    node.kind === ts.SyntaxKind.NullKeyword ||
+    node.kind === ts.SyntaxKind.UndefinedKeyword
+  );
+}
+
+/**
+ * Recognises an HTTP response constructed in code.
+ *
+ * Three shapes, all read from the code itself:
+ * - `res.status(201).json(order)` — a configuring call whose status travels to the producing call;
+ * - `reply.send(x)` — a producing call directly;
+ * - `return Response.json(data)` / `return new Response(body)` — a response returned rather than
+ *   written to an object.
+ *
+ * Nothing is inferred from a route's name or path, so an endpoint called `/users` never gains a
+ * response shape it did not write.
+ */
+function recordHttpResponse(node: ts.Node, ctx: WalkContext): void {
+  if (!ts.isCallExpression(node)) return;
+  const callee = calleeName(node.expression);
+  if (!callee) return;
+
+  const method = callee.split('.').at(-1) ?? callee;
+
+  // A configuring call records its status for the producing call that is built on it.
+  if (RESPONSE_CONFIGURERS.has(method)) {
+    const status = literalStatusArgument(node);
+    if (status !== undefined) ctx.responseStatus.set(node, status);
+    return;
+  }
+
+  const isMemberCall = callee.includes('.') && RESPONSE_METHODS.has(method);
+  const isResponseConstructor = callee === 'Response.json' || callee === 'Response.redirect' || callee === 'NextResponse.json' || callee === 'NextResponse.redirect' || newExpressionName(node) === 'Response';
+  if (!isMemberCall && !isResponseConstructor) return;
+  if (isMemberCall && !RESPONSE_METHODS.has(method)) return;
+
+const line = lineOf(ctx, safeStart(node, ctx));
+  const payload = node.arguments[0];
+  const payloadShape = payload ? classifyReturnedExpression(payload, line, ctx) : undefined;
+  const own = literalStatusArgument(node);
+
+  // `res.status(201).json(order)`: the configuring call is the receiver of this one, and a parent
+  // is walked before its children, so the status is not in the map yet. The pair is remembered
+  // and resolved after the walk, which is the only point at which both calls have been seen.
+  const receiver = node.expression;
+  const pendingStatus =
+    ts.isPropertyAccessExpression(receiver) && ts.isCallExpression(receiver.expression)
+      ? { producer: node, configurer: receiver.expression }
+      : undefined;
+
+  (ctx.result.responses ??= []).push({
+    line,
+    method: isResponseConstructor ? 'Response' : method,
+    ...(own ? { status: own } : {}),
+    ...(payloadShape?.name ? { payload: payloadShape.name } : {}),
+    ...(payloadShape ? { payloadKind: payloadShape.kind } : {}),
+    ...(ctx.returnedExpressions.has(node) ? { returned: true } : {}),
+  });
+
+  if (pendingStatus) ctx.pendingResponseStatus.push(pendingStatus);
+
+  // Emitted as a marker as well, so the graph builder can link the response to the route that
+  // names this function. The marker carries the scope; the response record carries the detail.
+  ctx.result.markers.push({
+    name: 'http.response',
+    line,
+    attributes: {
+      method: isResponseConstructor ? 'Response' : method,
+      ...(own ? { status: own } : {}),
+      ...(payloadShape?.name ? { payload: payloadShape.name } : {}),
+      ...(payloadShape ? { payloadKind: payloadShape.kind } : {}),
+      ...(ctx.stack.at(-1) ? { scope: ctx.stack.at(-1) } : {}),
+    },
+  });
+}
+
+/**
+ * Applies a chained status to the response it configures.
+ *
+ * Run once after the walk. Doing this during the walk would miss every case, because the
+ * producing call is visited before the configuring call it is built on.
+ */
+function resolveChainedResponseStatuses(ctx: WalkContext): void {
+  if (ctx.pendingResponseStatus.length === 0) return;
+
+  const statusByLine = new Map(ctx.responseStatus);
+  for (const { producer, configurer } of ctx.pendingResponseStatus) {
+    const status = ctx.responseStatus.get(configurer);
+    if (status === undefined) continue;
+    const response = ctx.result.responses?.find((entry) => entry.line === lineOf(ctx, safeStart(producer, ctx)));
+    if (response && response.status === undefined) response.status = status;
+    const marker = ctx.result.markers.find(
+      (entry) => entry.name === 'http.response' && entry.line === lineOf(ctx, safeStart(producer, ctx)),
+    );
+    if (marker && marker.attributes.status === undefined) marker.attributes.status = status;
+  }
+  void statusByLine;
+}
+
+/** Status literal from `res.status(201)`, when the code states a number. */
+function literalStatusArgument(node: ts.CallExpression): number | undefined {
+  const argument = node.arguments[0];
+  if (!argument) return undefined;
+  if (ts.isNumericLiteral(argument)) return Number(argument.text);
+  if (ts.isStringLiteralLike(argument) && /^\d{3}$/.test(argument.text)) return Number(argument.text);
+  return undefined;
+}
+
+/** `new Response(…)`, reduced to the constructor name. */
+function newExpressionName(node: ts.Node): string | undefined {
+  if (!ts.isNewExpression(node)) return undefined;
+  return calleeName(node.expression) ?? undefined;
+}
+
+function unwrapParens(node: ts.Expression): ts.Expression {
+  let current = node;
+  while (ts.isParenthesizedExpression(current)) current = current.expression;
+  return current;
+}
+
+function clip(text: string, limit: number): string {
+  const collapsed = text.replace(/\s+/g, ' ').trim();
+  return collapsed.length > limit ? `${collapsed.slice(0, limit - 1)}…` : collapsed;
 }

@@ -1,5 +1,6 @@
 import type { CallRecord, ExtractedEntity, Marker, ParsedFile } from '@repoatlas/core';
 import { analyzeSql } from './sql.js';
+import type { CallResult } from '@repoatlas/core';
 import { addProblem, emptyResult, type ParserContext, type SourceParser } from './contract.js';
 
 /**
@@ -230,6 +231,10 @@ function handlePythonLine(
   const flow = pythonControlFlowMarker(code, line.line, enclosing);
   if (flow) result.markers.push(flow);
 
+  recordPythonReturn(line, result, enclosing);
+  recordPythonThrow(line, result, enclosing);
+  recordPythonResponse(line, result, enclosing);
+
   const queries = pythonSqlMarkers(line.raw, line.line, enclosing);
   for (const query of queries) result.markers.push(query);
 
@@ -320,9 +325,9 @@ function pythonSqlMarkers(raw: string, line: number, scope: string | undefined):
   return markers;
 }
 
-function clip(text: string): string {
+function clip(text: string, limit = 120): string {
   const collapsed = text.replace(/\s+/g, ' ').trim();
-  return collapsed.length > 120 ? `${collapsed.slice(0, 119)}…` : collapsed;
+  return collapsed.length > limit ? `${collapsed.slice(0, limit - 1)}.` : collapsed;
 }
 
 /**
@@ -607,4 +612,109 @@ function countIndent(raw: string): number {
 
 function normaliseSpacing(code: string): string {
   return code.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Phase 4 for Python: what an interaction hands back.
+ *
+ * The Python extractor is a line-oriented structural reader, so these rules match the shape a
+ * `return`, `raise` and response call actually take rather than building an AST. Each fact is
+ * recorded at the line that states it, and the same restraint applies as in TypeScript: a call
+ * whose result the source says nothing about records nothing.
+ */
+
+/** Records `return <expr>` and what the expression is. */
+function recordPythonReturn(line: LogicalLine, result: ParsedFile, enclosing: string | undefined): void {
+  const match = /^return\b\s*(.*)$/.exec(line.code.trim());
+  if (match === null) return;
+
+  // `return` on its own returns nothing, and is still a return statement.
+  if (!match[1]?.trim()) {
+    (result.returns ??= []).push({
+      line: line.line,
+      ...(enclosing ? { fromQualifiedName: enclosing } : {}),
+      kind: 'bare',
+    });
+    return;
+  }
+
+  const expression = match[1].trim().replace(/#.*$/, '').trim();
+  const awaited = /^await\s+/.test(expression);
+  const inner = expression.replace(/^await\s+/, '').trim();
+
+  const shape = pythonExpressionShape(inner);
+  (result.returns ??= []).push({
+    line: line.line,
+    ...(enclosing ? { fromQualifiedName: enclosing } : {}),
+    ...shape,
+    ...(awaited ? { awaited: true } : {}),
+    expression: clip(expression, 120),
+  });
+}
+
+/** Records `raise …`, which is Python's explicit failure site. */
+function recordPythonThrow(line: LogicalLine, result: ParsedFile, enclosing: string | undefined): void {
+  const match = /^raise\b\s*(.*)$/.exec(line.code.trim());
+  if (match === null) return;
+  const expression = (match[1] ?? '').trim();
+  (result.throws ??= []).push({
+    line: line.line,
+    ...(enclosing ? { fromQualifiedName: enclosing } : {}),
+    ...(expression.length > 0 ? { expression: clip(expression, 120) } : {}),
+    via: 'throw',
+  });
+}
+
+/**
+ * A response produced by a framework call.
+ *
+ * FastAPI and Flask both answer by returning an object; Starlette answers by calling a method on
+ * a response object. Both shapes appear, and neither is inferred from a route name.
+ */
+function recordPythonResponse(line: LogicalLine, result: ParsedFile, _enclosing: string | undefined): void {
+  const returned = result.returns?.find((entry) => entry.line === line.line);
+  const code = line.code;
+
+  // `return JSONResponse({...}, status_code=201)` and `return {"k": "v"}` from a handler.
+  if (returned) {
+    const jsonResponse = /\b(JSONResponse|PlainTextResponse|HTMLResponse|RedirectResponse|Response)\s*\(/.exec(returned.expression ?? '');
+    if (jsonResponse) {
+      (result.responses ??= []).push({
+        line: line.line,
+        method: jsonResponse[1] ?? 'Response',
+        ...(pythonStatusArgument(returned.expression ?? '') !== undefined ? { status: pythonStatusArgument(returned.expression ?? '') } : {}),
+        returned: true,
+      });
+      return;
+    }
+  }
+
+  // `response.json(...)` / `return response.json(...)` on a response object.
+  const methodCall = /\bresponse\.(json|send|send_status|redirect|write|make_response)\s*\(/.exec(code);
+  if (!methodCall?.[1]) return;
+  (result.responses ??= []).push({
+    line: line.line,
+    method: methodCall[1],
+    ...(pythonStatusArgument(code) !== undefined ? { status: pythonStatusArgument(code) } : {}),
+    ...(returned ? { returned: true } : {}),
+  });
+}
+
+function pythonStatusArgument(expression: string): number | undefined {
+  const match = /status(?:_code)?\s*=\s*(\d{3})/.exec(expression);
+  return match?.[1] ? Number(match[1]) : undefined;
+}
+
+/** Classifies a Python expression the way the TypeScript side classifies a returned one. */
+function pythonExpressionShape(expression: string): Pick<CallResult, 'kind' | 'name'> {
+  const call = /^([A-Za-z_][\w.]*)\s*\(/.exec(expression);
+  if (call?.[1]) return { kind: 'call', name: call[1] };
+
+  const constructed = /^([A-Za-z_][\w.]*)\s*\(/.exec(expression);
+  if (constructed?.[1]) return { kind: 'constructor', name: constructed[1] };
+
+  if (/^[A-Za-z_]\w*$/.test(expression)) return { kind: 'identifier', name: expression };
+  if (/^[([{]/.test(expression)) return { kind: 'literal' };
+  if (/^["'`]/.test(expression)) return { kind: 'literal' };
+  return { kind: 'expression' };
 }

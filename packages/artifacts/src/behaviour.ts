@@ -1,4 +1,4 @@
-import type { Confidence, EvidenceRef, GraphNode, SoftwareGraph } from '@repoatlas/core';
+import type { Confidence, EvidenceRef, GraphEdge, GraphNode, SoftwareGraph } from '@repoatlas/core';
 import {
   hasGraphSupport,
   type Artifact,
@@ -14,10 +14,24 @@ import {
  *
  * **Sequence** is about *who talks to whom, in what order*. Every message is a `calls`
  * relationship the graph already records, traversed breadth-first from an entry point with a
- * depth bound and a visited set. It never draws a return message, because the graph records
- * no return; a sequence diagram whose arrows go back are the most common way this diagram type
- * starts asserting things the code does not say. Asynchronous calls are marked only where the
- * declaration is marked `async`.
+ * depth bound and a visited set.
+ *
+ * Phase 4 adds the three arrows that were previously refused:
+ *
+ * - a **return**, from a `returns` relationship, which exists only where the source has a
+ *   `return` statement that hands the callee's value back. The arrow is drawn immediately after
+ *   the call it belongs to, because the return evidence is on that line — appending returns at
+ *   the end would assert an order the source does not state;
+ * - an **HTTP response**, from a `returns` relationship flagged `httpResponse`, pointing at the
+ *   endpoint that asked. The status and method come from the response call in the handler;
+ * - an **error path**, from a `throws` relationship, which exists only where the callee's body
+ *   contains an explicit `throw`, `reject` or `raise`. A function with no recorded failure site
+ *   gets no error arrow, and the omission log says how many were not recorded rather than
+ *   implying the code cannot fail.
+ *
+ * What still does *not* get drawn: a return inferred from the existence of a call, a return value
+ * resolved to a type the source does not state, and a response shape inferred from a route name.
+ * Each of those is the difference between an evidenced return and an invented one.
  *
  * **Activity** is about *what a single unit of work decides*. Its stages are a function and
  * the branch, loop and handler conditions that function owns, in source order. A call graph is
@@ -72,6 +86,10 @@ export function buildSequence(context: ProjectionContext, options: SequenceOptio
   const flows: { id: string; title: string; messages: number }[] = [];
   let cappedMessages = 0;
   const cappedFlows: string[] = [];
+  let values = 0;
+  let responses = 0;
+  let errors = 0;
+  let drawnCalls = 0;
 
   if (entryPoints.length === 0) {
     return finish({
@@ -122,27 +140,71 @@ export function buildSequence(context: ProjectionContext, options: SequenceOptio
       nodes.push(sequenceNode(node));
     }
 
+    // A call is followed immediately by its own return and its own error path, because the
+    // evidence for both is on the same source line. Emitting every call first and every return
+    // afterwards would assert an order the source never states.
     for (const message of drawn) {
+      if (message.kind === 'calls') {
+        drawnCalls += 1;
+        edges.push({
+          id: `seq:${message.order}:${message.from}->${message.to}`,
+          kind: 'calls',
+          source: message.from,
+          target: message.to,
+          label: message.async ? `${message.callee} (async)` : message.callee,
+          confidence: message.confidence,
+          evidence: message.evidence,
+          supportingEdgeIds: [message.edgeId],
+          derivation: `A ${message.async ? 'declared asynchronous ' : ''}call relationship recorded in the graph.`,
+          view: 'sequence',
+        });
+        continue;
+      }
+
+      if (message.kind === 'returns') {
+        edges.push({
+          id: `seq:${message.order}:${message.to}->${message.from}`,
+          kind: 'returns',
+          source: message.from,
+          target: message.to,
+          label: message.label,
+          confidence: message.confidence,
+          evidence: message.evidence,
+          supportingEdgeIds: [message.edgeId],
+          derivation: message.derivation,
+          view: 'sequence',
+        });
+        if (message.httpResponse) responses += 1;
+        else values += 1;
+        continue;
+      }
+
+      errors += 1;
       edges.push({
-        id: `seq:${message.from}->${message.to}:${message.order}`,
-        kind: 'calls',
+        id: `seq:${message.order}:${message.to}->${message.from}`,
+        kind: 'throws',
         source: message.from,
         target: message.to,
-        label: message.async ? `${message.callee} (async)` : message.callee,
+        label: message.label,
         confidence: message.confidence,
         evidence: message.evidence,
         supportingEdgeIds: [message.edgeId],
-        derivation: `A ${message.async ? 'declared asynchronous ' : ''}call relationship recorded in the graph.`,
+        derivation: message.derivation,
         view: 'sequence',
       });
     }
   }
 
+  const functionsWithFailureSites = graph.nodes.filter((node) => node.kind === 'function' && Number(node.attributes?.throwSites ?? 0) > 0).length;
+  const functionsWithoutReturns = graph.nodes.filter(
+    (node) => (node.kind === 'function' || node.kind === 'test') && node.attributes?.hasReturn !== true,
+  ).length;
+
   return finish({
     kind: 'sequence',
     level: 'sequence',
     title: 'Sequence',
-    scope: `Participants are the entry point and everything it reaches through calls, to a depth of ${MAX_SEQUENCE_DEPTH}. Every arrow is a recorded calls relationship; no return message is drawn because the graph records no return. Flow count: ${flows.length}.`,
+    scope: `Participants are the entry point and everything it reaches through calls, to a depth of ${MAX_SEQUENCE_DEPTH}. Every arrow is a recorded relationship: a call is a calls relationship, a return is a return or await statement in the source, an error path is an explicit throw or reject, and an HTTP response is a response call in the handler. A call with no recorded return is drawn as a call with no return. Drawn: ${drawnCalls} call(s), ${values} return(s), ${responses} response(s), ${errors} error path(s). Flow count: ${flows.length}.`,
     graph,
     nodes,
     edges,
@@ -159,8 +221,20 @@ export function buildSequence(context: ProjectionContext, options: SequenceOptio
         : []),
       {
         reason:
-          'return messages and error responses: the graph records call relationships and explicit handler conditions, not return values or thrown errors, so none are drawn',
-        count: flows.length,
+          'calls with no return drawn: a return needs a return statement that hands a callee value back, or a response call in a handler. A call whose result the source does not use has no return, and none is drawn',
+        count: Math.max(drawnCalls - values - responses, 0),
+        examples: [],
+      },
+      {
+        reason:
+          'functions with no recorded return at all: the source states no return for them, so the sequence cannot show one. This is a fact about the code, not a gap in the analysis',
+        count: functionsWithoutReturns,
+        examples: [],
+      },
+      {
+        reason:
+          'error paths not drawn: an error arrow needs an explicit throw, reject or raise in the callee. A function with no recorded failure site gets none, which is not a claim that it cannot fail',
+        count: Math.max(graph.nodes.filter((node) => node.kind === 'function').length - functionsWithFailureSites, 0),
         examples: [],
       },
       {
@@ -174,6 +248,7 @@ export function buildSequence(context: ProjectionContext, options: SequenceOptio
 }
 
 interface SequenceMessage {
+  kind: 'calls' | 'returns' | 'throws';
   from: string;
   to: string;
   callee: string;
@@ -182,17 +257,44 @@ interface SequenceMessage {
   evidence: EvidenceRef[];
   async: boolean;
   order: number;
+  /** Label for a return or an error path. */
+  label?: string;
+  /** Why this arrow may be drawn, in words. */
+  derivation?: string;
+  /** True for a response back to the endpoint that asked. */
+  httpResponse?: boolean;
 }
 
-/** Breadth-first walk of `calls` relationships from one entry point. */
+/**
+ * Breadth-first walk of `calls` relationships from one entry point, each call followed by the
+ * returns and throws recorded for it.
+ *
+ * The pairing is exact rather than positional: a `returns` relationship is drawn only on the
+ * call whose caller is the relationship's target, so a return can never appear against a call it
+ * does not belong to. Ordering is therefore deterministic — call, then its own return, then its
+ * own error path, then the next call at the same depth — and reproducible for a given graph.
+ */
 function sequenceMessages(graph: SoftwareGraph, entry: GraphNode): SequenceMessage[] {
   const byId = new Map(graph.nodes.map((node) => [node.id, node]));
   const outgoing = new Map<string, SoftwareGraph['edges']>();
+  /** (callee, caller) → the relationships that describe what comes back. */
+  const returnsByPair = new Map<string, GraphEdge[]>();
+  const throwsByPair = new Map<string, GraphEdge[]>();
+
   for (const edge of graph.edges) {
-    if (edge.kind !== 'calls') continue;
-    const list = outgoing.get(edge.from);
+    if (edge.kind === 'calls') {
+      const list = outgoing.get(edge.from);
+      if (list) list.push(edge);
+      else outgoing.set(edge.from, [edge]);
+      continue;
+    }
+    if (edge.kind !== 'returns' && edge.kind !== 'throws') continue;
+    // `returns` and `throws` run callee → caller, so the pair key is reversed from `calls`.
+    const key = `${edge.from}->${edge.to}`;
+    const index = edge.kind === 'returns' ? returnsByPair : throwsByPair;
+    const list = index.get(key);
     if (list) list.push(edge);
-    else outgoing.set(edge.from, [edge]);
+    else index.set(key, [edge]);
   }
 
   const messages: SequenceMessage[] = [];
@@ -213,6 +315,7 @@ function sequenceMessages(graph: SoftwareGraph, entry: GraphNode): SequenceMessa
 
         order += 1;
         messages.push({
+          kind: 'calls',
           from: edge.from,
           to: edge.to,
           callee: String(edge.attributes?.callee ?? target.name),
@@ -222,6 +325,55 @@ function sequenceMessages(graph: SoftwareGraph, entry: GraphNode): SequenceMessa
           async: isAsync(target),
           order,
         });
+
+        const pairKey = `${edge.to}->${edge.from}`;
+        for (const returned of returnsByPair.get(pairKey) ?? []) {
+          const http = returned.attributes?.httpResponse === true;
+          order += 1;
+          messages.push({
+            kind: 'returns',
+            from: returned.from,
+            to: returned.to,
+            callee: '',
+            edgeId: returned.id,
+            confidence: returned.confidence,
+            evidence: returned.evidence,
+            async: returned.attributes?.awaited === true,
+            order,
+            ...(http
+              ? {
+                  httpResponse: true,
+                  label: `responds ${String(returned.attributes?.status ?? '')}${returned.attributes?.status ? ' ' : ''}${String(returned.attributes?.method ?? '')}`.trim(),
+                  derivation:
+                    'A response call in the handler body. The status and method come from that call, never from the route name.',
+                }
+              : {
+                  label: `returns${returned.attributes?.awaited === true ? ' (awaited)' : ''}`,
+                  derivation:
+                    returned.attributes?.inferred === true
+                      ? `A local binding assigned from this call (${String(returned.attributes?.via ?? 'variable')}) is returned by the caller. The return statement names the variable, not the call, so the link is an inference and is drawn as one.`
+                      : 'A return statement in the caller hands this callee value on. The returned value is not resolved to a type, so the arrow states the fact and not a shape.',
+                }),
+          });
+        }
+
+        for (const thrown of throwsByPair.get(pairKey) ?? []) {
+          order += 1;
+          messages.push({
+            kind: 'throws',
+            from: thrown.from,
+            to: thrown.to,
+            callee: '',
+            edgeId: thrown.id,
+            confidence: thrown.confidence,
+            evidence: thrown.evidence,
+            async: thrown.attributes?.rejects === true,
+            order,
+            label: `throws${thrown.attributes?.via === 'reject' || thrown.attributes?.rejects === true ? ' (rejects)' : ''}`,
+            derivation:
+              'An explicit throw, reject or raise inside the callee. A function with no recorded failure site produces no error arrow, which is not a claim that it cannot fail.',
+          });
+        }
 
         if (!visited.has(target.id)) {
           visited.add(target.id);

@@ -763,6 +763,179 @@ describe('test attribution', () => {
     const edge = graph.edges.find((candidate) => candidate.kind === 'reads');
     expect(edge?.from).toBe('module:src/migrate');
     expect(edge?.confidence).toBe('WEEKLY_INFERRED');
-    expect(edge?.attributes?.scopeUnknown).toBe(true);
+expect(edge?.attributes?.scopeUnknown).toBe(true);
+  });
+});
+
+describe('return, throw and response relationships', () => {
+  function functionEntity(name: string, line = 1) {
+    return { kind: 'function' as const, name, qualifiedName: name, startLine: line, endLine: line + 2, language: 'typescript' };
+  }
+
+  it('links a direct return from the callee to the caller', () => {
+    const graph = build([
+      parsedFile('src/a.ts', {
+        entities: [functionEntity('load'), functionEntity('find')],
+        calls: [{ callee: 'find', line: 2, fromQualifiedName: 'load', isLocalIdentifier: true }],
+        returns: [{ line: 2, fromQualifiedName: 'load', kind: 'call', name: 'find', expression: 'find()' }],
+      }),
+    ]).graph;
+
+    const returned = graph.edges.find((edge) => edge.kind === 'returns');
+    expect(returned?.from).toBe('function:find');
+    expect(returned?.to).toBe('function:load');
+    expect(returned?.confidence).toBe('STRONGLY_INFERRED');
+    expect(returned?.evidence[0]?.startLine).toBe(2);
+  });
+
+  it('marks a return through a binding as inferred, names the variable, and stays weaker', () => {
+    const graph = build([
+      parsedFile('src/a.ts', {
+        entities: [functionEntity('handler'), functionEntity('findAll')],
+        bindings: [{ name: 'rows', callee: 'findAll', line: 4, awaited: true, fromQualifiedName: 'handler' }],
+        returns: [{ line: 5, fromQualifiedName: 'handler', kind: 'identifier', name: 'rows', expression: 'rows' }],
+      }),
+    ]).graph;
+
+    const returned = graph.edges.find((edge) => edge.kind === 'returns');
+    expect(returned?.confidence).toBe('WEEKLY_INFERRED');
+    expect(returned?.attributes?.inferred).toBe(true);
+    expect(returned?.attributes?.via).toBe('rows');
+    expect(returned?.attributes?.awaited).toBe(true);
+    // Both the assignment and the return statement are cited, so a reader can check the chain.
+    expect(returned?.evidence.map((item) => item.startLine)).toEqual([4, 5]);
+  });
+
+  it('creates no return when a returned variable has more than one binding', () => {
+    const graph = build([
+      parsedFile('src/a.ts', {
+        entities: [functionEntity('handler'), functionEntity('findAll'), functionEntity('findOther')],
+        bindings: [
+          { name: 'rows', callee: 'findAll', line: 4, fromQualifiedName: 'handler' },
+          { name: 'rows', callee: 'findOther', line: 6, fromQualifiedName: 'handler' },
+        ],
+        returns: [{ line: 8, fromQualifiedName: 'handler', kind: 'identifier', name: 'rows', expression: 'rows' }],
+      }),
+    ]).graph;
+
+    expect(graph.edges.some((edge) => edge.kind === 'returns')).toBe(false);
+  });
+
+  it('creates no return for a bare return', () => {
+    const graph = build([
+      parsedFile('src/a.ts', {
+        entities: [functionEntity('load')],
+        returns: [{ line: 2, fromQualifiedName: 'load', kind: 'bare' }],
+      }),
+    ]).graph;
+
+    expect(graph.edges.some((edge) => edge.kind === 'returns')).toBe(false);
+    expect(graph.nodes.find((node) => node.id === 'function:load')?.attributes?.hasReturn).toBe(true);
+  });
+
+  it('links a throw from the callee to callers in other files', () => {
+    const graph = build([
+      parsedFile('src/a.ts', {
+        entities: [functionEntity('handler')],
+        calls: [{ callee: 'load', line: 4, fromQualifiedName: 'handler', isLocalIdentifier: true }],
+      }),
+      parsedFile('src/b.ts', {
+        entities: [functionEntity('load')],
+        throws: [{ line: 2, fromQualifiedName: 'load', via: 'throw', expression: "new Error('boom')" }],
+      }),
+    ]).graph;
+
+    const thrown = graph.edges.find((edge) => edge.kind === 'throws');
+    expect(thrown?.from).toBe('function:load');
+    expect(thrown?.to).toBe('function:handler');
+    expect(thrown?.attributes?.via).toBe('throw');
+    expect(graph.nodes.find((node) => node.id === 'function:load')?.attributes?.throwSites).toBe(1);
+  });
+
+  it('marks a rejection as a rejection rather than a synchronous throw', () => {
+    const graph = build([
+      parsedFile('src/a.ts', {
+        entities: [functionEntity('handler')],
+        calls: [{ callee: 'load', line: 4, fromQualifiedName: 'handler', isLocalIdentifier: true }],
+      }),
+      parsedFile('src/b.ts', {
+        entities: [{ ...functionEntity('load'), isAsync: true }],
+        throws: [{ line: 2, fromQualifiedName: 'load', via: 'reject', inAsyncFunction: true, expression: 'new Error()' }],
+      }),
+    ]).graph;
+
+    expect(graph.edges.find((edge) => edge.kind === 'throws')?.attributes?.rejects).toBe(true);
+  });
+
+  it('links a response written by a handler a route names to that endpoint', () => {
+    const graph = build([
+      parsedFile('src/routes.ts', {
+        entities: [
+          {
+            ...functionEntity('GET /reports handler', 3),
+            isAsync: true,
+            attributes: { routeHandler: true, method: 'GET', path: '/reports' },
+          },
+        ],
+        markers: [
+          {
+            name: 'http.route',
+            line: 3,
+            attributes: { httpMethod: 'GET', path: '/reports', handler: 'GET /reports handler' },
+          },
+          {
+            name: 'http.response',
+            line: 5,
+            attributes: { scope: 'GET /reports handler', status: 201, method: 'json', payload: 'rows' },
+          },
+        ],
+        responses: [{ line: 5, method: 'json', status: 201, payload: 'rows', payloadKind: 'identifier' }],
+      }),
+    ]).graph;
+
+    const responded = graph.edges.find((edge) => edge.kind === 'returns');
+    expect(responded?.from).toBe('function:get-/reports-handler');
+    expect(responded?.to).toBe('api_endpoint:get-/reports');
+    expect(responded?.attributes?.httpResponse).toBe(true);
+    expect(responded?.attributes?.status).toBe(201);
+    expect(responded?.evidence[0]?.startLine).toBe(5);
+  });
+
+  it('records a response from a function no route names without inventing an endpoint', () => {
+    const graph = build([
+      parsedFile('src/a.ts', {
+        entities: [functionEntity('load')],
+        markers: [{ name: 'http.response', line: 3, attributes: { scope: 'load', method: 'json' } }],
+        responses: [{ line: 3, method: 'json' }],
+      }),
+    ]).graph;
+
+    expect(graph.edges.some((edge) => edge.kind === 'returns')).toBe(false);
+    const load = graph.nodes.find((node) => node.id === 'function:load');
+    expect(load?.attributes?.httpResponses).toBe(1);
+    // No status was written, so none is claimed.
+    expect(load?.attributes?.httpResponseStatuses).toBeUndefined();
+  });
+
+  it('records the statuses a function states, without repeating one', () => {
+    const graph = build([
+      parsedFile('src/a.ts', {
+        entities: [functionEntity('load')],
+        markers: [
+          { name: 'http.response', line: 3, attributes: { scope: 'load', method: 'json', status: 200 } },
+          { name: 'http.response', line: 4, attributes: { scope: 'load', method: 'json', status: 200 } },
+          { name: 'http.response', line: 5, attributes: { scope: 'load', method: 'send', status: 404 } },
+        ],
+        responses: [
+          { line: 3, method: 'json', status: 200 },
+          { line: 4, method: 'json', status: 200 },
+          { line: 5, method: 'send', status: 404 },
+        ],
+      }),
+    ]).graph;
+
+    const load = graph.nodes.find((node) => node.id === 'function:load');
+    expect(load?.attributes?.httpResponses).toBe(3);
+    expect(load?.attributes?.httpResponseStatuses).toBe('200,404');
   });
 });
