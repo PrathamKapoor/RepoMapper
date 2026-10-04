@@ -545,6 +545,15 @@ function addMarkerFacts(
         case 'sql.query':
           addSqlQuery(builder, evidence, file, marker, moduleId, symbolIndex);
           break;
+        case 'sql.cte':
+          addCteQuery(builder, evidence, file, marker, symbolIndex);
+          break;
+        case 'sql.statement':
+          // A statement the analyser recognised and declined to classify. It creates no data
+          // relationship, and its evidence is recorded so the data projection can say a query is
+          // present and unread rather than "no database access here".
+          addUnclassifiedStatement(builder, evidence, file, marker, moduleId, symbolIndex);
+          break;
         case 'control.branch':
         case 'control.loop':
         case 'control.handler':
@@ -760,6 +769,136 @@ function addForeignKey(
 }
 
 /**
+ * Records a common table expression defined by a statement in code.
+ *
+ * A CTE is not a store. `WITH recent AS (SELECT * FROM orders) SELECT * FROM recent` reads
+ * `orders` and produces a *query result* named `recent`. Creating a `table` node for `recent`
+ * would put a physical store into the graph that does not exist in the database, and the ER
+ * diagram would draw it.
+ *
+ * So the CTE becomes a `constant` node — the vocabulary the graph already has for a name bound
+ * in source rather than declared as a structure — held by the function whose statement defined
+ * it, with the statement's own evidence. The consuming query's reads are attributed to the
+ * physical tables it actually names; the CTE is the path between them, not a store.
+ */
+function addCteQuery(
+  builder: SoftwareGraphBuilder,
+  evidence: EvidenceStore,
+  file: ParsedFileRef,
+  marker: ParsedFileRef['markers'][number],
+  symbolIndex: ReadonlyMap<string, SymbolRef>,
+): void {
+  const names = String(marker.attributes.names ?? '')
+    .split(',')
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0);
+  if (names.length === 0) return;
+
+  const markerEvidence = evidence.add({
+    kind: 'CALL_SITE',
+    path: file.path,
+    startLine: marker.line,
+    endLine: marker.line,
+    symbol: names.join(', '),
+    excerpt: `query expression ${names.join(', ')}`,
+    producer: file.producer,
+  });
+
+  const scopeName = typeof marker.attributes.scope === 'string' ? marker.attributes.scope : undefined;
+  const scoped = scopeName ? symbolIndex.get(scopeName) : undefined;
+  const fromId = scoped?.id ?? undefined;
+  if (!fromId) return;
+
+  for (const name of names) {
+    const cteId = nodeId('constant', `cte:${name}`);
+    if (!builder.hasNode(cteId)) {
+      builder.addNode({
+        kind: 'constant',
+        name,
+        qualifiedName: `cte:${name}`,
+        path: file.path,
+        startLine: marker.line,
+        evidence: [markerEvidence],
+        confidence: 'EXPLICIT',
+        // Named as a query result so a reader never takes it for a declared structure.
+        attributes: {
+          queryExpression: true,
+          ...(typeof marker.attributes.statement === 'string' ? { statement: marker.attributes.statement } : {}),
+        },
+      });
+    }
+    builder.addEdge({
+      from: fromId,
+      to: cteId,
+      kind: 'produces',
+      confidence: 'EXPLICIT',
+      evidence: [markerEvidence],
+      attributes: { queryExpression: true },
+    });
+  }
+}
+
+/**
+ * Records a statement the analyser recognised but would not classify.
+ *
+ * No data relationship is created — an unread statement has no known table, so a `reads` edge
+ * would name a table nobody evidenced. The statement itself becomes a `constant` node held by
+ * the function that contains it, carrying the reason it was not classified.
+ *
+ * This is what makes the difference between "there is no database access here" and "there is a
+ * query here that this analyser does not read" visible in the artifact rather than invisible.
+ */
+function addUnclassifiedStatement(
+  builder: SoftwareGraphBuilder,
+  evidence: EvidenceStore,
+  file: ParsedFileRef,
+  marker: ParsedFileRef['markers'][number],
+  moduleId: string,
+  symbolIndex: ReadonlyMap<string, SymbolRef>,
+): void {
+  const summary = String(marker.attributes.summary ?? 'statement').slice(0, 120);
+  const reason = typeof marker.attributes.unsupported === 'string' ? marker.attributes.unsupported : null;
+
+  const markerEvidence = evidence.add({
+    kind: 'CALL_SITE',
+    path: file.path,
+    startLine: marker.line,
+    endLine: marker.line,
+    symbol: summary,
+    excerpt: reason ? `${summary} — ${reason}` : summary,
+    producer: file.producer,
+  });
+
+  const scopeName = typeof marker.attributes.scope === 'string' ? marker.attributes.scope : undefined;
+  const scoped = scopeName ? symbolIndex.get(scopeName) : undefined;
+  const fromId = scoped?.id ?? moduleId;
+  const statementId = nodeId('constant', `statement:${summary}`);
+
+  if (!builder.hasNode(statementId)) {
+    builder.addNode({
+      kind: 'constant',
+      name: summary,
+      qualifiedName: `statement:${summary}`,
+      path: file.path,
+      startLine: marker.line,
+      evidence: [markerEvidence],
+      // The statement is certainly there; what it touches is not established.
+      confidence: 'UNKNOWN',
+      attributes: { unclassifiedStatement: true, ...(reason ? { reason } : {}) },
+    });
+  }
+
+  builder.addEdge({
+    from: fromId,
+    to: statementId,
+    kind: 'contains',
+    confidence: scoped ? 'EXPLICIT' : 'WEEKLY_INFERRED',
+    evidence: [markerEvidence],
+    attributes: { unclassifiedStatement: true },
+  });
+}
+
+/**
  * Records a SQL statement found in code as a read from, or a write to, the table it names.
  *
  * The relationship is stated by the code: the literal query names the table. Attributed to
@@ -819,7 +958,16 @@ function addSqlQuery(
     kind: operation === 'write' ? 'writes' : 'reads',
     confidence: scoped ? 'EXPLICIT' : 'WEEKLY_INFERRED',
     evidence: [markerEvidence],
-    attributes: { operation, ...(scoped ? {} : { scopeUnknown: true }) },
+    attributes: {
+      operation,
+      // Phase 4: the role the name appeared in, and the statement it came from. Two tables in
+      // one query produce two edges with different roles, which is what keeps a read of
+      // `orders` from being reported as a write because it joined a written table.
+      ...(typeof marker.attributes.role === 'string' ? { role: marker.attributes.role } : {}),
+      ...(typeof marker.attributes.statement === 'string' ? { statement: marker.attributes.statement } : {}),
+      ...(typeof marker.attributes.statementCount === 'number' ? { statementCount: marker.attributes.statementCount } : {}),
+      ...(scoped ? {} : { scopeUnknown: true }),
+    },
   });
 }
 

@@ -114,6 +114,31 @@ export function buildDataFlow(context: ProjectionContext, options: DataFlowOptio
     });
   }
 
+  // Phase 4. A query this analyser declined to classify is a different fact from no query, and
+  // the difference is exactly what a reader needs before concluding a repository has no data
+  // access here.
+  const unclassified = graph.nodes.filter((node) => node.attributes?.unclassifiedStatement === true);
+  if (unclassified.length > 0) {
+    omitted.push({
+      reason:
+        'queries present but not classified: a statement this analyser recognised and would not read contributes no flow, which is a limit of the extractor rather than an absence of database access',
+      count: unclassified.length,
+      examples: unclassified.slice(0, 3).map((node) => node.name),
+    });
+  }
+
+  // A CTE is a query result, not a store. Saying so keeps its absence from the store list from
+  // reading as an oversight.
+  const queryExpressions = graph.nodes.filter((node) => node.attributes?.queryExpression === true);
+  if (queryExpressions.length > 0) {
+    omitted.push({
+      reason:
+        'query expressions (CTEs) are drawn as code that produces a result, never as stores: a query result has no schema and is not a database table',
+      count: queryExpressions.length,
+      examples: queryExpressions.slice(0, 3).map((node) => node.name),
+    });
+  }
+
   return {
     kind: 'data-flow',
     title: 'Data flow',
@@ -142,6 +167,16 @@ export interface LineageHop {
   relation: GraphEdge['kind'];
   confidence: Confidence;
   evidence: EvidenceRef[];
+  /**
+   * What the statement did to the table: read, write, or unknown when the relationship states
+   * no operation. Carried so lineage can answer "where is this read" and "where is this
+   * persisted" without the reader having to open the evidence.
+   */
+  operation?: 'read' | 'write';
+  /** The clause the table name appeared in, when the relationship recorded one. */
+  role?: string;
+  /** The statement the hop came from, when recorded. */
+  statement?: string;
 }
 
 export interface Lineage {
@@ -154,6 +189,14 @@ export interface Lineage {
   downstream: LineageHop[];
   /** True when the chain was cut by the hop limit rather than by the graph. */
   truncated: boolean;
+  /**
+   * How the subject is used, counted by operation.
+   *
+   * Phase 4: `read` and `write` are separate because "where is this table persisted" and "where
+   * is it read" are different questions, and answering them from one merged list is how a
+   * reader ends up believing a read is a write.
+   */
+  usage: { read: number; write: number; unclassified: number };
 }
 
 /** Hard bound on how far lineage is followed. */
@@ -181,12 +224,24 @@ export function traceLineage(graph: SoftwareGraph, subjectNodeId: string): Linea
   const upstream = walk(incoming, subjectNodeId, 'inbound');
   const downstream = walk(outgoing, subjectNodeId, 'outbound');
 
+  // Counted from the edges that touch the subject directly, because a hop three levels away
+  // says what that level did rather than what the subject's own usage is.
+  const usage = { read: 0, write: 0, unclassified: 0 };
+  for (const edge of graph.edges) {
+    if (!isDataEdge(edge)) continue;
+    if (edge.from !== subjectNodeId && edge.to !== subjectNodeId) continue;
+    if (edge.attributes?.operation === 'read') usage.read += 1;
+    else if (edge.attributes?.operation === 'write') usage.write += 1;
+    else usage.unclassified += 1;
+  }
+
   return {
     subjectNodeId,
     subjectName: subject.qualifiedName ?? subject.name,
     upstream: upstream.hops,
     downstream: downstream.hops,
     truncated: upstream.truncated || downstream.truncated,
+    usage,
   };
 }
 
@@ -206,6 +261,9 @@ function walk(
       const edges = (index.get(nodeId) ?? []).slice().sort((a, b) => (a.id < b.id ? -1 : 1));
       for (const edge of edges) {
         const other = direction === 'inbound' ? edge.from : edge.to;
+        const operation = edge.attributes?.operation === 'read' || edge.attributes?.operation === 'write'
+          ? edge.attributes.operation
+          : undefined;
         hops.push({
           edgeId: edge.id,
           direction,
@@ -214,6 +272,9 @@ function walk(
           relation: edge.kind,
           confidence: edge.confidence,
           evidence: edge.evidence,
+          ...(operation ? { operation } : {}),
+          ...(typeof edge.attributes?.role === 'string' ? { role: edge.attributes.role } : {}),
+          ...(typeof edge.attributes?.statement === 'string' ? { statement: edge.attributes.statement } : {}),
         });
         if (!visited.has(other)) {
           visited.add(other);
@@ -253,21 +314,42 @@ function boundaryOf(graph: SoftwareGraph): number | null {
 
 function dataEdgeDerivation(edge: GraphEdge): string {
   const operation = edge.attributes?.operation;
+  const role = typeof edge.attributes?.role === 'string' ? edge.attributes.role : undefined;
+  const statement = typeof edge.attributes?.statement === 'string' ? edge.attributes.statement : undefined;
   const scopeUnknown = edge.attributes?.scopeUnknown === true;
-  if (typeof operation === 'string') {
-    return ` The statement in the source was a ${operation.toUpperCase()}.`;
+
+  const parts: string[] = [];
+  if (typeof operation === 'string') parts.push(`The statement in the source was a ${operation.toUpperCase()}.`);
+  if (role) parts.push(`The table appeared as ${ROLE_PHRASES[role] ?? role}.`);
+  if (statement) {
+    parts.push(
+      `It came from one statement reading ${statement}, so this relationship is one table of that statement rather than the whole of it.`,
+    );
   }
   if (scopeUnknown) {
-    return ' No enclosing function was resolved, so which unit performs it is not established.';
+    parts.push('No enclosing function was resolved, so which unit performs it is not established.');
   }
-  return '';
+  return parts.length > 0 ? ` ${parts.join(' ')}` : '';
 }
+
+/** How a table name's role in a statement is described to a reader. */
+const ROLE_PHRASES: Record<string, string> = {
+  from: 'the FROM clause',
+  join: 'a JOIN clause',
+  insert_into: 'the INSERT target',
+  update_target: 'the UPDATE target',
+  delete_target: 'the DELETE target',
+  delete_using: 'a USING clause',
+};
 
 function dataNode(node: GraphNode): ArtifactNode {
   const declaredInDdl = node.attributes?.declaredInDdl;
+  const isQueryExpression = node.attributes?.queryExpression === true;
   return {
     id: node.id,
-    label: node.qualifiedName ?? node.name,
+    // A query expression's qualified name carries an internal `cte:` prefix that exists to keep
+    // its id stable. The reader wants the name the query gives it.
+    label: isQueryExpression ? node.name : node.qualifiedName ?? node.name,
     kind: node.kind,
     confidence: node.confidence,
     evidence: node.evidence,
@@ -277,6 +359,8 @@ function dataNode(node: GraphNode): ArtifactNode {
         ? declaredInDdl === false
           ? 'A data store referenced by code. No schema in the analysed repository declares it, so its shape is unknown.'
           : 'A data store declared in a schema in the analysed repository.'
-        : 'Code that the graph records as moving data.',
+        : isQueryExpression
+          ? 'A query result defined by a WITH clause. It is not a store: it has no schema and no rows of its own.'
+          : 'Code that the graph records as moving data.',
   };
 }

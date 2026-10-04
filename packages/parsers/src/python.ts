@@ -1,5 +1,5 @@
 import type { CallRecord, ExtractedEntity, Marker, ParsedFile } from '@repoatlas/core';
-import { parseSqlStatement } from './typescript.js';
+import { analyzeSql } from './sql.js';
 import { addProblem, emptyResult, type ParserContext, type SourceParser } from './contract.js';
 
 /**
@@ -230,8 +230,8 @@ function handlePythonLine(
   const flow = pythonControlFlowMarker(code, line.line, enclosing);
   if (flow) result.markers.push(flow);
 
-  const query = pythonSqlMarker(line.raw, line.line, enclosing);
-  if (query) result.markers.push(query);
+  const queries = pythonSqlMarkers(line.raw, line.line, enclosing);
+  for (const query of queries) result.markers.push(query);
 
   // Markers read the literal-preserving view: a decorator's route path is a string
   // value, and blanking string bodies would make it undetectable.
@@ -267,26 +267,57 @@ function pythonControlFlowMarker(code: string, line: number, scope: string | und
 }
 
 /**
- * A SQL statement in a Python string literal.
+ * SQL statements in a Python string literal.
  *
- * Mirrors the TypeScript rule exactly: one statement, one table, no joins. The parser stays
- * a structural extractor, so the statement is matched as text rather than parsed as SQL.
+ * Uses the same statement analyser as the TypeScript extractor, so a join, a subquery or a CTE
+ * is read identically in both languages — two analysers would be two sets of bugs. The Python
+ * parser remains a structural extractor: it finds string literals by line and hands their
+ * contents to the analyser.
+ *
+ * Returns one marker per table the statement touches, so read and write stay separate facts.
  */
-function pythonSqlMarker(raw: string, line: number, scope: string | undefined): Marker | undefined {
-  if (!scope) return undefined;
-  for (const match of raw.matchAll(/(['"])(.*?)\1/gs)) {
+function pythonSqlMarkers(raw: string, line: number, scope: string | undefined): Marker[] {
+  if (!scope) return [];
+  const markers: Marker[] = [];
+
+  for (const match of raw.matchAll(/(['"])([\s\S]*?)\1/gs)) {
     const statement = match[2];
     if (!statement) continue;
-    const parsed = parseSqlStatement(statement);
-    if (parsed) {
-      return {
+    const analysis = analyzeSql(statement);
+    if (!analysis) continue;
+
+    if (analysis.tables.length === 0) {
+      markers.push({
+        name: 'sql.statement',
+        line,
+        attributes: { scope, summary: analysis.summary, unsupported: analysis.unsupportedReason ?? null },
+      });
+      continue;
+    }
+
+    for (const access of analysis.tables) {
+      markers.push({
         name: 'sql.query',
         line,
-        attributes: { operation: parsed.operation, table: parsed.table, scope },
-      };
+        attributes: {
+          operation: access.operation,
+          table: access.table,
+          role: access.role,
+          statement: analysis.summary,
+          scope,
+        },
+      });
+    }
+    if (analysis.ctes.length > 0) {
+      markers.push({
+        name: 'sql.cte',
+        line,
+        attributes: { scope, names: analysis.ctes.join(','), statement: analysis.summary },
+      });
     }
   }
-  return undefined;
+
+  return markers;
 }
 
 function clip(text: string): string {

@@ -652,4 +652,117 @@ describe('test attribution', () => {
 
     expect(graph.edges.filter((edge) => edge.kind === 'tests')).toHaveLength(0);
   });
+});describe('data access from SQL in code', () => {
+  const queryMarker = (table: string, operation: 'read' | 'write', role: string, scope = 'loadAll') => ({
+    name: 'sql.query',
+    line: 3,
+    attributes: { table, operation, role, statement: 'select users, orders', scope },
+  });
+
+  const entity = (name: string) => ({
+    kind: 'function' as const,
+    name,
+    qualifiedName: name,
+    startLine: 1,
+    endLine: 6,
+    language: 'typescript',
+  });
+
+  const service = (markers: unknown[]) =>
+    parsedFile('src/service.ts', { entities: [entity('loadAll')], markers: markers as never });
+
+  const edgesTo = (markers: unknown[], table: string) =>
+    build([service(markers)]).graph.edges.filter(
+      (edge) => (edge.kind === 'reads' || edge.kind === 'writes') && edge.to === nodeId('table', table),
+    );
+
+  it('creates one relationship per table in a join, each with its role', () => {
+    const markers = [queryMarker('users', 'read', 'from'), queryMarker('orders', 'read', 'join')];
+    const graph = build([service(markers)]).graph;
+
+    expect(edgesTo(markers, 'users')).toHaveLength(1);
+    expect(edgesTo(markers, 'orders')).toHaveLength(1);
+    expect(graph.edges.filter((edge) => edge.kind === 'reads')).toHaveLength(2);
+    expect(graph.edges.find((edge) => edge.to === nodeId('table', 'orders'))?.attributes?.role).toBe('join');
+  });
+
+  it('keeps a read and a write of the same table as separate relationships', () => {
+    // The exact shape of `INSERT INTO archive SELECT * FROM reports`. Collapsing these into one
+    // edge would make an archive write look like a report write.
+    const markers = [queryMarker('archive_reports', 'write', 'insert_into'), queryMarker('reports', 'read', 'from')];
+    const graph = build([service(markers)]).graph;
+
+    expect(graph.edges.find((edge) => edge.to === nodeId('table', 'archive_reports'))?.kind).toBe('writes');
+    expect(graph.edges.find((edge) => edge.to === nodeId('table', 'reports'))?.kind).toBe('reads');
+  });
+
+  it('attributes the relationship to the enclosing function and cites the statement line', () => {
+    const [edge] = build([service([queryMarker('users', 'read', 'from')])]).graph.edges.filter(
+      (candidate) => candidate.kind === 'reads',
+    );
+
+    expect(edge?.from).toBe('function:loadall');
+    expect(edge?.confidence).toBe('EXPLICIT');
+    expect(edge?.evidence[0]?.startLine).toBe(3);
+    expect(edge?.attributes?.statement).toBe('select users, orders');
+  });
+
+  it('marks a store as unknown schema when no DDL declares it, rather than inventing columns', () => {
+    const graph = build([service([queryMarker('legacy_orders', 'read', 'from')])]).graph;
+    const table = graph.nodes.find((node) => node.id === nodeId('table', 'legacy_orders'));
+
+    expect(table?.attributes?.declaredInDdl).toBe(false);
+    expect(table?.confidence).toBe('UNKNOWN');
+  });
+
+  it('records a CTE as a query result held by the function that defined it, never as a table', () => {
+    const graph = build([
+      service([
+        queryMarker('orders', 'read', 'from'),
+        { name: 'sql.cte', line: 3, attributes: { names: 'recent_orders', statement: 'select orders', scope: 'loadAll' } },
+      ]),
+    ]).graph;
+
+    const cte = graph.nodes.find((node) => node.attributes?.queryExpression === true);
+    expect(cte?.name).toBe('recent_orders');
+    expect(graph.nodes.some((node) => node.kind === 'table' && node.name === 'recent_orders')).toBe(false);
+    expect(graph.edges.find((edge) => edge.to === cte?.id)?.kind).toBe('produces');
+  });
+
+  it('records an unclassifiable statement as evidence with no data relationship', () => {
+    const graph = build([
+      service([
+        {
+          name: 'sql.statement',
+          line: 3,
+          attributes: {
+            summary: 'merge statement',
+            unsupported: 'a MERGE statement is not a data-access statement this analyser classifies',
+            scope: 'loadAll',
+          },
+        },
+      ]),
+    ]).graph;
+
+    expect(graph.edges.some((edge) => edge.kind === 'reads' || edge.kind === 'writes')).toBe(false);
+    const statement = graph.nodes.find((node) => node.attributes?.unclassifiedStatement === true);
+    expect(statement?.name).toBe('merge statement');
+    expect(statement?.confidence).toBe('UNKNOWN');
+    expect(String(statement?.attributes?.reason)).toContain('MERGE');
+  });
+
+  it('attaches an unscoped statement to the module and says the scope is unknown', () => {
+    const graph = build([
+      parsedFile('src/migrate.ts', {
+        markers: [
+          { name: 'sql.query', line: 2, attributes: { table: 'users', operation: 'read', role: 'from', statement: 'select users' } },
+        ],
+      }),
+    ]).graph;
+
+    const edge = graph.edges.find((candidate) => candidate.kind === 'reads');
+    expect(edge?.from).toBe('module:src/migrate');
+    expect(edge?.confidence).toBe('WEEKLY_INFERRED');
+    expect(edge?.attributes?.scopeUnknown).toBe(true);
+  });
 });

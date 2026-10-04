@@ -1,6 +1,7 @@
 import ts from 'typescript';
 import type { CallRecord, ExtractedEntity, ImportRecord, Marker, ParsedFile } from '@repoatlas/core';
 import { addProblem, emptyResult, type ParserContext, type SourceParser } from './contract.js';
+import { analyzeSql } from './sql.js';
 
 /**
  * TypeScript / JavaScript extractor built on the TypeScript compiler API.
@@ -388,8 +389,7 @@ function handleCallExpression(node: ts.CallExpression, ctx: WalkContext): void {
     }
   }
 
-  const query = sqlQueryMarker(node.arguments, ctx);
-  if (query) ctx.result.markers.push(query);
+  for (const query of sqlQueryMarkers(node.arguments, ctx)) ctx.result.markers.push(query);
 
 const route = routeMarker(node, ctx);
   if (route) {
@@ -720,79 +720,88 @@ function controlFlowCondition(node: ts.Node, sourceFile: ts.SourceFile): string 
 }
 
 /**
- * A SQL statement passed as a string literal to a call.
+ * SQL statements passed as a string literal to a call.
  *
- * This is the only place data flow comes from: a `reads`/`writes` edge exists when the code
- * literally contains a query naming a table. No ORM, repository naming convention or
- * "module looks like a data layer" heuristic is used, because each of those produces data
- * flow that the repository never states.
+ * This is where data access comes from: a `reads`/`writes` relationship exists when the code
+ * literally contains a query naming a table. No ORM, repository naming convention or "module
+ * looks like a data layer" heuristic is used, because each of those produces data flow the
+ * repository never states.
+ *
+ * One marker is emitted per table the statement touches, so a join or a subquery yields two
+ * facts rather than one guess about which table the call "really" used. Each marker carries the
+ * role the name appeared in, which is what makes the read/write split checkable rather than
+ * merely plausible.
+ *
+ * A statement this analyser will not classify still produces a `sql.statement` marker, so the
+ * data projection can say "a query is here and I did not understand it" instead of silence.
  */
-function sqlQueryMarker(args: readonly ts.Expression[], ctx: WalkContext): Marker | undefined {
+function sqlQueryMarkers(args: readonly ts.Expression[], ctx: WalkContext): Marker[] {
+  const markers: Marker[] = [];
+
   for (const argument of args) {
     if (!ts.isStringLiteralLike(argument)) continue;
-    const statement = parseSqlStatement(argument.text);
-    if (!statement) continue;
-    return {
-      name: 'sql.query',
-      line: lineOf(ctx, safeStart(argument, ctx)),
-      attributes: {
-        operation: statement.operation,
-        table: statement.table,
-      },
-    };
+    const analysis = analyzeSql(argument.text);
+    if (!analysis) continue;
+
+    const line = lineOf(ctx, safeStart(argument, ctx));
+    const scope = ctx.stack.at(-1);
+
+    if (analysis.tables.length === 0) {
+      markers.push({
+        name: 'sql.statement',
+        line,
+        attributes: {
+          summary: analysis.summary,
+          unsupported: analysis.unsupportedReason ?? null,
+          ...(scope ? { scope } : {}),
+        },
+      });
+      continue;
+    }
+
+    for (const access of analysis.tables) {
+      markers.push({
+        name: 'sql.query',
+        line,
+        attributes: {
+          operation: access.operation,
+          table: access.table,
+          role: access.role,
+          statement: analysis.summary,
+          statementCount: analysis.statementCount,
+          ...(scope ? { scope } : {}),
+        },
+      });
+    }
+
+    if (analysis.ctes.length > 0) {
+      markers.push({
+        name: 'sql.cte',
+        line,
+        attributes: {
+          names: analysis.ctes.join(','),
+          statement: analysis.summary,
+          ...(scope ? { scope } : {}),
+        },
+      });
+    }
   }
-  return undefined;
+
+  return markers;
 }
 
 /**
  * Recognises a single-table SQL statement written in a string literal.
  *
- * Deliberately narrow: one statement, one table, no joins and no subquery. A join names two
- * tables and the code does not say which of them this call reads or writes, so such a
- * statement is reported as unsupported by the data projection rather than attributed to the
- * first table matched.
+ * Retained as the narrow compatibility surface used by callers that only need a single
+ * operation/table pair. It now delegates to the statement analyser, so a join is refused here
+ * exactly as it is refused in the marker path, and the two can never disagree.
  */
 export function parseSqlStatement(text: string): { operation: string; table: string } | null {
-  const statement = text.replace(/\s+/g, ' ').trim().replace(/;$/, '');
-  if (statement.length === 0) return null;
-
-  const single = (primary: RegExp, other: readonly RegExp[]): boolean => {
-    if (countMatches(statement, primary) !== 1) return false;
-    return other.every((pattern) => countMatches(statement, pattern) === 0);
-  };
-
-  const select = /^SELECT\s+.+?\s+FROM\s+([A-Za-z_][\w.]*)/i.exec(statement);
-  if (select && single(/\bFROM\s+[A-Za-z_][\w.]*/gi, [/\bJOIN\s+[A-Za-z_][\w.]*/gi])) {
-    return tableOf('read', select[1]);
-  }
-
-  const insert = /^INSERT\s+INTO\s+([A-Za-z_][\w.]*)/i.exec(statement);
-  if (insert && single(/\bINTO\s+[A-Za-z_][\w.]*/gi, [/\bFROM\s+/gi])) {
-    return tableOf('write', insert[1]);
-  }
-
-  const update = /^UPDATE\s+([A-Za-z_][\w.]*)\s+SET\s+/i.exec(statement);
-  if (update && single(/\bUPDATE\s+[A-Za-z_][\w.]*/gi, [/\bFROM\s+/gi, /\bJOIN\s+/gi])) {
-    return tableOf('write', update[1]);
-  }
-
-  const del = /^DELETE\s+FROM\s+([A-Za-z_][\w.]*)/i.exec(statement);
-  if (del && single(/\bFROM\s+[A-Za-z_][\w.]*/gi, [/\bJOIN\s+[A-Za-z_][\w.]*/gi])) {
-    return tableOf('write', del[1]);
-  }
-
-  return null;
-}
-
-function countMatches(text: string, pattern: RegExp): number {
-  return [...text.matchAll(pattern)].length;
-}
-
-/** Normalises a possibly quoted, possibly qualified table name to its bare name. */
-function tableOf(operation: string, raw: string | undefined): { operation: string; table: string } | null {
-  if (!raw) return null;
-  const table = raw.replace(/^["`[]|["`\]]$/g, '').split('.').at(-1);
-  return table ? { operation, table } : null;
+  const analysis = analyzeSql(text);
+  if (!analysis || analysis.tables.length !== 1) return null;
+  const access = analysis.tables[0]!;
+  return { operation: access.operation, table: access.table };
 }
 
 
