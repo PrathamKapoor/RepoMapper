@@ -92,8 +92,8 @@ describe('import resolution', () => {
 
 describe('callee resolution', () => {
   const index = new Map([
-    ['ReportService', { id: 'class:reportservice', filePath: 'a.ts', kind: 'class' as const }],
-    ['findById', { id: 'function:findbyid', filePath: 'a.ts', kind: 'function' as const }],
+    ['ReportService', { id: 'class:reportservice', filePath: 'a.ts', kind: 'class' as const, qualifiedName: 'ReportService' }],
+    ['findById', { id: 'function:findbyid', filePath: 'a.ts', kind: 'function' as const, qualifiedName: 'findById' }],
   ]);
 
   it('prefers the full dotted name, then the member, then the root', () => {

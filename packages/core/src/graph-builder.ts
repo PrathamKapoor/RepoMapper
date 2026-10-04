@@ -527,7 +527,7 @@ function addMarkerFacts(
     for (const marker of file.markers) {
       switch (marker.name) {
         case 'http.route':
-          addApiEndpoint(builder, evidence, file, moduleId, marker, counters);
+          addApiEndpoint(builder, evidence, file, moduleId, marker, counters, symbolIndex);
           break;
         case 'schema.table':
           addTable(builder, evidence, file, moduleId, marker, counters);
@@ -575,6 +575,7 @@ function addApiEndpoint(
   moduleId: string,
   marker: ParsedFileRef['markers'][number],
   counters: GraphBuildCounters,
+  symbolIndex: ReadonlyMap<string, SymbolRef>,
 ): void {
   counters.apiEndpoints += 1;
   const method = String(marker.attributes.httpMethod ?? 'ANY');
@@ -606,6 +607,26 @@ function addApiEndpoint(
   });
   builder.addEdge({ from: moduleId, to: endpointId, kind: 'exposes', confidence: 'EXPLICIT', evidence: [markerEvidence] });
   builder.addEdge({ from: endpointId, to: moduleId, kind: 'declared_in', confidence: 'EXPLICIT', evidence: [markerEvidence] });
+
+  // The route registration names the handler. Resolving that name to a declaration links the
+  // endpoint to the code that serves it, which is what makes a sequence and a use case
+  // recoverable rather than a list of endpoints with nothing behind them.
+  //
+  // `STRONGLY_INFERRED`, because the handler name was resolved the same way any call is: by
+  // name. When the name does not resolve, no edge is created — an endpoint with no identified
+  // handler is a legitimate state, and the behaviour projections report it as partial.
+  const handlerName = typeof marker.attributes.handler === 'string' ? marker.attributes.handler : undefined;
+  if (!handlerName) return;
+  const handler = symbolIndex.get(handlerName);
+  if (!handler) return;
+  builder.addEdge({
+    from: endpointId,
+    to: handler.id,
+    kind: 'calls',
+    confidence: 'STRONGLY_INFERRED',
+    evidence: [markerEvidence],
+    attributes: { derivedFrom: 'route.handler', handler: handlerName },
+  });
 }
 
 function addTable(
@@ -829,13 +850,17 @@ function addControlFlow(
     producer: file.producer,
   });
 
-  // Keyed by owner and line so two conditions on the same line stay distinct, and so the id
-  // is stable across runs.
-  const conditionId = nodeId('condition', `${scope.qualifiedName}#${marker.line}:${flow}`);
+  // Keyed by owner, line and flow kind so two conditions on the same line stay distinct, so
+  // the id is stable across runs, and so the node id and the edge target are computed from the
+  // same string — computing them from different ones produces an edge that silently fails to
+  // attach because its endpoint does not exist.
+  const qualifiedName = `${scope.qualifiedName}#${marker.line}:${flow}`;
+  const conditionId = nodeId('condition', qualifiedName);
   builder.addNode({
+    id: conditionId,
     kind: 'condition',
     name: condition ?? flow,
-    qualifiedName: `${scope.qualifiedName}#${marker.line}`,
+    qualifiedName,
     path: file.path,
     startLine: marker.line,
     evidence: [markerEvidence],
