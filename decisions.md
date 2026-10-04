@@ -937,19 +937,113 @@ Rules for this file:
 
 ---
 
+## Phase 3 - Behaviour, data and traceability
+
+### D-042 - An inline route handler is named after the registration that contains it
+
+**Decision.** When a route registration passes an arrow function or function expression as its
+handler (`app.get('/reports', async (request, response) => { … })`), the extractor records a
+function entity named `<METHOD> <path> handler`, and the route marker names the same entity.
+
+**Why.** An anonymous argument is not a declaration, so before this the calls inside the handler
+were attributed to the enclosing module. On this repository that left all 22 endpoints with no
+behaviour behind them: the sequence view reported insufficient evidence and no use case had a
+step, even though the call graph was fully populated. An endpoint whose code cannot be reached is
+not a recovered endpoint.
+
+The name is derived from text the source already contains, so it is not an invention — but it is
+still ours, and the entity records `routeHandler` so the graph can say why the name exists. The
+source file is still parsed without parent pointers, so the registration registers the handler
+node by identity during the walk rather than the arrow asking what call it belongs to.
+
+### D-043 - Absence is never reported as a contradiction
+
+**Decision.** The consistency engine has five classes, and `CONTRADICTION` is reserved for two
+statements that cannot both be true: a projection asserting something the graph does not contain,
+or a requirement citing an entity that does not exist. A missing relationship is always
+`MISSING_EVIDENCE` or `PARTIAL_EVIDENCE`, and the finding states why absence is not a defect.
+
+**Why.** The obvious failure mode of a consistency checker is to turn "this repository does not
+say" into "this repository is wrong". A project with no database has not contradicted anything,
+and a report that says so is worse than no report. The rule is enforced by tests that assert
+`counts.CONTRADICTION === 0` across empty, partial and complete graphs, and that a
+contradiction-class finding can only come from the projection-integrity rule.
+
+The engine also records *agreement* as findings. A report listing only problems reads as an
+accusation, and a reader cannot tell three problems out of three checks from three out of thirty.
+
+### D-044 - A stated requirement with no implementation is kept, not dropped
+
+**Decision.** A requirement read from a document is always returned. When nothing in the graph
+implements it, its status is `PARTIAL` and its derivation says so.
+
+**Why.** Dropping it converted the most interesting fact about a repository into an absence, and
+the consistency rule that reports an unimplemented requirement could then never fire. This
+reverses the Phase 2 decision recorded in `packages/core/test/requirements.test.ts`, and the test
+that asserted the old behaviour now asserts the new one.
+
+Requirement extraction is deliberately narrow: only a line that states an obligation
+(`must`, `shall`, `should`, `is required to`, …) or an identifier (`REQ-001:`) becomes a
+requirement. Prose is not mined, because writing requirements on a repository's behalf is not this
+tool's job. An `implements_requirement` relationship is created only when the document names
+something that resolves to a declared entity.
+
+### D-045 - A use case is capped, and the cap is part of the answer
+
+**Decision.** Steps per use case are capped at 40 and a reachability cap of 24 nodes per subject.
+What was cut is reported in the use case's `missing[]` list, never dropped silently.
+
+**Why.** The walk is breadth-first. On this repository a single endpoint reached 330 functions in
+six hops, which produced a 2.2 MB payload for one table row and a "use case" that was a call graph
+with a title. The cut is stated because the interaction genuinely continues past what is shown —
+hiding the cap would let a reader conclude the endpoint does less than it does.
+
+### D-046 - The traceability index builds its models once
+
+**Decision.** `traceAll` builds the requirement and use-case models a single time and shares them
+across every entry point.
+
+**Why.** Each `traceSubject` call builds both models from scratch, and both walk the whole graph.
+With 22 endpoints the index took 15.2 s per request; it now takes 2.9 s. The split into
+`traceSubjectWith` exists for this reason and is noted at the function, because the obvious
+refactor — building models per call — is what caused it.
+
+### D-047 - Sequence messages are calls only; there is no return arrow
+
+**Decision.** The sequence projection draws one message per `calls` relationship and states in
+`omitted[]` that the graph records no return values or thrown errors.
+
+**Why.** The alternative is a dashed return arrow labelled "assumed", which reads as a fact on a
+diagram. A missing return is a property of the extraction, and it belongs where the diagram can be
+checked against the repository.
+
+### D-048 - Browser checks wait for content, not for controls
+
+**Decision.** The CDP driver waits for panel content rather than for the label of the control that
+opens it, scopes section clicks away from the tab bar, and matches evidence locations by shape
+rather than by a fixed list of file extensions.
+
+**Why.** Three separate failures during Phase 3 verification were the driver's, not the UI's: a
+check that read the DOM before the data arrived reported a working view as empty; a check that
+clicked the first button labelled "Traceability" clicked the *tab*, not the section, and then timed
+out on content that was never going to appear; and a check pinned to `.ts/.js/.md` failed whenever
+the only change happened to be in a file it had not thought of. A verification tool that reports
+working views as broken is worse than none, because it trains the reader to ignore it.
+
+---
 ## Deferred, with reasons
 
 Recorded so these are not mistaken for oversights.
 
 | Item | Why deferred |
 |---|---|
-| C4 architecture, sequence, DFD, use-case, activity, deployment diagrams | **Partly resolved in Phase 2.** C4 levels 1–3 are implemented as evidence-grounded projections (D-033, D-034). Sequence, DFD, use-case, activity and deployment views remain deferred: each needs graph facts that do not exist yet, and building one before its facts are in the graph would produce a confident-looking diagram with invented content. |
-| Requirements and traceability | Needs requirement extraction, which needs document-structure parsing. No facts to trace yet. |
-| Consistency and drift engine | **Implemented in Phase 2** (D-026 – D-030). A consistency checker that looks for *contradictions inside one graph* — declared versus imported, route with no handler — remains deferred; drift answers "what changed", not "what disagrees". |
+| C4 architecture, sequence, DFD, use-case, activity, deployment diagrams | **Partly resolved across Phases 2 and 3.** C4 levels 1-3 (D-033, D-034) plus the sequence, activity, data-flow, ER, use-case and traceability views are implemented as evidence-grounded projections. A dedicated deployment view remains deferred: a repository states containers and images, not the topology between them at runtime. |
+| Requirements and traceability | **Resolved in Phase 3** for what a repository can state: requirements read from documents, use cases over evidenced entry points, and the requirement -> use case -> implementation -> test chain (D-042, D-044, D-046). Business requirements held in an issue tracker, or implied by convention, remain out of reach and are reported as not recovered. |
+| Consistency and drift engine | **Implemented in Phases 2 and 3** (D-026 - D-030, D-043). Drift answers what changed; the consistency engine answers what the views disagree about. Semantics-level contradiction detection - two documents describing the same entity differently - is still deferred: it needs an understanding of prose this product does not have. |
 | Symbol-level and Git-corroborated rename detection | D-029 records the module-level content-identity rule in force and why the stronger sources are not used yet. |
 | Dockerfile `COPY` analysis for container contents | D-034 records why build-context attribution is an inference, and how instruction modelling would strengthen it. |
 | Authentication/authorisation relationships | No extractor produces them yet. Reported honestly as `NOT_FOUND` by the gap analysis (D-008). |
 | Archive upload endpoint | Extraction, containment and limits are implemented and tested (`extractTarArchive`). The HTTP route is not built. |
 | Languages beyond TypeScript/JavaScript and Python | D-003/D-004 explain the current coverage and the path to widening it. |
-| Sequence-diagram renderer | D-022 explains why the current renderer cannot express one. |
+| Sequence-diagram renderer | D-022 explains why the current renderer cannot express one. The sequence *projection* exists and is verified; only the Mermaid rendering of lifelines and return arrows is outstanding. |
 | API authentication and rate limiting | Absent so far. `REPOATLAS_ALLOWED_ROOTS` is the only boundary, and `/api/health` reports when it is not enforced. |

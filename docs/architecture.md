@@ -75,6 +75,19 @@ report its meaning:
 
 ## The chain the product promises
 
+Phase 3 extends the same chain one stage further, in the direction a reader actually asks:
+
+| Joint | What establishes it | What is reported when it is missing |
+|---|---|---|
+| Requirement | A document that states it, or a fixed rule over the graph | `NO_REQUIREMENT`, and it is stated that this is not a defect |
+| Use case | An evidenced entry point plus the calls reachable from it | `NO_USE_CASE`; steps cut at the limit are counted, not dropped |
+| Implementation | A `calls` relationship, or the handler the route names | `NO_IMPLEMENTATION` |
+| Test | A test that calls the handler the endpoint names | `NO_TEST`, and the reason names the limit of the matching |
+
+The chain is deliberately *not* closed by substitution. A requirement with no test is reported
+as a requirement with no test, because filling the joint with the nearest available fact is how
+a traceability tool starts lying.
+
 ```
 repository → evidence → canonical graph → snapshot → comparison / projection → artifact → evidence
 ```
@@ -144,10 +157,17 @@ Depends on nothing. Owns:
   rule that decides when two snapshots may be compared at all.
 - **Drift engine** (`drift.ts`) — indexed, deterministic comparison of two snapshots. Owns the
   rules for removals, renames and claim confidence.
-- **Diagnostics** (`diagnostics.ts`) — typed codes and severities. Stages report rather
-  than throw, so one bad file degrades one part of an analysis.
-- **Limits** (`limits.ts`) — every bound, with clamping so a caller cannot request an
-  unbounded run.
+- **Requirements model** (`requirements.ts`) - declared requirements read from documents
+  alongside derived ones, each with its origin, status and evidence. Kept even when nothing
+  implements them (`decisions.md`, D-044).
+- **Use-case model** (`use-cases.ts`) - entry points, bounded traversal, evidence-backed
+  actors, and a `missing[]` list naming what the repository does not evidence.
+- **Traceability** (`traceability.ts`) - the requirement to use case to implementation to
+  test chain, with each broken joint named. Builds its models once and shares them across
+  entry points; building them per row was a 15-second request (`decisions.md`, D-046).
+- **Limits and diagnostics** (`limits.ts`, `diagnostics.ts`) - every bound, with clamping so a
+  caller cannot request an unbounded run; typed diagnostic codes, so stages report rather than
+  throw and one bad file degrades one part of an analysis.
 
 The graph builder runs in nine passes. Pass 3 indexes every symbol **before** any
 relationship resolves; collapsing that into a single pass makes extraction
@@ -202,6 +222,26 @@ Each artifact carries three honesty fields:
 The ER projection is the clearest example of the policy: it draws inter-table
 relationships only when the graph holds an explicit edge, and records in `omitted` that
 foreign keys are **not inferred** in this phase. A guessed foreign key in an ER diagram is
+
+Ten projections are registered: dependency graph, module graph, class diagram, ER diagram,
+C4 at three levels, sequence, activity and data flow. Behaviour and data come last because
+they are the most inferential: a message arrow, a decision point and a data flow are claims
+about how the system *runs*, not about what it is made of. Each follows one rule, and each
+states its own exceptions:
+
+- **Sequence** draws one message per `calls` relationship and **no return arrow**, because the
+  graph records no return values (`omitted[]` says so).
+- **Activity** orders decision points by source line and draws nothing for a function with no
+  recorded branch, loop or handler — a call graph is not a workflow.
+- **Data flow** draws only data relationships. Imports and `depends_on` are explicitly
+  reported as *not* data flows, with a count.
+- **Lineage** answers both directions from one entry point and returns `null` for a node the
+  graph does not hold, rather than an empty object that reads like an answer.
+
+`checkConsistency` is not an artifact but lives here, because it compares artifacts. It reads
+the same graph every projection reads, so it cannot see a different world from the views it
+checks. Five classes, and `CONTRADICTION` is reserved for two statements that cannot both be
+true; a missing relationship is always missing *evidence* (`decisions.md`, D-043).
 exactly the kind of claim this product must not make.
 
 Mermaid is the text format because it renders in the browser with no server-side renderer
@@ -230,18 +270,28 @@ replayed from a cache, so a projection or extractor change is visible without re
 
 ### `@repoatlas/web` — the atlas
 
-Eight tabs: Overview, Architecture, **C4**, Structure, **Drift**, Evidence, Gaps,
-Diagnostics. Any entity, anywhere, opens the same inspector showing its relationships, its
-evidence and the confidence of each — which is how one entity connects across
-representations.
+Ten tabs: Overview, Architecture, **C4**, Structure, **Behaviour**, **Traceability**,
+**Drift**, Evidence, Gaps, Diagnostics. Any entity, anywhere, opens the same inspector
+showing its relationships, its evidence and the confidence of each - which is how one entity
+connects across representations.
 
-Three decisions worth noting:
+Five decisions worth noting:
 
 - **Deterministic layout** (`decisions.md`, D-021). A force simulation re-randomises, so
   two engineers would see different pictures and screenshots would not match. Determinism
   is what makes before/after comparison meaningful.
 - **Confidence is visual.** Explicit edges are solid green; inferred edges are dashed amber
   and labelled with the confidence level. A legend is rendered next to every graph.
+- **Progressive disclosure everywhere.** The behaviour tab opens one projection at a time,
+  and the traceability tab lists before it details: requirements, use cases, the chain
+  index, then the chain for the entry point a reader selects. A 40-step use case is a list
+  row, not a wall of text.
+- **Wording carries the claim.** The presentation logic that decides how a requirement is
+  labelled lives in `presentation.ts` with tests, not in the components, because the
+  difference between *stated by the repository* and *verified* is the difference between an
+  honest tool and a reassuring one. The browser driver waits for content rather than for the
+  control that opens it, so a view that fails to load is reported as failing
+  (`scripts/verify-browser.mjs`, D-048).
 - **The inspector carries its own analysis id.** A drift row describing a removal belongs to
   the *base* snapshot, whose entity does not exist in the analysis selected in the sidebar.
   Without this the drill-through 404s and reads as a broken link rather than the correct

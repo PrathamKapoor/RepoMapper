@@ -4,12 +4,15 @@ RepoAtlas takes a software repository and reconstructs the software system behin
 
 Point it at a repository and it produces a **Software Knowledge Graph** in which every
 entity and every relationship is traceable to a file and a line, labelled with how strongly
-it is actually supported. Multiple engineering views — dependency graph, module structure,
-class diagram, ER diagram, C4 architecture — are then *projections* of that one graph, so
-they cannot contradict each other. Each analysis is an immutable, content-addressed
-**snapshot**, and any two snapshots can be compared to show exactly what changed and how well
-that change is evidenced. A gap report states plainly where the repository provides no
-evidence, without ever claiming a capability does not exist.
+it is actually supported. Multiple engineering views - dependency graph, module structure,
+class diagram, ER diagram, C4 architecture, sequence, activity and data flow - are then
+*projections* of that one graph, so they cannot contradict each other. Requirements and use
+cases are read from what the repository states and evidences, and any entry point can be
+followed through to the code and the test that serve it. A consistency report compares every
+view against the others and reports absence as absence. Each analysis is an immutable,
+content-addressed **snapshot**, and any two snapshots can be compared to show exactly what
+changed and how well that change is evidenced. A gap report states plainly where the
+repository provides no evidence, without ever claiming a capability does not exist.
 
 ```
 repository → ingestion → analysis → evidence → canonical graph
@@ -19,22 +22,22 @@ repository → ingestion → analysis → evidence → canonical graph
 
 ## Status
 
-**STATUS: PARTIAL** — Phases 1 and 2 complete and verified. Usable and deployable for its
+**STATUS: PARTIAL** - Phases 1, 2 and 3 complete and verified. Usable and deployable for its
 stated scope; deliberately incomplete beyond it. Per-capability status is in
 [`docs/verification.md`](docs/verification.md).
 
 | | |
 |---|---|
 | Analyses real repositories | Yes — verified against this repository, over HTTP and in a container |
+| Behaviour, data and traceability | Yes - sequence, activity, data flow and lineage; requirements, use cases, cross-artifact consistency |
 | Drift between two states | Yes — verified on a real change set, in a container too |
-| C4 context / container / component | Yes — verified against this repository; reports what it could not recover |
-| Tests | 329 passing (`npm run test`) |
+| Tests | 489 passing (`npm run test`) |
 | Lint / typecheck / build | Clean |
-| Container image | Builds and runs; verified, including Phase 2 endpoints |
-| Languages parsed | TypeScript, JavaScript, Python (structural) |
-| Artifacts | Dependency graph, module structure, class diagram, ER diagram, C4 × 3 levels |
-| Browser rendering of the UI | **Partially verified** — driven in real headless Chromium, 27/27 checks; layout, zoom and non-Chromium browsers are not verified |
-| Not built | Sequence, DFD, use-case, activity, deployment diagrams; requirements; in-graph consistency checks; symbol-level and Git-corroborated renames; archive-upload endpoint; API auth and rate limiting |
+| Container image | Builds and runs; verified through Phase 3, including every Phase 3 endpoint |
+| Artifacts | Dependency graph, module structure, class diagram, ER diagram, C4 x 3 levels, sequence, activity, data flow |
+| Requirements and use cases | Yes - read from documents and evidenced entry points, with a requirement-to-test chain; issues-tracker requirements are not recovered |
+| Browser rendering of the UI | **Partially verified** - driven in real headless Chromium, 41/41 checks with two analyses; layout, zoom and non-Chromium browsers are not verified |
+| Not built | Deployment diagram; issues-tracker requirements; semantics-level contradiction detection; symbol-level and Git-corroborated renames; archive-upload endpoint; API auth and rate limiting |
 
 ## Quick start
 
@@ -139,7 +142,12 @@ repository-escaping `build:` context is ignored rather than honoured.
 | `GET` | `/api/analyses/:id/graph` | Filtered graph. `?kind=` node kinds, `?edgeKind=` relations, `?q=`, `?limit=`, `?edgeLimit=`, `?confidence=` |
 | `GET` | `/api/analyses/:id/nodes/:nodeId` | Entity with relationships, neighbours and evidence |
 | `GET` | `/api/analyses/:id/evidence` | Evidence records. `?path=` filters |
-| `GET` | `/api/analyses/:id/artifacts[/:kind]` | Artifact projections, with Mermaid. Kinds: `dependency-graph`, `module-graph`, `class-diagram`, `er-diagram`, `c4-context`, `c4-container`, `c4-component` |
+| `GET` | `/api/analyses/:id/artifacts[/:kind]` | Artifact projections, with Mermaid. Kinds: `dependency-graph`, `module-graph`, `class-diagram`, `er-diagram`, `c4-context`, `c4-container`, `c4-component`, `sequence`, `activity`, `data-flow` |
+| `GET` | `/api/analyses/:id/requirements` | Requirements, each labelled stated or derived, with its evidence |
+| `GET` | `/api/analyses/:id/use-cases[/:useCaseId]` | Use cases with steps, status and what is not evidenced |
+| `GET` | `/api/analyses/:id/consistency` | Cross-artifact findings: class, evidence expected, evidence found |
+| `GET` | `/api/analyses/:id/traceability[/:nodeId]` | Chain index, or the requirement-to-test chain for one entity |
+| `GET` | `/api/analyses/:id/lineage/:nodeId` | Where a value came from, and where it goes |
 | `GET` | `/api/analyses/:id/snapshot` | Snapshot identity of this state, without its graph |
 | `GET` | `/api/analyses/:id/drift?against=<analysisId>` | What changed between two states, with evidence on both sides. `?limit=`, `?includeChanges=` |
 | `GET` | `/api/analyses/:id/gaps` | Gap report |

@@ -341,8 +341,18 @@ projectAtlas(graph)                                   packages/artifacts/src/ind
   ├─ buildC4(container)          deployment_component → container;
   │                                 cross-container imports/calls → depends_on
   ├─ buildC4(component)          module + deploys → component; module→module → depends_on
-  │    └─ toMermaid(artifact)                        text projection
   └─ analyseGaps(graph)
+  → buildSequence()           api_endpoint | cli_command | event_consumer, `calls`; messages only, no returns
+  → buildActivity()           function | test, `branches` | `loops` edges; ordered by source line
+  → buildDataFlow()           `reads` | `writes` | `communicates_with` only
+  → checkConsistency()        compares every artifact above over one graph
+       → projectionIntegrity        unsupported inference, per artifact
+       → c4WithoutCode             container with no attributed module
+       → requirementImplementation  declared requirement with no implementation
+       → useCaseReachability       entry point with no reachable step
+       → dataCoverage              table no analysed code reads or writes
+       → behaviourCoverage         entry point with no tests relationship
+       → crossArtefactAgreement    recorded agreement, so problems have context
        ├─ deploymentArchitecture   compose services, base images, deploys edges
        ├─ apiSurface               api_endpoint count
        ├─ dataStorage              tables, columns, reads/writes edges
@@ -463,6 +473,11 @@ buildApp()                                           packages/server/src/app.ts
   ├─ GET    /api/analyses/:id/drift?against=<analysisId>
   │                                          → DriftReport; 400 without `against`
   ├─ GET    /api/analyses/:id/gaps
+  → GET    /api/analyses/:id/requirements      → buildRequirements(stored graph)
+  → GET    /api/analyses/:id/use-cases[/:useCaseId]
+  → GET    /api/analyses/:id/consistency       → checkConsistency(stored graph)
+  → GET    /api/analyses/:id/traceability[/:nodeId]
+  → GET    /api/analyses/:id/lineage/:nodeId  → traceLineage(stored graph)
   ├─ GET    /api/analyses/:id/diagnostics
   └─ DELETE /api/analyses/:id
 ```

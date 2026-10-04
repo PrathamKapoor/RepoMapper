@@ -6,68 +6,118 @@ Read this file first, then `decisions.md` and `flow.md`, before starting work.
 
 ## 1. Current Phase
 
-**Phase 2 — Drift detection and C4 architecture recovery: complete and committed.**
+**Phase 3 — behaviour, data and traceability: complete, verified and committed.**
 
-The canonical graph now has the two things it was missing: a comparable identity for a
-repository state, and an architecture view derived only from that state.
+The graph now carries the facts behaviour and data views need: explicit control flow, SQL data
+access, schema keys and constraints, declared requirements, and a test-to-endpoint link. On top
+of them the product projects sequence, activity and data-flow views, recovers requirements and
+use cases, follows any entry point through to the code and test that serve it, and compares
+every view against the others.
 
-The product is **usable and deployable for its stated scope** and **explicitly partial**
-beyond it. Browser rendering moved from *unknown* to *partially verified* during this phase —
-a real headless Chromium is now driven over the DevTools Protocol with no added dependency
-(D-041). Visual layout, zoom, drag and non-Chromium browsers remain unverified — see §8.
-Per-capability status is in `docs/verification.md`.
+The product is **usable and deployable for its stated scope** and **explicitly partial** beyond
+it. Rendering is verified by CDP assertions (38/38 with one analysis, 41/41 with two and a real
+change), not by pixels; visual layout, zoom, drag and non-Chromium browsers remain unverified
+(D-041, D-048). Per-capability status is in `docs/verification.md`.
+docs/verification.md
+`
+.
 
 ---
 
 ## 2. Work Completed
 
-Carried over from Phase 1 (see `git log`): the pipeline, six packages, containment, extraction,
-the canonical graph, four projections, gap analysis, persistence, the API, the UI, the
-container image and CI.
+Carried over from Phase 1: the pipeline, six packages, containment, extraction, the canonical
+graph, gap analysis, persistence, the API, the UI, the container image and CI. Carried over
+from Phase 2: snapshots and drift, content digests, the C4 projections at three levels,
+deployment attribution by build context, and the Snapshot and Drift views.
 
-Phase 2 added:
+Phase 3 added, in dependency order:
 
-- **Analysis snapshots** (`packages/core/src/snapshot.ts`). Content-derived identity:
-  `sha256` over the extractor version, the graph schema version and every node, edge and
-  evidence record. Provenance is recorded outside the identity, so re-analysing unchanged
-  content yields the same snapshot id. Two snapshots from different extractor or schema
-  versions are reported incomparable rather than diffed.
-- **Content digests on module nodes** (`contentDigest()` in `packages/server/src/analyze.ts`),
-  computed inside the read each file already requires, with CRLF normalised so a Windows and a
-  Linux checkout of the same commit are the same source.
-- **A drift engine** (`packages/core/src/drift.ts`). Indexed, deterministic comparison
-  reporting node, edge, evidence and confidence changes. Removals are withheld as claims when
-  the target analysis was truncated. Renames are proved by identical content, never by name
-  similarity.
-- **C4 projections** (`packages/artifacts/src/c4.ts`) at three levels, every element carrying
-  its derivation and evidence and every relationship carrying the graph edges or nodes that
-  justify it. A relationship with no support, or with an endpoint outside its level, is
-  dropped and the drop is recorded.
-- **Deployment attribution by build context** (`packages/core/src/graph-builder.ts`), so C4
-  components rest on graph facts. Without it, level 3 was empty for every real repository.
-- **Two HTTP endpoints**: `GET /api/analyses/:id/snapshot` and
-  `GET /api/analyses/:id/drift?against=<analysisId>`.
-- **C4 and Drift tabs in the UI**, with progressive disclosure, an element panel that
-  explains why each element exists, and drill-through from a change row to the entity
-  inspector in the snapshot that change belongs to.
-- **114 new tests** (215 → 329), including drift fixtures built through the real pipeline.
-- **Four bugs found and fixed**, three by tests and one by container verification, each with a
-  regression test (D-031, D-032, D-038, D-039).
-- **Verification**: real repository drift over a real change set, C4 against this repository,
-  and a rebuilt container exercised through both Phase 2 endpoints.
+- **The facts behaviour views need.** Explicit control flow (`branches`, `loops` edges to
+  `condition` nodes) for TypeScript and Python; `isAsync` where the declaration states it;
+  SQL `reads` and `writes` from single-table statements in string literals; DDL primary keys,
+  foreign keys, nullability and uniqueness, including foreign keys added by `ALTER TABLE`;
+  `references` edges between declarations.
+- **Inline route handlers are named** (D-042). `app.get('/x', async (req, res) => { … })` is
+  the most common handler shape in Express, Fastify and Hono code, and an anonymous argument
+  is not a declaration. Without a name, every endpoint in this repository had no behaviour
+  behind it: the sequence view reported insufficient evidence and no use case had a step.
+- **Requirement and use-case models** (`requirements.ts`, `use-cases.ts`). Declared
+  requirements are read from Markdown lines that state an obligation, never from prose; a
+  stated requirement with no implementation is kept and marked `PARTIAL` (D-044). Use cases
+  start from evidenced entry points, bound their traversal, and list what is not evidenced.
+- **Sequence, activity, data-flow and lineage projections** (`behaviour.ts`, `data-flow.ts`),
+  each with its own rule and its own `omitted[]`. No return arrow is drawn, because the graph
+  records no return (D-047).
+- **A cross-artifact consistency engine** (`consistency.ts`) with five classes, where
+  `CONTRADICTION` is reserved for two statements that cannot both be true and a missing
+  relationship is always missing *evidence* (D-043). Agreement is recorded too, so problems
+  have context.
+- **Traceability** (`traceability.ts`): the requirement → use case → implementation → test
+  chain, with each broken joint named and the index building its models once (D-046).
+- **A `tests` edge** from a test to the endpoint whose handler it calls, which is what makes
+  the last joint of the chain recoverable.
+- **Five HTTP endpoints**: `/requirements`, `/use-cases[/:useCaseId]`, `/consistency`,
+  `/traceability[/:nodeId]`, `/lineage/:nodeId`.
+- **Two new UI tabs** (Behaviour, Traceability), progressive disclosure throughout, with the
+  decision logic in `presentation.ts` under test rather than inside components.
+- **Graph schema version 3**, because the shape of the graph changed.
+- **160 new tests** (329 → 489), including the defects below.
+- **Verification**: real self-analysis of this repository (4582 nodes, 6983 edges, sequence
+  257/1205), every Phase 3 endpoint exercised in a Linux container, and the browser driver at
+  38/38 and 41/41.
 
 ### Bugs found and fixed during this phase
 
 | | Symptom | Root cause |
 |---|---|---|
-| D-031 | `/snapshot` returned `"snapshotId": ""` | `createSnapshot()` left a placeholder in provenance and only overwrote the digest |
-| D-032 | Drift against a failed analysis reported the entire system as removed, at full confidence | `getSnapshot()` accepted any analysis with rows; a failed one yields an empty but *valid* graph |
-| D-038 | Container reported `schemaVersion: 1` and a digest that did not match the one recorded at analysis time | `Store.getGraph()` stamped rebuilt graphs with the **database** schema version instead of the graph model version |
-| D-039 | C4 drew a named compose volume, a Docker base image and a component named `unknown` as containers | Compose parser matched any indented name and missed the long `build:` form; every deployment marker created a component |
-
----
+| D-042 | Sequence reported insufficient evidence on every real repository | Inline route callbacks were not entities, so endpoint → handler resolution had nothing to resolve |
+| D-044 | A declared requirement with no implementation vanished from the report | The model filtered orphans out instead of marking them `PARTIAL` |
+| D-045 | A use case was 2.2 MB of JSON with 330 steps | Breadth-first walk of a dense call graph, unbounded in width |
+| D-046 | `/traceability` took 15.2 s per request | Models rebuilt per entry point instead of once |
+| D-048 | The browser driver reported working views as broken, and a broken view as working | It waited on control labels rather than content, and clicked a tab where it meant a section |
+| — | The activity projection reported a limit count of **-650** | Node count used for the unit count included decision nodes |
+| — | An endpoint named its handler with the arrow's source text | An anonymous handler has no name to resolve; it now gets one derived from the registration |
 
 ## 3. Files Changed
+
+Phase 3 (this phase):
+
+```
+packages/core/src/types.ts                  condition nodes; branches/loops/references/tests edge kinds; isAsync
+packages/core/src/graph.ts                  GRAPH_SCHEMA_VERSION 2 -> 3; allNodes()/allEdges()
+packages/core/src/graph-builder.ts          condition facts, SQL reads/writes, DDL keys and FKs,
+                                           endpoint -> handler, declared requirements, tests edges
+packages/core/src/requirements.ts           declared requirements kept when unimplemented; PARTIAL status
+packages/core/src/use-cases.ts              bounded steps (40), step-support matching, cut reported
+packages/core/src/traceability.ts     NEW   requirement -> use case -> implementation -> test chain
+packages/core/test/requirements.test.ts    requirement and use-case model tests
+packages/core/test/traceability.test.ts NEW  chain, broken joints, cycle safety
+packages/parsers/src/typescript.ts         control flow, isAsync, inline route handler naming, shared SQL reader
+packages/parsers/src/python.ts             control flow and isAsync for Python
+packages/parsers/src/config.ts              Markdown requirements, DDL constraints, ALTER TABLE foreign keys
+packages/parsers/test/parsers.test.ts       inline handlers, Markdown requirements, ALTER TABLE FKs
+packages/artifacts/src/behaviour.ts    NEW  sequence and activity projections
+packages/artifacts/src/data-flow.ts    NEW  data flow and lineage
+packages/artifacts/src/consistency.ts  NEW  cross-artifact consistency engine
+packages/artifacts/src/er-diagram.ts        explicit keys, foreign keys, constraint notes
+packages/artifacts/src/gaps.ts              requirement and use-case counts from the models
+packages/artifacts/src/index.ts             sequence, activity, data-flow registered; consistency in projectAtlas
+packages/artifacts/src/contract.ts          non-C4 `view` field
+packages/artifacts/test/behaviour.test.ts NEW  28 behaviour, data-flow and lineage tests
+packages/artifacts/test/consistency.test.ts NEW 19 consistency tests
+packages/server/src/app.ts                  5 new endpoints
+packages/server/src/service.ts              requirements, use cases, consistency, traceability, lineage
+packages/server/test/phase3-api.test.ts NEW 22 endpoint tests
+packages/web/src/phase3.tsx            NEW  Behaviour and Traceability tabs, lineage panel
+packages/web/src/api.ts                    Phase 3 types and client methods
+packages/web/src/app.tsx                   two new tabs, ten in total
+packages/web/src/presentation.ts           requirement wording, consistency headline, chain view
+packages/web/test/phase3-presentation.test.ts NEW 21 wording and ordering tests
+scripts/verify-browser.mjs                 Phase 3 checks; waits for content, not controls
+```
+
+Carried over from Phase 2 (for orientation):
 
 ```
 packages/core/src/snapshot.ts        NEW   content-addressed snapshot identity
@@ -79,30 +129,14 @@ packages/core/test/drift.test.ts      NEW   34 snapshot and drift tests
 packages/core/test/graph-builder.test.ts   deployment attribution, base images, digests
 packages/parsers/src/config.ts             compose scoped to `services:`, both build: forms
 packages/parsers/src/registry.ts            readFile receives the repository-relative path
-packages/parsers/test/parsers.test.ts       volumes/networks, build: forms, service lines
-packages/artifacts/src/c4.ts          NEW   C4 context, container, component
-packages/artifacts/src/contract.ts         C4 element fields, supporting edge/node ids, gate
-packages/artifacts/src/index.ts            three C4 artifacts registered
+packages/artifacts/src/c4.ts          NEW   C4 context, container and component projections
 packages/artifacts/test/c4.test.ts    NEW   32 C4 tests
-packages/server/src/store.ts               snapshot columns, digest column, schema-version fix
-packages/server/src/service.ts             snapshot lifecycle and drift comparison
-packages/server/src/app.ts                 /snapshot and /drift routes
-packages/server/src/analyze.ts             content digests captured during read
-packages/server/test/drift-api.test.ts NEW  15 HTTP tests over the real store
-packages/web/src/c4.tsx              NEW   C4 tab with progressive disclosure
+packages/server/src/app.ts                  snapshot and drift routes
+packages/server/src/service.ts              compareAnalyses, getSnapshot
+packages/server/test/drift-api.test.ts NEW   15 drift endpoint tests
+packages/web/src/c4.tsx              NEW   C4 tab with element panel
 packages/web/src/drift.tsx           NEW   Drift tab
-packages/web/src/presentation.ts     NEW   testable UI decisions
-packages/web/test/presentation.test.ts NEW  17 tests for those decisions
-packages/web/src/api.ts                    snapshot and drift client, C4 types
-packages/web/src/app.tsx                   two new tabs, inspector carries its analysis id
-packages/web/src/entity-drawer.tsx         unchanged; app.tsx now passes an explicit analysis
-packages/web/tsconfig.json                 includes `test` for the type-aware linter
-decisions.md  flow.md  docs/architecture.md  docs/deployment.md  docs/verification.md
-README.md  handoff.md
 ```
-
----
-
 ## 4. Current Architecture / State
 
 ```
@@ -127,7 +161,9 @@ createSnapshot()             packages/core/src/snapshot.ts        content-addres
    ├─ Store.saveAnalysis()   packages/server/src/store.ts
    │
    ▼
-projectAtlas()               packages/artifacts/src/index.ts      7 projections + gap analysis
+projectAtlas()               packages/artifacts/src/index.ts      10 projections + gaps + consistency
+   |                         → buildSequence(), buildActivity(), buildDataFlow()
+   |                         → checkConsistency(), buildRequirements(), buildUseCases()
    │                         └─ buildC4() × 3 levels
    │
    ▼
@@ -176,6 +212,13 @@ Three invariants now hold the design together:
 | D-041 | Browser verification driven over CDP with no dependency; the UI moved from unknown to partially verified |
 | D-039 | Compose volumes and base images are not containers (bug found by real C4) |
 | D-040 | Git's dubious-ownership guard is not disabled |
+| D-042 | An inline route handler is named after the registration that contains it, so an endpoint resolves to its code |
+| D-043 | Absence is never a contradiction; the consistency engine records agreement too |
+| D-044 | A stated requirement with no implementation is kept and marked partial, not dropped |
+| D-045 | A use case is capped at 40 steps and the cap is reported |
+| D-046 | The traceability index builds its models once; per-row model building was a 15 s request |
+| D-047 | Sequence messages are calls only; no return arrow is drawn |
+| D-048 | Browser checks wait for content, not for controls |
 
 ---
 
@@ -206,29 +249,29 @@ npm ci                # reproducible install from the lockfile
 npm run lint          # eslint, type-aware
 npm run typecheck     # tsc --noEmit per package, source + tests
 npm run build         # all packages + web bundle
-npm run test          # vitest, 329 tests
+npm run test          # vitest, 489 tests
 npm run verify        # lint + typecheck + build + test, in that order
 ```
 
 **Run `npm run verify`, not `npx vitest` alone.** Packages resolve through `dist/`, so a test
 run without a build silently exercises the previous build (D-035).
 
-Phase 2 verification, recorded with output in `docs/verification.md`:
+Verification, recorded with output in `docs/verification.md`:
 
-- **Real repository drift.** An isolated copy of this repository with its own Git history was
-  analysed, then changed (a new module, a pure rename, a comment-only edit), then analysed
-  again. Result: 157 changes across 11 categories, one proven rename with evidence on both
-  sides, byte-identical output on repeat.
-- **Real repository C4.** 1 software system, 1 container cited to `docker-compose.yml:7`,
-  96 components with 181 relationships, each naming the `deploys` edge behind it.
-- **Container.** Rebuilt, run healthy, both Phase 2 endpoints exercised, `schemaVersion: 2`
-  after D-038, a rename detected across two host-side analyses, `/etc` and
-  `/repos/fixture/../..` both refused with 403.
-- **Browser.** Real headless Chromium, driven over the DevTools Protocol by
-  `scripts/verify-browser.mjs` with no added dependency. **27/27** checks against a fixture
-  with two analyses, **24/24** against this repository. Covers rendering and the click paths:
-  every tab, all three C4 levels with their omission tables, selecting a C4 element to reveal
-  its derivation and evidence, and a drift row drilling through to the entity inspector.
+- **Real self-analysis.** This repository analysed at commit `954f3d7`: 4582 nodes, 6983 edges,
+  9144 evidence records, sequence 257 participants / 1205 messages, activity 1809 / 2565,
+  data flow 7 / 7, 31 requirements stated by documents plus 25 derived, and 37 use cases.
+  Phase 3's own facts are visible in the node and edge kinds, not only in the totals.
+- **Container.** Rebuilt from the Phase 3 tree; every Phase 3 endpoint exercised against
+  an isolated read-only fixture on Node 24.21.0, including a requirement read from a
+  document, a use case with three steps, a consistency report with zero contradictions,
+  and an ER diagram whose foreign key came from an `ALTER TABLE` statement.
+- **Browser.** Real headless Chromium over the DevTools Protocol, no added dependency:
+  **38/38** checks with one analysis, **41/41** with two and a real change between them.
+  Covers all ten tabs, the three behaviour views on demand, lineage, the requirements and
+  use-case lists, opening a chain from the index, and the consistency view.
+- **Performance, observed rather than benchmarked:** `/traceability` went from 15.2 s to
+  2.9 s after D-046; the `/use-cases` payload for this repository is 538 KB for 37 use cases.
 
 **Not verified:** visual layout, styling and responsive behaviour at any viewport; React Flow
 zoom, pan and drag; and any browser other than the Chromium builds installed here. No
@@ -246,8 +289,10 @@ benchmark numbers are claimed. See `docs/verification.md` §5 for the full list.
 | Rename detection is whole-file and content-exact | A moved class, or a rename whose content changed, is removed + added | Deliberate. Proved rather than guessed (D-029) |
 | A container with an image but no build context gets no components | Level 3 is empty for such repositories | Recorded in `omitted[]`. Dockerfile `COPY` analysis would fix it |
 | Git history is unavailable inside the container for foreign-owned repositories | Commit, contributor and ownership facts are absent there | `GIT_UNAVAILABLE` diagnostic, analysis still succeeds. The guard is not disabled by default (D-040) |
-| Drift compares two analyses; it does not judge one | No in-graph consistency checking | Deferred, §9 |
 | Analyses run inline; long runs hold an HTTP connection | Proxies with short read timeouts need raising | Accepted, documented, D-006 |
+| `reads`/`writes` come only from single-table SQL in a string literal | A repository behind an ORM shows stores it never evidences, and the DFD is sparse | Deliberate and stated in `omitted[]`. Widening it is the first item of Phase 4 |
+| Sequence diagrams have no return arrow | A sequence shows calls but not returns, so it is incomplete in a way the view states | `omitted[]` says so (D-047). Returns are Phase 4 |
+| Requirement status is `PARTIAL` for most stated requirements in a code-only repository | A document states an obligation nothing implements | Correct and reported. Not a defect in the repository |
 | No authentication on the API | Anyone who can reach the port can analyse paths the process can read | Mitigated by `REPOATLAS_ALLOWED_ROOTS`; bound to `127.0.0.1` in compose |
 | Python extraction is structural, not a full grammar | Dynamic/metaprogrammed code is not modelled | Documented, D-004. Facts stay ≤ `STRONGLY_INFERRED` |
 | Call resolution matches by name | A same-named symbol in another file can be chosen | Labelled `STRONGLY_INFERRED`/`WEEKLY_INFERRED`, never `EXPLICIT` |
@@ -261,63 +306,57 @@ benchmark numbers are claimed. See `docs/verification.md` §5 for the full list.
 
 Ordered by what unblocks the most downstream value. None of these are started.
 
-1. **In-graph consistency checking.** Drift answers "what changed"; nothing answers "what
-   disagrees *within* this state" — a route with no handler, an import nothing calls, a table
-   no code reads, a declared dependency nothing imports. The graph now holds the facts for the
-   first two.
+1. **Return messages and error paths in sequence diagrams.** The graph records calls and no
+   returns, so the sequence view draws no return arrow (D-047). Recovering returns needs data
+   flow within a function, which is a different extraction problem.
 2. **Dockerfile `COPY` analysis.** Would replace the build-context inference with a real
    statement of which source is in the image, strengthening every C4 component boundary
    (D-034).
-3. **Stronger rename detection.** `git log --follow` as corroboration where history exists;
+3. **ORM and query-builder extraction.** `reads`/`writes` currently come only from
+   single-table SQL in a string literal, so a repository behind an ORM shows stores it never
+   evidences. This is the largest remaining gap in the data views and the lineage answer.
+4. **State models.** 1480 condition nodes here name states but the graph holds no transition
+   relationship, so no state diagram is drawn. Transitions need an explicit representation.
+5. **Stronger rename detection.** `git log --follow` as corroboration where history exists;
    symbol-level pairing for a class moved between files. Both must keep D-029's refusal to
    guess.
-4. **Data-flow lineage.** Requires `reads`/`writes` edges from code to tables, which requires
-   ORM and query-pattern extraction.
-5. **Requirement extraction and traceability**, then requirements-vs-implementation.
-6. **Further artifacts** in the documented order: sequence, DFD, use-case, activity,
-   deployment — each only once the graph holds its facts (D-022 explains why the current
-   renderer cannot express a sequence diagram).
-7. **Archive upload endpoint.** `extractTarArchive()` is implemented and tested; the route is
-   missing.
-8. **Wider language coverage** via `web-tree-sitter`, per D-003.
-9. **API auth and rate limiting** if the service is ever exposed beyond localhost.
-10. **Visual-regression checks.** The browser driver exists; a screenshot comparison would catch
-    layout changes. It would not replace the driver.
-11. **Coverage measurement** and closing any gaps it reveals.
+6. **Requirements from an issue tracker.** Out of reach by design; the tool reports them as not
+   recovered rather than guessing.
+7. **Screenshot comparison in the browser driver.** Layout is still verified by DOM assertions
+   only, so a visual regression would not be caught.
+8. **Archive-upload endpoint, CORS, rate limiting, API authentication.** Unchanged from Phase 1;
+   `extractTarArchive` exists and is tested but unreachable.
 
 ---
 
 ## 10. Next Subphase
 
-**Phase 3 — In-graph consistency analysis, plus stronger deployment attribution.**
+**Phase 4 - data access beyond string literals, plus returns.**
 
 Why this order:
 
-- Consistency checking is the natural companion to drift. Drift needs two analyses; consistency
-  needs one, and answers the question drift cannot: *is this state internally coherent?* The
-  facts for the first two cases — a route with no handler, an import nothing calls — are
-  already in the graph.
-- Dockerfile `COPY` analysis is the smallest change that would turn C4 component boundaries
-  from an inference into a citation, and it improves every future view that touches deployment.
-- `scripts/verify-browser.mjs` now runs against every screen. Extend it as screens are added:
-  a new view nobody checks is a new unverified surface.
+- The data views are the weakest part of the product today. `reads` and `writes` come from one
+  narrow, honest rule, and this repository's own DFD is 7 relationships because of it. Widening
+  the rule is what turns "we can see six tables" into "we can see how data moves".
+- Return messages follow from the same work: both need to know what a function hands back, and
+  a single pass over return statements and typed results could produce both. Until then the
+  sequence diagram is honest but incomplete, and its `omitted[]` says so.
+- Everything else on the list is either a smaller improvement (Dockerfile `COPY`) or blocked on
+  something external (an issue tracker).
 
 Concrete first steps:
 
-1. Extract `COPY --from=<stage> <src> <dest>` from Dockerfiles, and record it as a
-   `deployment_component` attribute rather than as a new node kind.
-2. Attribute a module to a container from `COPY` evidence when it exists, and fall back to the
-   build context otherwise — with the two distinguishable in the C4 derivation string.
-3. Add a `consistency.ts` module in `@repoatlas/core` producing a report shaped like the gap
-   report: every finding cites evidence, every absence claim hedges, and a test enforces the
-   wording as D-008 does.
-4. Expose `GET /api/analyses/:id/consistency` and add it to the UI next to Gaps.
-5. Add cross-artifact consistency tests: a graph edge removed must change the C4 projection,
-   and a drift-visible change must be visible in C4.
-6. Extend the browser driver to cover the new view, and add a screenshot comparison so layout
-   regressions are caught rather than judged by eye.
-
----
+1. Record an explicit `returns` relationship from a function to the entity it returns, with the
+   `return` statement as evidence, for TypeScript and Python. Do not infer it from types: a
+   declared return type is a claim about the signature, not about the value.
+2. Widen SQL extraction to the query builders actually present in the target repositories —
+   Knex, Prisma, TypeORM, SQLAlchemy — one at a time, each with a fixture test, and keep the
+   single-table limitation stated wherever it applies.
+3. Add a `communicates_with` extractor for HTTP clients, so a data flow can cross the system
+   boundary instead of always stopping at an unknown store.
+4. Draw the sequence return arrow only where a `returns` relationship exists, and extend the
+   `omitted[]` note to count the returns that were not recorded.
+5. Extend the browser driver with a screenshot comparison, so layout stops being unverified.
 
 ## 11. Critical Context
 

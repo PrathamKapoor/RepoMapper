@@ -181,6 +181,14 @@ id2=$(curl -fsS -X POST http://127.0.0.1:4300/api/analyses \
 curl -fsS "http://127.0.0.1:4300/api/analyses/$id2/drift?against=$id" \
   | sed -E 's/.*"totalChanges":([0-9]+).*/total changes: \1/'
 
+# behaviour and traceability views
+curl -fsS "http://127.0.0.1:4300/api/analyses/$id2/artifacts/sequence" \
+  | sed -E 's/.*"insufficientEvidence":(true|false).*/insufficient: \1/'
+
+curl -fsS "http://127.0.0.1:4300/api/analyses/$id2/requirements" | head -c 400
+curl -fsS "http://127.0.0.1:4300/api/analyses/$id2/consistency" | head -c 400
+curl -fsS "http://127.0.0.1:4300/api/analyses/$id2/traceability" | head -c 400
+
 # C4 levels
 curl -fsS "http://127.0.0.1:4300/api/analyses/$id2/artifacts/c4-container" \
   | sed -E 's/.*"insufficientEvidence":(true|false).*/insufficient: \1/'
