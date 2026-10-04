@@ -88,6 +88,16 @@ export interface UseCaseModel {
 /** Hard ceiling on traversal. A pathological repository must not cause unbounded descent. */
 export const MAX_USE_CASE_DEPTH = 6;
 
+/**
+ * Hard ceiling on steps in one use case.
+ *
+ * The walk is breadth-first and this repository has a dense call graph, so an entry point can
+ * reach three hundred functions inside six hops. Listing them all turns a use case into a call
+ * graph with a title and produces a multi-megabyte payload for one row of a table. The cap keeps
+ * the view readable; what it cut is reported in missing[], never silently dropped.
+ */
+export const MAX_USE_CASE_STEPS = 40;
+
 export function buildUseCases(graph: SoftwareGraph, requirements: readonly Requirement[] = []): UseCaseModel {
   const repository = graph.nodes.find((node) => node.kind === 'repository');
   const systemNodeId = repository?.id ?? '';
@@ -200,7 +210,7 @@ function buildUseCase(
   systemNodeId: string,
   requirements: readonly Requirement[],
 ): UseCase {
-  const steps = traverse(graph, entry.node);
+  const { steps, cut } = traverse(graph, entry.node);
   const missing: string[] = [];
   const groups: EvidenceRef[][] = [entry.node.evidence];
   for (const step of steps) groups.push(step.evidence);
@@ -223,6 +233,10 @@ function buildUseCase(
 
   if (steps.length === 0) {
     missing.push('steps: no call was resolved from this entry point, so the interaction is not observed');
+  } else if (cut > 0) {
+    missing.push(
+      `steps: ${cut} further call relationship(s) reachable from this entry point were cut at the ${MAX_USE_CASE_STEPS}-step limit; the interaction continues past what is shown`,
+    );
   }
 
   const dataTouched = dataTargets(graph, steps);
@@ -274,7 +288,7 @@ function buildUseCase(
  * terminates and a deep chain cannot make this quadratic. Only `calls` and `imports` are
  * followed: a dependency is not a step in an interaction.
  */
-function traverse(graph: SoftwareGraph, entry: GraphNode): UseCaseStep[] {
+function traverse(graph: SoftwareGraph, entry: GraphNode): { steps: UseCaseStep[]; cut: number } {
   const byId = new Map(graph.nodes.map((node) => [node.id, node]));
   const outgoing = new Map<string, SoftwareGraph['edges']>();
   for (const edge of graph.edges) {
@@ -287,6 +301,7 @@ function traverse(graph: SoftwareGraph, entry: GraphNode): UseCaseStep[] {
   const steps: UseCaseStep[] = [];
   const visited = new Set<string>([entry.id]);
   let frontier = [entry.id];
+  let cut = 0;
 
   for (let depth = 0; depth < MAX_USE_CASE_DEPTH && frontier.length > 0; depth += 1) {
     const next: string[] = [];
@@ -296,14 +311,23 @@ function traverse(graph: SoftwareGraph, entry: GraphNode): UseCaseStep[] {
       for (const edge of edges) {
         const target = byId.get(edge.to);
         if (!target) continue;
-        steps.push({
-          nodeId: target.id,
-          label: target.qualifiedName ?? target.name,
-          kind: target.kind,
-          viaEdgeIds: [edge.id],
-          evidence: edge.evidence,
-          confidence: edge.confidence,
-        });
+
+        // A use case with three hundred steps is not a use case, it is a call graph with a
+        // title. The walk stops at the cap and the cut is reported, so the reader knows the
+        // interaction continues past what is shown.
+        if (steps.length >= MAX_USE_CASE_STEPS) {
+          cut += 1;
+        } else {
+          steps.push({
+            nodeId: target.id,
+            label: target.qualifiedName ?? target.name,
+            kind: target.kind,
+            viaEdgeIds: [edge.id],
+            evidence: edge.evidence,
+            confidence: edge.confidence,
+          });
+        }
+
         if (!visited.has(target.id)) {
           visited.add(target.id);
           next.push(target.id);
@@ -314,7 +338,7 @@ function traverse(graph: SoftwareGraph, entry: GraphNode): UseCaseStep[] {
     frontier = next;
   }
 
-  return steps;
+  return { steps, cut };
 }
 
 /** Data stores the interaction reaches, deduplicated and ordered. */

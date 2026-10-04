@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildRequirements, buildUseCases, MAX_USE_CASE_DEPTH, type Requirement } from '@repoatlas/core';
+import { buildRequirements, buildUseCases, MAX_USE_CASE_DEPTH, MAX_USE_CASE_STEPS, type Requirement } from '@repoatlas/core';
 import { buildGraph, DiagnosticCollector, EvidenceStore, type ParsedFile, type RepositoryRef } from '@repoatlas/core';
 
 /**
@@ -455,5 +455,57 @@ describe('use cases', () => {
 
   it('is deterministic for the same graph', () => {
     expect(JSON.stringify(buildUseCases(API_TO_DATABASE))).toBe(JSON.stringify(buildUseCases(API_TO_DATABASE)));
+  });
+});
+
+describe('use case step limit', () => {
+  it('caps the steps of one use case and reports what it cut', () => {
+    // A dense call graph: one handler reaching MAX_USE_CASE_STEPS + 10 functions.
+    const calls = Array.from({ length: MAX_USE_CASE_STEPS + 10 }, (_, index) => ({
+      callee: `f${index}`,
+      line: index + 2,
+      fromQualifiedName: 'handleList',
+      isLocalIdentifier: true,
+      argCount: 0,
+    }));
+
+    const graph = graphOf([
+      parsedFile('src/routes.ts', {
+        entities: [
+          { kind: 'function' as const, name: 'handleList', qualifiedName: 'handleList', startLine: 1, endLine: 2, language: 'typescript' },
+          ...Array.from({ length: MAX_USE_CASE_STEPS + 10 }, (_, index) => ({
+            kind: 'function' as const,
+            name: `f${index}`,
+            qualifiedName: `f${index}`,
+            startLine: index + 2,
+            endLine: index + 3,
+            language: 'typescript',
+          })),
+        ],
+        calls,
+        markers: [{ name: 'http.route', line: 1, attributes: { httpMethod: 'GET', path: '/api/x', handler: 'handleList' } }],
+      }),
+    ]);
+
+    const useCase = buildUseCases(graph).useCases.find((candidate) => candidate.entryKind === 'api_endpoint')!;
+    expect(useCase.steps).toHaveLength(MAX_USE_CASE_STEPS);
+    // The cut is stated, not hidden: an interaction that continues past the cap must say so.
+    expect(useCase.missing.some((entry) => entry.includes(`${MAX_USE_CASE_STEPS}-step limit`))).toBe(true);
+  });
+
+  it('reports no cut for an interaction inside the limit', () => {
+    const graph = graphOf([
+      parsedFile('src/routes.ts', {
+        entities: [
+          { kind: 'function' as const, name: 'handleList', qualifiedName: 'handleList', startLine: 1, endLine: 2, language: 'typescript' },
+          { kind: 'function' as const, name: 'load', qualifiedName: 'load', startLine: 2, endLine: 3, language: 'typescript' },
+        ],
+        calls: [{ callee: 'load', line: 2, fromQualifiedName: 'handleList', isLocalIdentifier: true, argCount: 0 }],
+        markers: [{ name: 'http.route', line: 1, attributes: { httpMethod: 'GET', path: '/api/x', handler: 'handleList' } }],
+      }),
+    ]);
+
+    const useCase = buildUseCases(graph).useCases[0]!;
+    expect(useCase.missing.some((entry) => entry.includes('step limit'))).toBe(false);
   });
 });

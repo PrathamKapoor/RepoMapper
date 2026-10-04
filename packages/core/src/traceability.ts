@@ -70,11 +70,29 @@ const MAX_IMPLEMENTATION_NODES = MAX_IMPLEMENTATION_DEPTH * 4;
  * claim".
  */
 export function traceSubject(graph: SoftwareGraph, subjectId: string): Traceability | null {
+  const requirements = buildRequirements(graph).requirements;
+  return traceSubjectWith(graph, { requirements, useCases: buildUseCases(graph, requirements).useCases }, subjectId);
+}
+
+/** The models a chain is read from. Built once and shared, never rebuilt per subject. */
+interface ChainModels {
+  requirements: readonly Requirement[];
+  useCases: readonly UseCase[];
+}
+
+/**
+ * The chain, given models that have already been built.
+ *
+ * Separate from `traceSubject` because building the requirement and use-case models walks the
+ * whole graph: doing that once per entry point turned a 300 ms index into fifteen seconds on a
+ * repository with twenty-two endpoints, which a browser waits on.
+ */
+function traceSubjectWith(graph: SoftwareGraph, models: ChainModels, subjectId: string): Traceability | null {
   const subject = graph.nodes.find((node) => node.id === subjectId);
   if (!subject) return null;
 
-  const requirements = buildRequirements(graph).requirements;
-  const useCases = buildUseCases(graph, requirements).useCases;
+  const requirements = models.requirements;
+  const useCases = models.useCases;
   const relevant = relevantUseCases(useCases, subjectId);
 
   const links: TraceLink[] = [];
@@ -165,12 +183,16 @@ export function traceAll(graph: SoftwareGraph): {
   rows: { subjectId: string; title: string; entryKind: string; requirements: number; useCases: number; implementation: number; tests: number; complete: boolean }[];
   totals: { subjects: number; complete: number; incomplete: number };
 } {
+  // Built once for the whole index. `traceAll` exists to give a reader the whole picture at
+  // once; rebuilding the models per row would make it quadratic in the number of entry points.
+  const requirements = buildRequirements(graph).requirements;
+  const models: ChainModels = { requirements, useCases: buildUseCases(graph, requirements).useCases };
   const entryKinds = new Set<string>(['api_endpoint', 'event_consumer', 'cli_command']);
 
   const rows = graph.nodes
     .filter((node) => entryKinds.has(node.kind))
     .map((node) => {
-      const trace = traceSubject(graph, node.id)!;
+      const trace = traceSubjectWith(graph, models, node.id)!;
       return {
         subjectId: node.id,
         title: node.name,

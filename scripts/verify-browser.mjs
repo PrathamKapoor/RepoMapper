@@ -229,16 +229,20 @@ try {
   );
 
   // ---------------------------------------------------------------- traceability
-  await goto(`${baseUrl}/#/traceability`, `document.body.textContent.includes('Requirements')`);
-  record('traceability renders the requirements view', await evaluate(`document.body.textContent.includes('stated by the repository') || document.body.textContent.includes('derived from code')`));
+  // Waiting on the *content*, not on the section button label: the buttons render before their
+  // data arrives, and a check that reads the DOM too early reports a working view as empty.
+  const requirementLabels =
+    '/stated by the repository|derived from code|partly evidenced|not supported by this repository|states no requirement/';
+  await goto(`${baseUrl}/#/traceability`, `${requirementLabels}.test(document.body.textContent)`);
+  record('traceability renders the requirements view', await evaluate(`${requirementLabels}.test(document.body.textContent)`));
   record(
     'traceability distinguishes stated from derived requirements',
-    await evaluate(`/stated by the repository|derived from code|partly evidenced|not supported by this repository/.test(document.body.textContent)`),
+    await evaluate(`/stated by the repository|derived from code/.test(document.body.textContent)`),
   );
 
   const useCasesClicked = await evaluate(`
     (() => {
-      const button = [...document.querySelectorAll('button')].find((b) => b.textContent === 'Use cases');
+      const button = [...document.querySelectorAll('.row.wrap button')].find((b) => b.textContent === 'Use cases');
       if (button) button.click();
       return !!button;
     })()
@@ -252,7 +256,7 @@ try {
 
   const chainClicked = await evaluate(`
     (() => {
-      const button = [...document.querySelectorAll('button')].find((b) => b.textContent === 'Traceability');
+      const button = [...document.querySelectorAll('.row.wrap button')].find((b) => b.textContent === 'Traceability');
       if (button) button.click();
       return !!button;
     })()
@@ -262,17 +266,32 @@ try {
 
   const rowClicked = await evaluate(`
     (() => {
-      const button = [...document.querySelectorAll('.link')].find((b) => b.closest('table'));
+      const button = [...document.querySelectorAll('table .link')].find((b) => b.closest('table'));
       if (button) button.click();
       return !!button;
     })()
   `);
-  if (rowClicked) {
-    await waitFor(`document.body.textContent.includes('joint') || document.body.textContent.includes('requirement use case')`, 'chain detail');
+if (rowClicked) {
+    // The chain arrives asynchronously after the row is selected, so the check waits for the
+    // chain's own wording rather than reading the panel the instant it opens.
+    await waitFor(
+      `/Every joint traced|joint\\(s\\) the repository does not evidence|No chain for this entity|Chain could not be loaded/.test(document.body.textContent)`,
+      'chain detail',
+    );
     record('selecting an entry point opens its requirement → test chain', true);
+    const joints = await evaluate(
+      `['requirement', 'use case', 'implementation', 'test'].filter((joint) =>
+        [...document.querySelectorAll('.stat .label')].some((label) => (label.textContent ?? '').toLowerCase() === joint),
+      )`,
+    );
     record(
       'the chain reports every joint, zeros included',
-      await evaluate(`/\\brequirement\\b/i.test(document.body.textContent) && /\\btest\\b/i.test(document.body.textContent)`),
+      joints.length === 4,
+      // The four joint counters, read from the rendered labels rather than from body text: the
+      // table headers are plural ("Tests"), the counters are singular ("test"), and matching
+      // body text would pass on the header alone without the chain ever having opened.
+      joints.join(', ') ||
+        (await evaluate(`[...document.querySelectorAll('.stat .label')].map((n) => n.textContent).join(' | ')`)),
     );
   } else {
     record('this repository declares no entry point, so no chain opens', await evaluate(`document.body.textContent.includes('no entry point')`));
@@ -280,7 +299,7 @@ try {
 
   const consistencyClicked = await evaluate(`
     (() => {
-      const button = [...document.querySelectorAll('button')].find((b) => b.textContent === 'Consistency');
+      const button = [...document.querySelectorAll('.row.wrap button')].find((b) => b.textContent === 'Consistency');
       if (button) button.click();
       return !!button;
     })()
@@ -305,28 +324,44 @@ try {
     record('drift does not present an empty state as "nothing changed"', !(await evaluate(`document.body.textContent.includes('Nothing changed')`)));
   } else {
     record('drift renders the comparison identity table', await evaluate(`document.body.textContent.includes('Base state') && document.body.textContent.includes('Target state')`));
-    record('drift renders the change summary', await evaluate(`document.body.textContent.includes('Change summary')`));
-    record(
-      'drift renders individual changes with evidence on both sides',
-      await evaluate(
-        `/entity added|entity removed|entity renamed/.test(document.body.textContent) && /[\\w.]+\\.(ts|tsx|js|json|yml|sql|md):\\d+/.test(document.body.textContent)`,
-      ),
-    );
 
-    const clicked = await evaluate(`
-      (() => {
-        const button = [...document.querySelectorAll('button')].find((b) => b.textContent === 'inspect entity');
-        if (button) button.click();
-        return !!button;
-      })()
-    `);
-    record('a drift row offers an inspect action', clicked);
-    if (clicked) {
-      await waitFor(
-        `document.body.textContent.includes('Outgoing') || document.body.textContent.includes('Evidence (')`,
-        'drift inspector',
+    // Two analyses of an unchanged repository must render as "nothing changed", and the
+    // change-level checks below would then be checking for rows that correctly do not exist.
+    const identical = await evaluate(`document.body.textContent.includes('Nothing changed')`);
+    if (identical) {
+      record('drift reports no change between two identical analyses', true);
+      record(
+        'drift says the two snapshots share a graph digest',
+        await evaluate(`/graph digest|snapshot|digest/i.test(document.body.textContent)`),
       );
-      record('a drift row drills through to the entity inspector', true);
+    } else {
+      record('drift renders the change summary', await evaluate(`document.body.textContent.includes('Change summary')`));
+      record(
+        'drift renders individual changes with evidence on both sides',
+        // What the view must show is the evidence on each side, so the check looks for the
+        // two labels it renders and any source location. Pinning the check to a list of file
+        // extensions would make it fail whenever the only change happened to be in a file it
+        // did not think of.
+        await evaluate(
+          `document.body.textContent.includes('base:') && document.body.textContent.includes('target:') && /[\\w./-]+\\.[a-z]{1,6}:\\d+/.test(document.body.textContent)`,
+        ),
+      );
+
+      const clicked = await evaluate(`
+        (() => {
+          const button = [...document.querySelectorAll('button')].find((b) => b.textContent === 'inspect entity');
+          if (button) button.click();
+          return !!button;
+        })()
+      `);
+      record('a drift row offers an inspect action', clicked);
+      if (clicked) {
+        await waitFor(
+          `document.body.textContent.includes('Outgoing') || document.body.textContent.includes('Evidence (')`,
+          'drift inspector',
+        );
+        record('a drift row drills through to the entity inspector', true);
+      }
     }
   }
 
