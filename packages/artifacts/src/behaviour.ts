@@ -143,11 +143,15 @@ export function buildSequence(context: ProjectionContext, options: SequenceOptio
     // A call is followed immediately by its own return and its own error path, because the
     // evidence for both is on the same source line. Emitting every call first and every return
     // afterwards would assert an order the source never states.
+    // The arrow id names the flow it was drawn in. `order` alone restarts at 1 for every entry
+    // point, so two flows that both reach `service -> repository` produced two edges with the
+    // same id — which silently collapsed them in the UI, where an arrow is selected by id, and
+    // made the evidence panel show whichever of the two came first (D-049).
     for (const message of drawn) {
       if (message.kind === 'calls') {
         drawnCalls += 1;
         edges.push({
-          id: `seq:${message.order}:${message.from}->${message.to}`,
+          id: `seq:${entry.id}:${message.order}:${message.from}->${message.to}`,
           kind: 'calls',
           source: message.from,
           target: message.to,
@@ -163,7 +167,7 @@ export function buildSequence(context: ProjectionContext, options: SequenceOptio
 
       if (message.kind === 'returns') {
         edges.push({
-          id: `seq:${message.order}:${message.to}->${message.from}`,
+          id: `seq:${entry.id}:${message.order}:${message.to}->${message.from}`,
           kind: 'returns',
           source: message.from,
           target: message.to,
@@ -181,7 +185,7 @@ export function buildSequence(context: ProjectionContext, options: SequenceOptio
 
       errors += 1;
       edges.push({
-        id: `seq:${message.order}:${message.to}->${message.from}`,
+        id: `seq:${entry.id}:${message.order}:${message.to}->${message.from}`,
         kind: 'throws',
         source: message.from,
         target: message.to,

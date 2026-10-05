@@ -79,6 +79,36 @@ describe('joins', () => {
     expect(accesses('SELECT * FROM users, orders')).toEqual(['users:read', 'orders:read']);
   });
 
+  it('reads both tables when each carries an AS alias', () => {
+    // D-051. The alias is two tokens, and stepping over one token consumed the `AS` and
+    // stopped on the alias, so the second table was never read.
+    expect(accesses('SELECT * FROM users AS u, orders AS o WHERE u.id = o.user_id')).toEqual([
+      'users:read',
+      'orders:read',
+    ]);
+  });
+
+  it('reads both tables when the alias follows a schema-qualified name', () => {
+    expect(accesses('SELECT * FROM public.users u, public.orders o')).toEqual(['users:read', 'orders:read']);
+  });
+
+  it('reads the joined table through a two-word join modifier', () => {
+    // D-050. `LEFT OUTER JOIN b` was read as `LEFT` introducing the table, which put a table
+    // named `JOIN` into the graph alongside `b`.
+    expect(accesses('SELECT * FROM a LEFT OUTER JOIN b ON b.id = a.id')).toEqual(['a:read', 'b:read']);
+  });
+
+  it('reads the joined table through a single-token join keyword', () => {
+    // D-050. `STRAIGHT_JOIN b ON 1` reported a table named `ON`.
+    expect(accesses('SELECT * FROM a STRAIGHT_JOIN b ON 1')).toEqual(['a:read', 'b:read']);
+  });
+
+  it('reads every table in a join chain that mixes modifier and bare forms', () => {
+    expect(
+      accesses('SELECT * FROM a FULL OUTER JOIN b ON 1 INNER JOIN c ON 1 LEFT JOIN d ON 1'),
+    ).toEqual(['a:read', 'b:read', 'c:read', 'd:read']);
+  });
+
   it('does not report a function call in FROM as a table', () => {
     expect(accesses('SELECT * FROM generate_series(1, 10)')).toEqual([]);
   });

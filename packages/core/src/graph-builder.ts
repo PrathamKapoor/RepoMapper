@@ -815,12 +815,17 @@ function addCteQuery(
   if (!fromId) return;
 
   for (const name of names) {
-    const cteId = nodeId('constant', `cte:${name}`);
+    // The id carries the defining function. `recent_orders` in one query says nothing about a
+    // `recent_orders` in another, and one id for both merged them into a single node whose two
+    // `produces` edges pointed at different tables — a reader saw one query result fed by two
+    // stores, which no statement in the repository states (D-052).
+    const qualified = `cte:${scopeName}::${name}`;
+    const cteId = nodeId('constant', qualified);
     if (!builder.hasNode(cteId)) {
       builder.addNode({
         kind: 'constant',
         name,
-        qualifiedName: `cte:${name}`,
+        qualifiedName: qualified,
         path: file.path,
         startLine: marker.line,
         evidence: [markerEvidence],
@@ -877,13 +882,17 @@ function addUnclassifiedStatement(
   const scopeName = typeof marker.attributes.scope === 'string' ? marker.attributes.scope : undefined;
   const scoped = scopeName ? symbolIndex.get(scopeName) : undefined;
   const fromId = scoped?.id ?? moduleId;
-  const statementId = nodeId('constant', `statement:${summary}`);
+  // Keyed by location, not by text. Two unreadable `select` statements are two statements, and a
+  // summary-keyed id merged them into one node, so a reader counting unclassified statements saw
+  // one where the repository holds two (D-053).
+  const qualified = `statement:${file.path}:${marker.line}:${summary}`;
+  const statementId = nodeId('constant', qualified);
 
   if (!builder.hasNode(statementId)) {
     builder.addNode({
       kind: 'constant',
       name: summary,
-      qualifiedName: `statement:${summary}`,
+      qualifiedName: qualified,
       path: file.path,
       startLine: marker.line,
       evidence: [markerEvidence],
@@ -1875,12 +1884,9 @@ function addHttpResponses(
         });
       }
 
-if (endpoints.length === 0) {
-        // No route names this function, so there is no requester to point at. The response is
-        // still a fact about the code and is counted on the function node - otherwise a response
-        // written outside any route handler would leave no trace in the graph at all.
-      }
-
+// No route may name this function, in which case there is no requester to point at. The
+      // response is still a fact about the code and is counted on the function node below -
+      // otherwise a response written outside any route handler would leave no trace at all.
       const stagedFor = staged.get(scope.id);
       const known = typeof stagedFor?.httpResponseStatuses === 'string' ? stagedFor.httpResponseStatuses : '';
       const status = marker.attributes.status;

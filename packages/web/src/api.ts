@@ -422,6 +422,12 @@ export interface LineageHop {
   relation: string;
   confidence: Confidence;
   evidence: EvidenceRef[];
+  /** What the statement did to the table, where the relationship recorded one. */
+  operation?: 'read' | 'write';
+  /** The clause the table name appeared in, where recorded. */
+  role?: string;
+  /** The statement the hop came from, where recorded. */
+  statement?: string;
 }
 
 export interface Lineage {
@@ -430,6 +436,12 @@ export interface Lineage {
   upstream: LineageHop[];
   downstream: LineageHop[];
   truncated: boolean;
+  /**
+   * How the subject itself is used, counted by operation. `unclassified` counts relationships
+   * that name no operation, so "nothing here says read or write" is visible as its own number
+   * rather than read as zero writes.
+   */
+  usage: { read: number; write: number; unclassified: number };
 }
 
 // ---------------------------------------------------------------------------

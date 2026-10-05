@@ -729,6 +729,34 @@ describe('test attribution', () => {
     expect(graph.edges.find((edge) => edge.to === cte?.id)?.kind).toBe('produces');
   });
 
+  it('keeps two same-named query expressions in different functions apart', () => {
+    // D-052. A name-keyed id merged `recent_orders` from two functions into one node, so one
+    // query result appeared to be produced from two different tables at once.
+    const graph = build([
+      service([
+        queryMarker('orders', 'read', 'from'),
+        { name: 'sql.cte', line: 3, attributes: { names: 'recent_orders', statement: 'select orders', scope: 'loadAll' } },
+      ]),
+      parsedFile('src/other.ts', {
+        entities: [entity('loadRecent')],
+        markers: [
+          { name: 'sql.query', line: 4, attributes: { operation: 'read', table: 'users', role: 'from', statement: 'select users', scope: 'loadRecent' } },
+          { name: 'sql.cte', line: 4, attributes: { names: 'recent_orders', statement: 'select users', scope: 'loadRecent' } },
+        ],
+      }),
+    ]).graph;
+
+    const expressions = graph.nodes.filter((node) => node.attributes?.queryExpression === true);
+    expect(expressions).toHaveLength(2);
+
+    // Each expression is held by exactly one function, and that function reads exactly one
+    // table. Before the fix both expressions were one node with two producers, which read as
+    // one query result produced from two stores at once.
+    const producers = expressions.map((expression) => graph.edges.find((edge) => edge.to === expression.id)?.from);
+    expect(new Set(producers).size).toBe(2);
+    expect(producers.every((from) => from !== undefined && graph.edges.filter((e) => e.from === from && e.kind === 'reads').length === 1)).toBe(true);
+  });
+
   it('records an unclassifiable statement as evidence with no data relationship', () => {
     const graph = build([
       service([
@@ -749,6 +777,23 @@ describe('test attribution', () => {
     expect(statement?.name).toBe('merge statement');
     expect(statement?.confidence).toBe('UNKNOWN');
     expect(String(statement?.attributes?.reason)).toContain('MERGE');
+  });
+
+  it('counts two unclassifiable statements with identical text as two statements', () => {
+    // D-053. A summary-keyed node id merged them, so a reader counting unread queries saw one
+    // where the repository holds two.
+    const marker = (line: number) => ({
+      name: 'sql.statement',
+      line,
+      attributes: { summary: 'select', unsupported: 'no table reference could be established', scope: 'loadAll' },
+    });
+    const graph = build([
+      service([marker(3), marker(7)]),
+    ]).graph;
+
+    const statements = graph.nodes.filter((node) => node.attributes?.unclassifiedStatement === true);
+    expect(statements).toHaveLength(2);
+    expect(new Set(statements.map((node) => node.id)).size).toBe(2);
   });
 
   it('attaches an unscoped statement to the module and says the scope is unknown', () => {

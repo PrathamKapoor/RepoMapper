@@ -1031,6 +1031,182 @@ the only change happened to be in a file it had not thought of. A verification t
 working views as broken is worse than none, because it trains the reader to ignore it.
 
 ---
+
+## Phase 4 - Richer data access and return messages
+
+### D-049 - A projected arrow's id must be unique within the view, not within a flow
+
+**Decision.** Sequence arrow ids carry the flow they were drawn in: `seq:<entry>:<order>:<from>-><to>`.
+
+**Why.** The order counter restarts at 1 for every entry point, so two endpoints that both reach
+`service -> repository` produced two arrows with the same id. Nothing in the projection noticed,
+because both arrows were genuinely there. The UI did: an arrow is selected by id, so the evidence
+panel showed whichever of the two came first — the right evidence about the wrong interaction. On
+self-analysis, 175 of 1205 sequence arrows shared an id with another arrow.
+
+The id was always the projection's own construct; it was never a graph id. Making it unique costs
+nothing and removes an entire class of "the UI showed me the wrong thing" report.
+
+### D-050 - A join modifier is a step towards `JOIN`, never a place a table can start
+
+**Decision.** `LEFT`, `RIGHT`, `INNER`, `OUTER`, `CROSS`, `NATURAL` and `LATERAL` are walked over
+until the join keyword is found, and the table is read after `JOIN`. `STRAIGHT_JOIN` is treated as a
+join keyword in its own right.
+
+**Why.** Reading the table directly after the modifier produced a table named `JOIN` for
+`LEFT OUTER JOIN b` and one named `ON` for `STRAIGHT_JOIN b ON 1`. Both are the worst kind of defect
+for this product: a fabricated store in a data-flow diagram, with evidence pointing at a real line
+of real SQL. The rule is now that a modifier never introduces a table, and the test suite covers the
+modifier, the compound keyword and a chain mixing both forms.
+
+### D-051 - A comma-separated table list steps over `AS` as well as the alias
+
+**Decision.** `tableListAfter` steps over the table name, an optional `AS`, and an optional alias,
+using the token index past the end of the name rather than assuming it is one token long.
+
+**Why.** `FROM users AS u, orders AS o` reported one table instead of two. The alias is two tokens,
+and the walk consumed the `AS`, treated the alias as the table, and stopped. The same
+one-token-assumption bug hid behind a schema qualifier: `public.users u` consumed `public` as the
+table and `users` as its alias.
+
+An under-read is the more dangerous direction of error here. A missed table makes the data-flow view
+look simpler than the repository is, and nothing in the view says a table was dropped — whereas a
+surplus table is at least visible to a reader who knows the schema.
+
+### D-052 - A CTE's identity is its defining scope, not its name
+
+**Decision.** A query-expression node id is `cte:<enclosing function>::<name>`.
+
+**Why.** Two functions that each defined `recent_orders` over a different table produced one node
+with two `produces` edges pointing into it. The data-flow view then showed a single query result
+produced from two stores at once, which no statement in the repository states. A CTE exists only
+inside its own statement, so its identity has to include the scope that gives it meaning.
+
+### D-053 - An unclassified statement is identified by where it is, not by what it says
+
+**Decision.** An unclassified-statement node id is `statement:<path>:<line>:<summary>`.
+
+**Why.** Same root cause as D-052 with a different symptom: the summary is a description, and two
+different unreadable statements can share one exactly. Merging them made a reader counting unread
+queries see one where the repository holds two — a count that is wrong in the direction that hides
+a limit of the extractor.
+
+### D-054 - Every parser that records a response must also emit the marker the graph reads
+
+**Decision.** The Python extractor emits `http.response` markers alongside `ParsedFile.responses`,
+as the TypeScript extractor already did.
+
+**Why.** The graph builder pairs a response with the endpoint that asked for it by reading markers;
+`ParsedFile.responses` is the extractor's own record and reaches nothing downstream. Python emitted
+only the record, so a FastAPI handler's response was parsed, held in a field, and then dropped. The
+failure mode is indistinguishable from a handler that returns nothing: the graph simply held no
+fact that the endpoint answered.
+
+The general rule this establishes: **an extracted record that no graph rule reads is dead weight,
+and its absence is invisible.** A new `ParsedFile` field is not finished when the parser fills it;
+it is finished when something consumes it, and a test asserts that something does.
+
+### D-055 - `new Response(body)` is a response, and a guard that excludes it is a bug
+
+**Decision.** The response recogniser accepts both `CallExpression` and `NewExpression`; only the
+static `Response` / `NextResponse` constructors qualify, and `new URL(...)` remains not a response.
+
+**Why.** The check for a response constructor was written and then made unreachable by an earlier
+guard that returned for anything that was not a call. Dead code that reads as coverage is worse
+than no code: the next reader believes `new Response(...)` is handled. The regression test now
+asserts both directions — that `new Response(JSON.stringify(rows))` is recorded and that
+`new URL(...)` is not.
+
+### D-056 - A sequence walk is depth-first, because breadth-first draws returns before the calls that precede them
+
+**Decision.** `sequenceMessages` walks depth-first: call, then everything the callee does, then the
+return for that call.
+
+**Why.** With a breadth-first walk, `handler -> service` is emitted, then `service -> database`, then
+`service -> handler` returning — so the diagram shows a callee handing back a value before the work
+that produced it. That is not a cosmetic ordering problem: it asserts a sequence the code does not
+have, and this diagram's entire value is that its arrows can be checked against the source.
+
+Returns are paired by `(callee, caller)` rather than by position, so a return can only ever appear
+against the call it belongs to. The walk stays bounded by depth and a visited set, so a cyclic call
+graph terminates as it did before.
+
+### D-057 - A return is recorded from a return statement, never from the existence of a call
+
+**Decision.** `returns` edges come from `return <callee>(…)`, from a single-assignment local binding
+that the caller returns, or from a response call in a handler. Confidence is `STRONGLY_INFERRED` for
+a direct return, `WEEKLY_INFERRED` for the binding inference, `EXPLICIT` for a response the handler
+writes.
+
+**Why.** The tempting alternative — a call implies a return — produces a complete-looking diagram of
+pure invention. Every arrow has to name the line of source that says it, which is why `returns`
+carries the return statement's evidence and not the call's.
+
+The binding inference is deliberately weaker and labelled. `const rows = await findAll(); return rows;`
+is the most common way a handler returns something, and the return statement names neither the callee
+nor a type. It is recorded, `inferred: true`, with the variable named so a reader can check it. It
+requires exactly one binding for that name: assigned twice, the value returned is not established,
+and no edge is created.
+
+### D-058 - A self-directed return or failure arrow is dropped
+
+**Decision.** A `returns` or `throws` edge whose source and target are the same node is not created.
+
+**Why.** A function does not hand its value to itself. This arises when a returned name resolves to
+the declaration that encloses its use — `return list(...)` inside a method called `list`, or a
+variable shadowing an imported name. The edge would put a loop in a sequence view that the code
+never states, and it is exactly the kind of arrow a reader does not check.
+
+### D-059 - HTTP responses are observed from the response object, never from the route
+
+**Decision.** A response edge exists only where the handler's body contains a response-producing
+call: `res.json`, `res.status(201).json(order)`, `reply.send(x)`, `return Response.json(data)`,
+`return JSONResponse(..., status_code=201)`. Status and method come from that call.
+
+**Why.** The alternative — deriving a response shape from `/users` — is how a sequence diagram ends
+up asserting a response contract the repository never wrote. Naming a route says what the endpoint
+is for; only the code says what it answers with.
+
+The status chained from a configuring call (`res.status(201).json(x)`) is resolved after the walk,
+because the producing call is visited before the configuring call it is built on. Doing it during
+the walk would have missed every chained status.
+
+### D-060 - Unclassified SQL is a fact, and it is reported rather than dropped
+
+**Decision.** A statement the analyser recognises and declines to classify produces a node carrying
+the reason, a consistency finding, and an entry in the data-flow view's `omitted[]`.
+
+**Why.** "No database access here" and "there is a query here I could not read" are different facts,
+and only one of them is a statement about the repository. The Phase 3 behaviour — a parser limitation
+surfacing as silence — is the specific confusion D-012 warned about, so the distinction is carried
+into three places: the graph, the artifact's omission log, and the consistency report.
+
+### D-061 - ORM and query-builder extraction remains unsupported
+
+**Decision.** No ORM or query-builder is supported. `reads` and `writes` come from table names in SQL
+the extractor read.
+
+**Why.** Each framework would need its own rules, and each set of rules is a set of guesses about
+which call touches which table: `db.users.findMany()` does not name `users` as a store the way
+`FROM users` does, and a rule that maps the first path segment to a table name produces data flow for
+repositories that never declared it. The consistency engine already reports a declared table that
+nothing reads or writes as `MISSING_EVIDENCE` with the reason, so the gap is visible and correctly
+attributed to the extractor rather than to the repository.
+
+This is recorded as a deliberate boundary, not an oversight. It is the largest remaining gap in the
+data views, and it is the first item after Phase 4.
+
+### D-062 - Python records no `constructor` return shape
+
+**Decision.** A returned `User(1)` is recorded as `kind: 'call'`.
+
+**Why.** Python writes a constructor exactly like a call and has no `new`. Distinguishing them
+requires a naming convention, and a naming convention is not a statement in the source. The previous
+code carried a `constructor` branch whose pattern was byte-identical to the `call` pattern above it,
+so it could never fire — a test asserting constructor returns on the Python side would have been a
+test that could not fail.
+
+---
 ## Deferred, with reasons
 
 Recorded so these are not mistaken for oversights.
@@ -1038,6 +1214,8 @@ Recorded so these are not mistaken for oversights.
 | Item | Why deferred |
 |---|---|
 | C4 architecture, sequence, DFD, use-case, activity, deployment diagrams | **Partly resolved across Phases 2 and 3.** C4 levels 1-3 (D-033, D-034) plus the sequence, activity, data-flow, ER, use-case and traceability views are implemented as evidence-grounded projections. A dedicated deployment view remains deferred: a repository states containers and images, not the topology between them at runtime. |
+| ORM and query-builder data access | **Unsupported by decision** (D-061). `reads` and `writes` come from table names in SQL the extractor read. Each framework would require guessing which call touches which store, and a declared table that nothing reads is already reported as missing evidence rather than as a finding against the repository. |
+| Column-level data lineage | Not implemented. Every lineage hop is table-level, because that is what a SQL statement names. A column-level edge would have to be inferred from a projection list the extractor does not yet resolve. |
 | Requirements and traceability | **Resolved in Phase 3** for what a repository can state: requirements read from documents, use cases over evidenced entry points, and the requirement -> use case -> implementation -> test chain (D-042, D-044, D-046). Business requirements held in an issue tracker, or implied by convention, remain out of reach and are reported as not recovered. |
 | Consistency and drift engine | **Implemented in Phases 2 and 3** (D-026 - D-030, D-043). Drift answers what changed; the consistency engine answers what the views disagree about. Semantics-level contradiction detection - two documents describing the same entity differently - is still deferred: it needs an understanding of prose this product does not have. |
 | Symbol-level and Git-corroborated rename detection | D-029 records the module-level content-identity rule in force and why the stronger sources are not used yet. |

@@ -68,9 +68,21 @@ const SQL_KEYWORDS = new Set([
   'VACUUM', 'ANALYZE', 'PRAGMA', 'USE', 'SHOW', 'DESCRIBE', 'REPLACE', 'UPSERT',
 ]);
 
-/** Clause keywords that introduce a table reference. */
+/** The join keyword itself. */
 const JOIN_WORDS = new Set(['JOIN']);
-const JOIN_PREFIXES = ['INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'NATURAL', 'OUTER', 'STRAIGHT_JOIN', 'LATERAL'];
+
+/**
+ * Words that may sit between the join keyword and the table, or stand in for it.
+ *
+ * `LEFT OUTER JOIN t` has two modifiers before `JOIN`; `STRAIGHT_JOIN t` has the join folded
+ * into one token. Treating a modifier as if the table followed it directly produced a *table
+ * named `ON`* for `STRAIGHT_JOIN b ON …` and a table named `JOIN` for `LEFT OUTER JOIN b`
+ * (D-050). A modifier is therefore a step towards `JOIN`, never a place a table can start.
+ */
+const JOIN_MODIFIERS = new Set(['INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'NATURAL', 'OUTER', 'LATERAL']);
+
+/** Join keywords written as a single token rather than `MODIFIER JOIN`. */
+const COMPOUND_JOIN_WORDS = new Set(['STRAIGHT_JOIN']);
 
 /** What a DDL or privilege verb needs before the text is a statement rather than a sentence. */
 const SCHEMA_OBJECT_WORDS = new Set([
@@ -382,7 +394,6 @@ function analyzeOne(segment: string): SqlStatementAnalysis | null {
     const token = tokens[index]!;
     if (token.kind !== 'word') continue;
     const word = token.value.toUpperCase();
-    const isJoin = JOIN_WORDS.has(word) || JOIN_PREFIXES.includes(word);
 
     if (word === 'FROM') {
       // DELETE's first FROM names the rows being deleted; every later FROM is a read.
@@ -400,9 +411,23 @@ function analyzeOne(segment: string): SqlStatementAnalysis | null {
       continue;
     }
 
-    if (isJoin) {
-      // `LEFT JOIN x`, `CROSS JOIN y`, or a bare `JOIN z`: the table follows the keyword.
-      const offset = JOIN_PREFIXES.includes(word) ? index + 1 : index;
+    if (JOIN_WORDS.has(word) || COMPOUND_JOIN_WORDS.has(word)) {
+      // The table follows the join keyword. For `STRAIGHT_JOIN` that is the compound token
+      // itself; for a bare `JOIN` it is the next token.
+      const read = tableReferenceAt(tokens, index + 1, cteNames);
+      if (read) accesses.push({ ...read, operation: 'read', role: 'join' });
+      continue;
+    }
+
+    if (JOIN_MODIFIERS.has(word)) {
+      // `LEFT`, `OUTER`, `INNER` … step forward over any further modifiers until the join
+      // keyword, then read the table after it. `LEFT JOIN x` and `LEFT OUTER JOIN x` therefore
+      // agree, and neither reads the following token as a table.
+      let offset = index;
+      while (tokens[offset]?.kind === 'word' && JOIN_MODIFIERS.has(tokens[offset]!.value.toUpperCase())) {
+        offset += 1;
+      }
+      if (!JOIN_WORDS.has(String(tokens[offset]?.value ?? '').toUpperCase())) continue;
       const read = tableReferenceAt(tokens, offset + 1, cteNames);
       if (read) accesses.push({ ...read, operation: 'read', role: 'join' });
       continue;
@@ -487,7 +512,7 @@ function tableReferenceAt(
   index: number,
   ctes: ReadonlySet<string>,
   allowParen = false,
-): { table: string } | null {
+): { table: string; end: number } | null {
   const token = tokens[index];
   if (!token) return null;
   if (token.kind !== 'word' && token.kind !== 'quoted') return null;
@@ -503,12 +528,16 @@ function tableReferenceAt(
 
   // `FROM table(col)` and `FROM generate_series(…)` are expressions, not stores — unless the
   // parenthesis is the column list of a write target.
-  if (!allowParen && isPunct(tokens[offset + 1], '(')) return null;
+  let end = offset + 1;
+  if (isPunct(tokens[end], '(')) {
+    if (!allowParen) return null;
+    end = skipBalanced(tokens, end);
+  }
 
   const bare = last.value.split('.').at(-1)?.replace(/^["`[]|["`\]]$/g, '').trim() ?? '';
   if (bare.length === 0) return null;
   if (ctes.has(bare.toLowerCase())) return null;
-  return { table: bare };
+  return { table: bare, end };
 }
 
 /**
@@ -517,6 +546,11 @@ function tableReferenceAt(
  * Only the first element can be followed by an alias, so the walk stops at anything that is not
  * another comma-separated name. That means `FROM a, b WHERE x` yields both tables and
  * `FROM a, count(*)` yields only `a`, which is the correct reading of the second form.
+ *
+ * The alias may be written with `AS`, which is two tokens rather than one. Stepping over only a
+ * single word consumed the `AS` and stopped on the alias, so `FROM a AS x, b AS y` reported one
+ * table instead of two — an under-read, and the more dangerous direction of error for a tool
+ * whose claims are meant to be complete (D-051).
  */
 function tableListAfter(tokens: readonly SqlToken[], index: number, ctes: ReadonlySet<string>): { table: string }[] {
   const found: { table: string }[] = [];
@@ -525,11 +559,13 @@ function tableListAfter(tokens: readonly SqlToken[], index: number, ctes: Readon
   for (let consumed = 0; consumed < 8; consumed += 1) {
     const reference = tableReferenceAt(tokens, position, ctes);
     if (!reference) break;
-    found.push(reference);
+    found.push({ table: reference.table });
 
-    // Step over the table, an optional alias, then look for a comma.
-    let next = position + 1;
-    if (isPunct(tokens[next], '(')) next = skipBalanced(tokens, next);
+    // Step over the table, an optional alias (`x` or `AS x`), then look for a comma.
+    // `end` is past the last token of the name, so `public.users u` steps over three tokens
+    // rather than treating `users` as the alias and stopping on the comma-less `u`.
+    let next = reference.end;
+    if (isWord(tokens[next], 'AS')) next += 1;
     if (tokens[next] && (tokens[next]!.kind === 'word' || tokens[next]!.kind === 'quoted') && !isPunct(tokens[next + 1], '.')) {
       if (SQL_KEYWORDS.has(tokens[next]!.value.toUpperCase())) break;
       next += 1;

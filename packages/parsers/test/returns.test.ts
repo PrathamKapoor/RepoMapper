@@ -124,6 +124,18 @@ describe('HTTP responses', () => {
     const result = parseTs('function handler() {\n  render(rows);\n  save(payload);\n}');
     expect(result.responses).toHaveLength(0);
   });
+
+  it('records a constructed Response, which is not a call expression', () => {
+    // D-055. The guard rejected anything that was not a `CallExpression`, which dropped
+    // `new Response(body)` before the check written to accept it could run.
+    const result = parseTs('function handler() {\n  return new Response(JSON.stringify(rows));\n}');
+    expect(result.responses?.[0]).toMatchObject({ method: 'Response', returned: true });
+  });
+
+  it('does not treat an unrelated constructor as a response', () => {
+    const result = parseTs('function handler() {\n  return new URL("https://example.test");\n}');
+    expect(result.responses).toHaveLength(0);
+  });
 });
 
 describe('error paths', () => {
@@ -198,5 +210,26 @@ describe('python returns, raises and responses', () => {
   it('records a response object call', () => {
     const result = parsePy('def handler(request):\n    response.json({"id": 1})\n');
     expect(result.responses?.[0]).toMatchObject({ method: 'json' });
+  });
+
+  it('emits the marker that carries a response to the graph, not only the record', () => {
+    // D-054. The graph builder pairs a response with the endpoint that asked for it by reading
+    // the marker. Python emitted the record only, so a FastAPI response was extracted and then
+    // discarded: the graph held no fact that the handler answered at all.
+    const result = parsePy('def handler():\n    return JSONResponse({"id": 1}, status_code=201)\n');
+    const marker = result.markers.find((entry) => entry.name === 'http.response');
+    expect(marker).toMatchObject({ attributes: { method: 'JSONResponse', status: 201, scope: 'handler' } });
+  });
+
+  it('emits the marker for a response-object call too', () => {
+    const result = parsePy('def handler(request):\n    response.status_code = 404\n    response.json({"id": 1})\n');
+    expect(result.markers.some((entry) => entry.name === 'http.response')).toBe(true);
+  });
+
+  it('classifies a returned call as a call, not a constructor', () => {
+    // Python writes `User(id)` exactly like a call, and there is no `new`. Recording a
+    // constructor here would be a naming convention stated as a fact.
+    const result = parsePy('def make():\n    return User(1)\n');
+    expect(result.returns?.[0]).toMatchObject({ kind: 'call', name: 'User' });
   });
 });

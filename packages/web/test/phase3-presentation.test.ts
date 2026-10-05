@@ -9,10 +9,12 @@ import {
   requirementStatusLabel,
   traceView,
 } from '../src/presentation';
+import { describeUsage, hopStatement } from '../src/phase3';
 import type {
   ConsistencyClass,
   ConsistencyFinding,
   ConsistencyReport,
+  LineageHop,
   Requirement,
   Traceability,
 } from '../src/api';
@@ -266,5 +268,42 @@ describe('chain counts', () => {
 
   it('reports zeros for a chain that has not loaded', () => {
     expect(chainCounts(null).every((entry) => entry.count === 0)).toBe(true);
+  });
+});
+
+describe('lineage wording', () => {
+  const hop = (over: Partial<LineageHop>): LineageHop => ({
+    edgeId: 'e',
+    direction: 'outbound',
+    from: 'function:save',
+    to: 'table:orders',
+    relation: 'writes',
+    confidence: 'EXPLICIT',
+    evidence: [],
+    ...over,
+  });
+
+  it('names the operation on a hop rather than leaving the reader to infer it', () => {
+    expect(hopStatement(hop({ operation: 'write', role: 'insert_into', statement: 'insert orders' }))).toContain('write');
+    expect(hopStatement(hop({ operation: 'read', role: 'join' }))).toContain('read');
+  });
+
+  it('says a hop records no operation rather than implying a read', () => {
+    // The dangerous default: a relationship with no stated operation shown as "read" claims
+    // something the graph never said.
+    expect(hopStatement(hop({}))).toBe('no operation recorded for this relationship');
+  });
+
+  it('reports a write and a read as separate facts', () => {
+    const sentence = describeUsage({ read: 3, write: 1, unclassified: 0 });
+    expect(sentence).toContain('written by 1');
+    expect(sentence).toContain('read by 3');
+  });
+
+  it('distinguishes nothing recorded from nothing accessed', () => {
+    expect(describeUsage({ read: 0, write: 0, unclassified: 0 })).toBe(
+      'not read or written by any recorded data relationship',
+    );
+    expect(describeUsage({ read: 0, write: 0, unclassified: 2 })).toContain('recording no operation');
   });
 });

@@ -314,6 +314,42 @@ describe('sequence projection', () => {
     for (const edge of sequenceOf().edges) expect(hasGraphSupport(edge)).toBe(true);
   });
 
+  it('gives every arrow a distinct id, even when two flows make the same call', () => {
+    // D-049. The order counter restarts per flow, so `seq:2:service->repo` was produced once
+    // per entry point. Two edges with one id cannot be told apart in a view that selects an
+    // arrow by id, so the evidence panel showed whichever came first.
+    const shared = graphOf([
+      parsedFile('src/routes.ts', {
+        entities: [fn('handler', 1, 6)],
+        markers: [
+          { name: 'http.route', line: 1, attributes: { httpMethod: 'GET', path: '/a', handler: 'handler' } },
+          { name: 'http.route', line: 3, attributes: { httpMethod: 'GET', path: '/b', handler: 'handler' } },
+        ],
+      }),
+      parsedFile('src/handler.ts', {
+        entities: [fn('handler', 1, 6, true), fn('service', 10, 20, true)],
+        calls: [
+          {
+            callee: 'service',
+            line: 4,
+            fromQualifiedName: 'handler',
+            isLocalIdentifier: true,
+            argCount: 1,
+            awaited: true,
+            result: { kind: 'awaited_call', name: 'service', line: 4, awaited: true },
+          },
+        ],
+        returns: [{ line: 4, fromQualifiedName: 'handler', kind: 'awaited_call', name: 'service', awaited: true }],
+      }),
+    ]);
+    const artifact = sequenceOf(shared);
+    const ids = artifact.edges.map((edge) => edge.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    // Both flows reach the same call, so the shared leg is drawn once per flow and both copies
+    // must remain individually addressable.
+    expect(artifact.edges.filter((edge) => edge.source === 'function:handler' && edge.target === 'function:service')).toHaveLength(2);
+  });
+
   it('is deterministic', () => {
     expect(JSON.stringify(sequenceOf())).toBe(JSON.stringify(sequenceOf()));
   });

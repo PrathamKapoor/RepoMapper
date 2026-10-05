@@ -1058,35 +1058,40 @@ function isLiteralExpression(node: ts.Expression): boolean {
  * response shape it did not write.
  */
 function recordHttpResponse(node: ts.Node, ctx: WalkContext): void {
-  if (!ts.isCallExpression(node)) return;
-  const callee = calleeName(node.expression);
+  // `new Response(body)` is a NewExpression, not a call, so a guard on `isCallExpression`
+  // dropped it before the constructor check that was written to accept it (D-055).
+if (!ts.isCallExpression(node) && !ts.isNewExpression(node)) return;
+  const expression = node.expression;
+  const callee = calleeName(expression);
   if (!callee) return;
 
   const method = callee.split('.').at(-1) ?? callee;
+  const isCall = ts.isCallExpression(node);
 
   // A configuring call records its status for the producing call that is built on it.
-  if (RESPONSE_CONFIGURERS.has(method)) {
+  if (RESPONSE_CONFIGURERS.has(method) && isCall) {
     const status = literalStatusArgument(node);
     if (status !== undefined) ctx.responseStatus.set(node, status);
     return;
   }
 
-  const isMemberCall = callee.includes('.') && RESPONSE_METHODS.has(method);
-  const isResponseConstructor = callee === 'Response.json' || callee === 'Response.redirect' || callee === 'NextResponse.json' || callee === 'NextResponse.redirect' || newExpressionName(node) === 'Response';
+  const isMemberCall = isCall && callee.includes('.') && RESPONSE_METHODS.has(method);
+  const isResponseConstructor =
+    (isCall && (callee === 'Response.json' || callee === 'Response.redirect' || callee === 'NextResponse.json' || callee === 'NextResponse.redirect')) ||
+    callee === 'Response';
   if (!isMemberCall && !isResponseConstructor) return;
-  if (isMemberCall && !RESPONSE_METHODS.has(method)) return;
 
-const line = lineOf(ctx, safeStart(node, ctx));
-  const payload = node.arguments[0];
+  const line = lineOf(ctx, safeStart(node, ctx));
+  const payload = node.arguments?.[0];
   const payloadShape = payload ? classifyReturnedExpression(payload, line, ctx) : undefined;
-  const own = literalStatusArgument(node);
+  const own = isCall ? literalStatusArgument(node) : undefined;
 
   // `res.status(201).json(order)`: the configuring call is the receiver of this one, and a parent
   // is walked before its children, so the status is not in the map yet. The pair is remembered
   // and resolved after the walk, which is the only point at which both calls have been seen.
-  const receiver = node.expression;
+  const receiver = isCall ? node.expression : undefined;
   const pendingStatus =
-    ts.isPropertyAccessExpression(receiver) && ts.isCallExpression(receiver.expression)
+    receiver !== undefined && ts.isPropertyAccessExpression(receiver) && ts.isCallExpression(receiver.expression)
       ? { producer: node, configurer: receiver.expression }
       : undefined;
 
@@ -1125,18 +1130,15 @@ const line = lineOf(ctx, safeStart(node, ctx));
 function resolveChainedResponseStatuses(ctx: WalkContext): void {
   if (ctx.pendingResponseStatus.length === 0) return;
 
-  const statusByLine = new Map(ctx.responseStatus);
   for (const { producer, configurer } of ctx.pendingResponseStatus) {
     const status = ctx.responseStatus.get(configurer);
     if (status === undefined) continue;
-    const response = ctx.result.responses?.find((entry) => entry.line === lineOf(ctx, safeStart(producer, ctx)));
+    const line = lineOf(ctx, safeStart(producer, ctx));
+    const response = ctx.result.responses?.find((entry) => entry.line === line);
     if (response && response.status === undefined) response.status = status;
-    const marker = ctx.result.markers.find(
-      (entry) => entry.name === 'http.response' && entry.line === lineOf(ctx, safeStart(producer, ctx)),
-    );
+    const marker = ctx.result.markers.find((entry) => entry.name === 'http.response' && entry.line === line);
     if (marker && marker.attributes.status === undefined) marker.attributes.status = status;
   }
-  void statusByLine;
 }
 
 /** Status literal from `res.status(201)`, when the code states a number. */
@@ -1148,11 +1150,7 @@ function literalStatusArgument(node: ts.CallExpression): number | undefined {
   return undefined;
 }
 
-/** `new Response(…)`, reduced to the constructor name. */
-function newExpressionName(node: ts.Node): string | undefined {
-  if (!ts.isNewExpression(node)) return undefined;
-  return calleeName(node.expression) ?? undefined;
-}
+
 
 function unwrapParens(node: ts.Expression): ts.Expression {
   let current = node;

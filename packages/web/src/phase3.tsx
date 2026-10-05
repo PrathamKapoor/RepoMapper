@@ -6,6 +6,7 @@ import {
   type ConsistencyFinding,
   type ConsistencyReport,
   type Lineage,
+  type LineageHop,
   type Requirement,
   type RequirementModel,
   type Traceability,
@@ -807,6 +808,55 @@ export interface LineagePanelProps {
   nodeId: string;
 }
 
+/** How a table name's role in a statement reads to a reader. */
+const ROLE_PHRASES: Record<string, string> = {
+  from: 'FROM',
+  join: 'JOIN',
+  insert_into: 'INSERT target',
+  update_target: 'UPDATE target',
+  delete_target: 'DELETE target',
+  delete_using: 'USING',
+};
+
+/**
+ * One hop in words, or an honest statement that the hop records no operation.
+ *
+ * The operation is the difference between "this is where a value is persisted" and "this is
+ * where it is read", so it is never inferred from the direction of the hop. A relationship with
+ * no operation says so rather than defaulting to a read.
+ */
+export function hopStatement(hop: LineageHop): string {
+  const parts: string[] = [];
+  if (hop.operation) parts.push(hop.operation === 'write' ? 'write' : 'read');
+  if (hop.role) parts.push(`from the ${ROLE_PHRASES[hop.role] ?? hop.role} clause`);
+  if (hop.statement) parts.push(`statement \`${hop.statement}\``);
+  if (parts.length === 0) return 'no operation recorded for this relationship';
+  return parts.join(', ');
+}
+
+/**
+ * One sentence about how a store is used.
+ *
+ * Written rather than concatenated from counts so that "nothing states an operation" is
+ * distinguishable from "nothing reads it" - the first is a limit of the extraction, the second
+ * is a fact about the repository.
+ */
+export function describeUsage(usage: { read: number; write: number; unclassified: number }): string {
+  const parts: string[] = [];
+  if (usage.write > 0) parts.push(`written by ${usage.write} recorded operation(s)`);
+  if (usage.read > 0) parts.push(`read by ${usage.read} recorded operation(s)`);
+  const qualified = usage.unclassified > 0 ? `${usage.unclassified} relationship(ies) recording no operation` : '';
+  if (parts.length === 0) {
+    // No operation anywhere. Whether the store is touched at all is a different question, and
+    // the unclassified count is the only thing the graph can say about it.
+    return qualified.length > 0
+      ? `${qualified}; the repository states no read or write for it`
+      : 'not read or written by any recorded data relationship';
+  }
+  const sentence = parts.join(' and ');
+  return qualified.length > 0 ? `${sentence}, with ${qualified}` : sentence;
+}
+
 /**
  * Where a value came from and where it goes.
  *
@@ -850,10 +900,21 @@ export function LineagePanel({ analysisId, nodeId }: LineagePanelProps): React.R
 
   return (
     <div>
-      <p className="small dim">
+<p className="small dim">
         {lineage.upstream.length} hop(s) upstream, {lineage.downstream.length} downstream
-        {lineage.truncated ? ', truncated at the hop limit — this chain is longer than the view shows' : ''}.
+        {lineage.truncated ? ', truncated at the hop limit - this chain is longer than the view shows' : ''}.
       </p>
+
+      {/*
+        Read and write are counted separately because they answer different questions, and a
+        merged number is how a reader ends up believing a store is persisted when it is only
+        read. `unclassified` is shown too: a relationship that states no operation must not be
+        reported as "no writes".
+      */}
+      <p className="small" style={{ margin: '6px 0' }}>
+        <strong>{lineage.subjectName}</strong> is {describeUsage(lineage.usage)}.
+      </p>
+
       <table>
         <thead>
           <tr>
@@ -861,6 +922,7 @@ export function LineagePanel({ analysisId, nodeId }: LineagePanelProps): React.R
             <th style={{ width: 120 }}>Relationship</th>
             <th>From → to</th>
             <th style={{ width: 130 }}>Confidence</th>
+            <th style={{ width: 190 }}>Stated by</th>
           </tr>
         </thead>
         <tbody>
@@ -874,6 +936,7 @@ export function LineagePanel({ analysisId, nodeId }: LineagePanelProps): React.R
               <td>
                 <ConfidenceBadge value={hop.confidence} />
               </td>
+              <td className="small dim">{hopStatement(hop)}</td>
             </tr>
           ))}
         </tbody>

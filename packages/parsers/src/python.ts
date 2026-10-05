@@ -671,16 +671,15 @@ function recordPythonThrow(line: LogicalLine, result: ParsedFile, enclosing: str
  * FastAPI and Flask both answer by returning an object; Starlette answers by calling a method on
  * a response object. Both shapes appear, and neither is inferred from a route name.
  */
-function recordPythonResponse(line: LogicalLine, result: ParsedFile, _enclosing: string | undefined): void {
+function recordPythonResponse(line: LogicalLine, result: ParsedFile, enclosing: string | undefined): void {
   const returned = result.returns?.find((entry) => entry.line === line.line);
-  const code = line.code;
+const code = line.code;
 
   // `return JSONResponse({...}, status_code=201)` and `return {"k": "v"}` from a handler.
   if (returned) {
     const jsonResponse = /\b(JSONResponse|PlainTextResponse|HTMLResponse|RedirectResponse|Response)\s*\(/.exec(returned.expression ?? '');
     if (jsonResponse) {
-      (result.responses ??= []).push({
-        line: line.line,
+      recordPythonResponseAt(line, result, enclosing, {
         method: jsonResponse[1] ?? 'Response',
         ...(pythonStatusArgument(returned.expression ?? '') !== undefined ? { status: pythonStatusArgument(returned.expression ?? '') } : {}),
         returned: true,
@@ -692,11 +691,40 @@ function recordPythonResponse(line: LogicalLine, result: ParsedFile, _enclosing:
   // `response.json(...)` / `return response.json(...)` on a response object.
   const methodCall = /\bresponse\.(json|send|send_status|redirect|write|make_response)\s*\(/.exec(code);
   if (!methodCall?.[1]) return;
-  (result.responses ??= []).push({
-    line: line.line,
+  recordPythonResponseAt(line, result, enclosing, {
     method: methodCall[1],
     ...(pythonStatusArgument(code) !== undefined ? { status: pythonStatusArgument(code) } : {}),
     ...(returned ? { returned: true } : {}),
+  });
+}
+
+/**
+ * Records a response and emits the marker the graph builder reads.
+ *
+ * Both halves are needed. The graph builder pairs a response with the endpoint that asked for
+ * it, and it finds that pairing through the marker rather than through `ParsedFile.responses`.
+ * The TypeScript extractor has always emitted both; Python emitted only the record, so a
+ * FastAPI handler's response was extracted, held in memory, and never became a graph fact —
+ * the same code path with the marker missing reads as "this repository returns nothing"
+ * (D-054).
+ */
+function recordPythonResponseAt(
+  line: LogicalLine,
+  result: ParsedFile,
+  enclosing: string | undefined,
+  response: Omit<NonNullable<ParsedFile['responses']>[number], 'line'>,
+): void {
+  (result.responses ??= []).push({ ...response, line: line.line });
+  result.markers.push({
+    name: 'http.response',
+    line: line.line,
+    attributes: {
+      method: response.method,
+      ...(response.status !== undefined ? { status: response.status } : {}),
+      ...(response.payload ? { payload: response.payload } : {}),
+      ...(response.payloadKind ? { payloadKind: response.payloadKind } : {}),
+      ...(enclosing ? { scope: enclosing } : {}),
+    },
   });
 }
 
@@ -705,13 +733,17 @@ function pythonStatusArgument(expression: string): number | undefined {
   return match?.[1] ? Number(match[1]) : undefined;
 }
 
-/** Classifies a Python expression the way the TypeScript side classifies a returned one. */
+/**
+ * Classifies a Python expression the way the TypeScript side classifies a returned one.
+ *
+ * Python has no `new` keyword: `User(id)` is written identically to a call, so a constructor
+ * cannot be distinguished from a function call by its syntax alone. Classifying by capitalisation
+ * would be a naming convention, not a statement in the source, so `constructor` is never produced
+ * here — the shape is recorded as the call it literally is.
+ */
 function pythonExpressionShape(expression: string): Pick<CallResult, 'kind' | 'name'> {
   const call = /^([A-Za-z_][\w.]*)\s*\(/.exec(expression);
   if (call?.[1]) return { kind: 'call', name: call[1] };
-
-  const constructed = /^([A-Za-z_][\w.]*)\s*\(/.exec(expression);
-  if (constructed?.[1]) return { kind: 'constructor', name: constructed[1] };
 
   if (/^[A-Za-z_]\w*$/.test(expression)) return { kind: 'identifier', name: expression };
   if (/^[([{]/.test(expression)) return { kind: 'literal' };
