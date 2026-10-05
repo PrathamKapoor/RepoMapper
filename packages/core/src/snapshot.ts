@@ -27,11 +27,17 @@ import type { GraphStats, SoftwareGraph } from './types.js';
 /**
  * Version of the extraction behaviour.
  *
- * Bump when a change to any parser, marker rule, or graph-construction rule can alter
- * the facts produced from unchanged source. A cosmetic change (comments, formatting)
+ * Bump when a change to any parser, marker rule, or graph-construction rule can alter the
+ * facts produced from unchanged source. A cosmetic change (comments, formatting)
  * must not bump it, or drift between consecutive analyses becomes meaningless.
+ *
+ * 1.1.0 - Phase 4. The SQL scanner reads every table in a statement rather than only a single
+ * FROM, records joins, subqueries, CTEs and set operations, and requires a verb to carry the
+ * clause it needs before treating text as a statement. Return, rejection and HTTP-response
+ * records became graph facts. Unchanged source therefore produces different facts than it did
+ * under 1.0.0, and a snapshot taken then must not compare as though nothing changed.
  */
-export const EXTRACTOR_VERSION = '1.0.0';
+export const EXTRACTOR_VERSION = '1.1.0';
 
 /** Field separators for the canonical digest input. Control characters, never in source. */
 const UNIT = '';

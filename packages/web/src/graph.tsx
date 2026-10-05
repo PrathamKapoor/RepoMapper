@@ -6,6 +6,7 @@ import {
   ReactFlow,
   ReactFlowProvider,
   type Edge,
+  type EdgeMouseHandler,
   type Node,
   type NodeMouseHandler,
 } from '@xyflow/react';
@@ -49,9 +50,11 @@ function colourFor(kind: string): string {
 
 export interface AtlasGraphProps {
   nodes: { id: string; label: string; kind: string; confidence: Confidence; detail?: string; path?: string }[];
-  edges: { id: string; source: string; target: string; confidence: Confidence; label?: string }[];
+  edges: { id: string; source: string; target: string; confidence: Confidence; label?: string; kind?: string }[];
   /** Invoked when a node is clicked, to open the entity inspector. */
   onSelectNode?: (nodeId: string) => void;
+  /** Invoked when an arrow is clicked, to open the interaction evidence. */
+  onSelectEdge?: (edgeId: string) => void;
   height?: number;
   /** Cap on rendered nodes; the UI states when it is truncated rather than silently cutting. */
   maxNodes?: number;
@@ -59,9 +62,10 @@ export interface AtlasGraphProps {
 
 interface AtlasInnerProps extends AtlasGraphProps {
   onNodeClick: NodeMouseHandler<Node>;
+  onEdgeClick: EdgeMouseHandler;
 }
 
-function AtlasInner({ nodes, edges, onNodeClick, height = 520, maxNodes = 220 }: AtlasInnerProps): React.ReactElement {
+function AtlasInner({ nodes, edges, onNodeClick, onEdgeClick, height = 520, maxNodes = 220 }: AtlasInnerProps): React.ReactElement {
   const visible = useMemo(() => nodes.slice(0, maxNodes), [nodes, maxNodes]);
   const visibleIds = useMemo(() => new Set(visible.map((node) => node.id)), [visible]);
 
@@ -123,6 +127,7 @@ function AtlasInner({ nodes, edges, onNodeClick, height = 520, maxNodes = 220 }:
           nodes={layouted}
           edges={layoutedEdges}
           onNodeClick={onNodeClick}
+          onEdgeClick={onEdgeClick}
           nodesDraggable
           nodesConnectable={false}
           elementsSelectable
@@ -159,9 +164,19 @@ export function AtlasGraph(props: AtlasGraphProps): React.ReactElement {
     [props],
   );
 
+  // An arrow is a claim, so it is selectable: which call it came from, what confidence it was
+  // recorded at and where the source states it. Selecting the two participants instead would
+  // show what exists, not what the repository says happens between them.
+  const handleEdgeClick = useCallback<EdgeMouseHandler>(
+    (_event, edge) => {
+      props.onSelectEdge?.(edge.id);
+    },
+    [props],
+  );
+
   return (
     <ReactFlowProvider>
-      <AtlasInner {...props} onNodeClick={handleNodeClick} />
+      <AtlasInner {...props} onNodeClick={handleNodeClick} onEdgeClick={handleEdgeClick} />
     </ReactFlowProvider>
   );
 }
@@ -171,6 +186,8 @@ export interface GraphViewProps {
   loading: boolean;
   error: string | null;
   onSelectNode: (nodeId: string) => void;
+  /** Invoked when an arrow is clicked. Kept optional so a caller that only reads the shape can ignore it. */
+  onSelectEdge?: (edgeId: string) => void;
 }
 
 /**
@@ -180,7 +197,7 @@ export interface GraphViewProps {
  * explains what would be needed — instead of rendering an empty canvas that reads as a
  * successful result.
  */
-export function GraphView({ artifact, loading, error, onSelectNode }: GraphViewProps): React.ReactElement {
+export function GraphView({ artifact, loading, error, onSelectNode, onSelectEdge }: GraphViewProps): React.ReactElement {
   if (loading) return <Empty>Loading projection…</Empty>;
   if (error) return <Notice kind="error">{error}</Notice>;
   if (!artifact) return <Notice kind="warning">This projection is not available for the selected analysis.</Notice>;
@@ -199,7 +216,12 @@ export function GraphView({ artifact, loading, error, onSelectNode }: GraphViewP
         </Notice>
       ) : null}
 
-      <AtlasGraph nodes={artifact.nodes} edges={artifact.edges} onSelectNode={onSelectNode} />
+      <AtlasGraph
+        nodes={artifact.nodes}
+        edges={artifact.edges}
+        onSelectNode={onSelectNode}
+        onSelectEdge={onSelectEdge}
+      />
 
       {artifact.omitted.length > 0 ? (
         <div className="card" style={{ marginTop: 14 }}>

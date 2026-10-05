@@ -74,6 +74,7 @@ interface SnapshotOptions {
   branch?: string | null;
   truncated?: boolean;
   extractorVersion?: string;
+  graphSchemaVersion?: number;
 }
 
 function snapshotOf(graph: SoftwareGraph, options: SnapshotOptions = {}): AnalysisSnapshot {
@@ -87,6 +88,7 @@ function snapshotOf(graph: SoftwareGraph, options: SnapshotOptions = {}): Analys
     truncated: options.truncated ?? false,
     graph,
     ...(options.extractorVersion ? { extractorVersion: options.extractorVersion } : {}),
+    ...(options.graphSchemaVersion ? { graph: { ...graph, schemaVersion: options.graphSchemaVersion } } : {}),
   };
   return createSnapshot(input);
 }
@@ -201,6 +203,31 @@ describe('snapshot identity', () => {
     expect(report.comparable).toBe(false);
     expect(report.incomparabilityReason).toContain('Extractor versions differ');
     expect(report.changes).toHaveLength(0);
+  });
+
+  it('refuses to compare a Phase 3 graph with a Phase 4 graph of the same repository', () => {
+    // Phase 4 changed what the model holds. Two graphs of identical source that describe
+    // different facts must not be diffed against each other, even under one extractor version.
+    const before = snapshotOf(graphOf(BASE_FILES), { graphSchemaVersion: 3 });
+    const after = snapshotOf(graphOf(BASE_FILES));
+
+    expect(GRAPH_SCHEMA_VERSION).toBe(4);
+    expect(incomparabilityReason(before.provenance, after.provenance)).toContain('Graph schema versions differ');
+
+    const report = compareSnapshots(before, after);
+    expect(report.comparable).toBe(false);
+    expect(report.identical).toBe(false);
+    expect(report.changes).toHaveLength(0);
+    expect(report.counts.NODE_ADDED).toBe(0);
+    expect(report.counts.EDGE_ADDED).toBe(0);
+  });
+
+  it('gives a repository analysed under two extraction versions two snapshot identities', () => {
+    // Nothing in the source changed; only what the extractors can read did. If the identities
+    // matched, "nothing changed" would be reported for a graph whose facts differ.
+    const before = snapshotOf(graphOf(BASE_FILES), { extractorVersion: '1.0.0' });
+    const after = snapshotOf(graphOf(BASE_FILES));
+    expect(after.id).not.toBe(before.id);
   });
 
   it('creates a snapshot for a repository with no git history', () => {

@@ -266,18 +266,23 @@ interface SequenceMessage {
 }
 
 /**
- * Breadth-first walk of `calls` relationships from one entry point, each call followed by the
- * returns and throws recorded for it.
+ * Depth-first walk of `calls` relationships from one entry point, each call followed by whatever
+ * the callee does before the value comes back.
+ *
+ * The order is the order the code runs in: `handler -> outer`, then everything `outer` does, then
+ * `outer -> handler` returning. A breadth-first walk drew the return before the nested calls that
+ * actually happened first, which read as though the callee returned before it had finished.
  *
  * The pairing is exact rather than positional: a `returns` relationship is drawn only on the
  * call whose caller is the relationship's target, so a return can never appear against a call it
- * does not belong to. Ordering is therefore deterministic — call, then its own return, then its
- * own error path, then the next call at the same depth — and reproducible for a given graph.
+ * does not belong to. Ordering is therefore deterministic and reproducible for a given graph.
+ * The walk is bounded by `MAX_SEQUENCE_DEPTH` and by the visited set, so a cyclic call graph
+ * terminates rather than recursing without end.
  */
 function sequenceMessages(graph: SoftwareGraph, entry: GraphNode): SequenceMessage[] {
   const byId = new Map(graph.nodes.map((node) => [node.id, node]));
   const outgoing = new Map<string, SoftwareGraph['edges']>();
-  /** (callee, caller) → the relationships that describe what comes back. */
+  /** (callee, caller) -> the relationships that describe what comes back. */
   const returnsByPair = new Map<string, GraphEdge[]>();
   const throwsByPair = new Map<string, GraphEdge[]>();
 
@@ -289,7 +294,7 @@ function sequenceMessages(graph: SoftwareGraph, entry: GraphNode): SequenceMessa
       continue;
     }
     if (edge.kind !== 'returns' && edge.kind !== 'throws') continue;
-    // `returns` and `throws` run callee → caller, so the pair key is reversed from `calls`.
+    // `returns` and `throws` run callee to caller, so the pair key is reversed from `calls`.
     const key = `${edge.from}->${edge.to}`;
     const index = edge.kind === 'returns' ? returnsByPair : throwsByPair;
     const list = index.get(key);
@@ -299,35 +304,37 @@ function sequenceMessages(graph: SoftwareGraph, entry: GraphNode): SequenceMessa
 
   const messages: SequenceMessage[] = [];
   const visited = new Set<string>([entry.id]);
-  let frontier = [entry.id];
   let order = 0;
 
-  for (let depth = 0; depth < MAX_SEQUENCE_DEPTH && frontier.length > 0; depth += 1) {
-    const next: string[] = [];
+  const walk = (source: string, depth: number): void => {
+    const edges = (outgoing.get(source) ?? []).slice().sort((a, b) => (a.id < b.id ? -1 : 1));
+    for (const edge of edges) {
+      const target = byId.get(edge.to);
+      if (!target) continue;
+      // A package is a dependency, not a participant: its behaviour was not analysed.
+      if (target.kind === 'package') continue;
 
-    for (const source of frontier) {
-      const edges = (outgoing.get(source) ?? []).slice().sort((a, b) => (a.id < b.id ? -1 : 1));
-      for (const edge of edges) {
-        const target = byId.get(edge.to);
-        if (!target) continue;
-        // A package is a dependency, not a participant: its behaviour was not analysed.
-        if (target.kind === 'package') continue;
+      order += 1;
+      messages.push({
+        kind: 'calls',
+        from: edge.from,
+        to: edge.to,
+        callee: String(edge.attributes?.callee ?? target.name),
+        edgeId: edge.id,
+        confidence: edge.confidence,
+        evidence: edge.evidence,
+        async: isAsync(target),
+        order,
+      });
 
-        order += 1;
-        messages.push({
-          kind: 'calls',
-          from: edge.from,
-          to: edge.to,
-          callee: String(edge.attributes?.callee ?? target.name),
-          edgeId: edge.id,
-          confidence: edge.confidence,
-          evidence: edge.evidence,
-          async: isAsync(target),
-          order,
-        });
+      // Whatever the callee does happens before its value comes back.
+      if (!visited.has(target.id) && depth < MAX_SEQUENCE_DEPTH) {
+        visited.add(target.id);
+        walk(target.id, depth + 1);
+      }
 
-        const pairKey = `${edge.to}->${edge.from}`;
-        for (const returned of returnsByPair.get(pairKey) ?? []) {
+      const pairKey = `${edge.to}->${edge.from}`;
+      for (const returned of returnsByPair.get(pairKey) ?? []) {
           const http = returned.attributes?.httpResponse === true;
           order += 1;
           messages.push({
@@ -374,16 +381,10 @@ function sequenceMessages(graph: SoftwareGraph, entry: GraphNode): SequenceMessa
               'An explicit throw, reject or raise inside the callee. A function with no recorded failure site produces no error arrow, which is not a claim that it cannot fail.',
           });
         }
-
-        if (!visited.has(target.id)) {
-          visited.add(target.id);
-          next.push(target.id);
-        }
       }
-    }
+  };
 
-    frontier = next;
-  }
+  walk(entry.id, 0);
 
   return messages;
 }

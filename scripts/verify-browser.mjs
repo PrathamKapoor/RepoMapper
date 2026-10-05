@@ -217,15 +217,81 @@ try {
     record(`behaviour view ${view} renders`, clicked);
   }
 
-  await goto(`${baseUrl}/#/behaviour`, `document.body.textContent.includes('Sequence')`);
+await goto(`${baseUrl}/#/behaviour`, `document.body.textContent.includes('Sequence')`);
   const lineage = await evaluate(`document.body.textContent.includes('Data lineage')`);
   record('behaviour offers data lineage alongside the projections', lineage);
   record(
     'lineage either traces a store or says the repository moves no data to one',
     lineage &&
       (await evaluate(
-        `/\\d+ hop\\(s\\) upstream/.test(document.body.textContent) || document.body.textContent.includes('nothing in') || document.body.textContent.includes('declares no table')`,
+        String.raw`new RegExp('\\d+ hop\\(s\\) upstream').test(document.body.textContent) || document.body.textContent.includes('nothing in') || document.body.textContent.includes('declares no table')`,
       )),
+  );
+
+  // ------------------------------------------------------------ return messages
+  // The sequence view has to show what the graph holds about hand-backs and failures. The
+  // artefact is fetched over the same origin the page uses, so a message that exists in the
+  // graph but never renders fails here rather than passing on an empty view.
+  await goto(`${baseUrl}/#/behaviour`, `document.body.textContent.includes('Sequence')`);
+  await evaluate(`
+    (() => {
+      const button = [...document.querySelectorAll('button')].find((b) => b.textContent === 'Sequence');
+      if (button) button.click();
+      return !!button;
+    })()
+  `);
+  await waitFor(`document.querySelectorAll('.react-flow__node').length > 0`, 'behaviour sequence nodes');
+
+  const analyses = await (await fetch(`${baseUrl}/api/analyses?limit=1`)).json();
+  const analysisId = analyses?.analyses?.[0]?.id;
+  const returnFacts = await evaluate(`
+    (async () => {
+      const id = ${JSON.stringify(analysisId ?? '')};
+      if (!id) return { ok: false, reason: 'no analysis available' };
+      const response = await fetch('/api/analyses/' + id + '/artifacts/sequence');
+      if (!response.ok) return { ok: false, reason: 'artifact request failed: ' + response.status };
+      const artifact = await response.json();
+      const body = document.body.textContent;
+      const count = (kind) => (artifact.edges ?? []).filter((edge) => edge.kind === kind).length;
+      return {
+        ok: true,
+        drawn: document.querySelectorAll('.react-flow__node').length,
+        drawnEdges: document.querySelectorAll('.react-flow__edge').length,
+        // The view states its own cap rather than cutting silently, so a truncated view is
+        // not expected to show every message.
+        truncated: /Showing \\d+ of \\d+ entities/.test(body),
+        returns: count('returns'),
+        throws: count('throws'),
+        shownReturns: /\\breturns\\b/.test(body),
+        shownThrows: /\\bthrows\\b/.test(body),
+        omissions: (artifact.omissions ?? []).length,
+        statesOmissions: /not read|no recorded return/.test(body),
+      };
+    })()
+  `);
+  record(
+    'sequence draws the participants the artefact names',
+    returnFacts.ok && returnFacts.drawn > 0,
+    returnFacts.ok ? `${returnFacts.drawn} participants, ${returnFacts.drawnEdges} messages` : String(returnFacts.reason),
+  );
+  record(
+    'a return message in the graph is drawn in the sequence view',
+    returnFacts.ok && (returnFacts.returns === 0 || returnFacts.truncated || returnFacts.shownReturns),
+    returnFacts.ok
+      ? `${returnFacts.returns} return message(s) in the artefact${returnFacts.truncated ? ', view truncated' : ''}`
+      : String(returnFacts.reason),
+  );
+  record(
+    'a failure message in the graph is drawn in the sequence view',
+    returnFacts.ok && (returnFacts.throws === 0 || returnFacts.truncated || returnFacts.shownThrows),
+    returnFacts.ok
+      ? `${returnFacts.throws} failure message(s) in the artefact${returnFacts.truncated ? ', view truncated' : ''}`
+      : String(returnFacts.reason),
+  );
+  record(
+    'the sequence view states what it could not read rather than drawing it',
+    returnFacts.ok && (returnFacts.omissions === 0 || returnFacts.statesOmissions),
+    returnFacts.ok ? `${returnFacts.omissions} omission(s) recorded` : String(returnFacts.reason),
   );
 
   // ---------------------------------------------------------------- traceability

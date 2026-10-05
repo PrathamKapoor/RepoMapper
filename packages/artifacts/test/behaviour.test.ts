@@ -125,6 +125,89 @@ describe('sequence projection', () => {
     expect(first?.target).toBe('function:handlelist');
   });
 
+  it('places a return message next to the call it belongs to, in source order', () => {
+    // handler → A → B, and handler returns A. The return belongs after the A call that produced
+    // the value, not after B's call, which happens to be visited later.
+    const artifact = sequenceOf(
+      graphOf([
+        parsedFile('src/routes.ts', {
+          entities: [fn('handler', 1, 8, true)],
+          calls: [{ callee: 'outer', line: 4, fromQualifiedName: 'handler', isLocalIdentifier: true, argCount: 0 }],
+          bindings: [{ name: 'value', callee: 'outer', line: 4, awaited: true, fromQualifiedName: 'handler' }],
+          returns: [{ line: 7, fromQualifiedName: 'handler', kind: 'identifier', name: 'value', expression: 'value' }],
+          markers: [{ name: 'http.route', line: 1, attributes: { httpMethod: 'GET', path: '/x', handler: 'handler' } }],
+        }),
+        parsedFile('src/a.ts', {
+          entities: [fn('outer', 1, 6, true)],
+          calls: [{ callee: 'inner', line: 3, fromQualifiedName: 'outer', isLocalIdentifier: true, argCount: 0 }],
+          bindings: [{ name: 'deep', callee: 'inner', line: 3, awaited: true, fromQualifiedName: 'outer' }],
+          returns: [{ line: 5, fromQualifiedName: 'outer', kind: 'identifier', name: 'deep', expression: 'deep' }],
+        }),
+        parsedFile('src/b.ts', { entities: [fn('inner', 1, 3, false)] }),
+      ]),
+    );
+
+    const order = artifact.edges.map((edge) => `${edge.kind}:${edge.source}->${edge.target}`);
+    // Calls are drawn before the returns that close them, deepest last.
+    expect(order.indexOf('calls:function:handler->function:outer')).toBeLessThan(
+      order.indexOf('calls:function:outer->function:inner'),
+    );
+    expect(order.indexOf('calls:function:outer->function:inner')).toBeLessThan(
+      order.indexOf('returns:function:inner->function:outer'),
+    );
+    expect(order.indexOf('returns:function:inner->function:outer')).toBeLessThan(
+      order.indexOf('returns:function:outer->function:handler'),
+    );
+  });
+
+  it('draws every return a function states, not only the first', () => {
+    const artifact = sequenceOf(
+      graphOf([
+        parsedFile('src/routes.ts', {
+          entities: [fn('handler', 1, 9, true)],
+          calls: [
+            { callee: 'first', line: 4, fromQualifiedName: 'handler', isLocalIdentifier: true, argCount: 0 },
+            { callee: 'second', line: 6, fromQualifiedName: 'handler', isLocalIdentifier: true, argCount: 0 },
+          ],
+          markers: [{ name: 'http.route', line: 1, attributes: { httpMethod: 'GET', path: '/x', handler: 'handler' } }],
+        }),
+        parsedFile('src/a.ts', {
+          entities: [fn('first', 1, 4, true)],
+          calls: [{ callee: 'source', line: 2, fromQualifiedName: 'first', isLocalIdentifier: true, argCount: 0 }],
+          returns: [{ line: 3, fromQualifiedName: 'first', kind: 'call', name: 'source', expression: 'source()' }],
+        }),
+        parsedFile('src/b.ts', {
+          entities: [fn('second', 1, 4, true)],
+          calls: [{ callee: 'other', line: 2, fromQualifiedName: 'second', isLocalIdentifier: true, argCount: 0 }],
+          returns: [{ line: 3, fromQualifiedName: 'second', kind: 'call', name: 'other', expression: 'other()' }],
+        }),
+        parsedFile('src/c.ts', { entities: [fn('source', 1, 2), fn('other', 1, 2)] }),
+      ]),
+    );
+
+    // Both hand-backs are drawn: `source` into `first` and `other` into `second`.
+    const returned = artifact.edges.filter((edge) => edge.kind === 'returns').map((edge) => edge.target);
+    expect(returned).toEqual(['function:first', 'function:second']);
+    expect(artifact.edges.filter((edge) => edge.kind === 'calls')).toHaveLength(5);
+  });
+
+  it('draws a call whose return the source does not state, as a call with no return', () => {
+    const artifact = sequenceOf(
+      graphOf([
+        parsedFile('src/routes.ts', {
+          entities: [fn('handler', 1, 6, true)],
+          calls: [{ callee: 'load', line: 3, fromQualifiedName: 'handler', isLocalIdentifier: true, argCount: 0 }],
+          markers: [{ name: 'http.route', line: 1, attributes: { httpMethod: 'GET', path: '/x', handler: 'handler' } }],
+        }),
+        parsedFile('src/a.ts', { entities: [fn('load', 1, 3)] }),
+      ]),
+    );
+
+    const call = artifact.edges.find((edge) => edge.kind === 'calls' && edge.target === 'function:load');
+    expect(call).toBeDefined();
+    expect(artifact.edges.some((edge) => edge.kind === 'returns' && edge.source === 'function:load')).toBe(false);
+  });
+
   it('draws no return message when the graph records none', () => {
     // Phase 4 removed the blanket refusal to draw a return, not the requirement for evidence.
     // A call whose result the source never uses still produces no return arrow, and the view
