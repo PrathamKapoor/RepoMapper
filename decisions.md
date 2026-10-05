@@ -1157,6 +1157,25 @@ the declaration that encloses its use — `return list(...)` inside a method cal
 variable shadowing an imported name. The edge would put a loop in a sequence view that the code
 never states, and it is exactly the kind of arrow a reader does not check.
 
+### D-067 - A finding names each entity once
+
+**Decision.** `ConsistencyFinding.nodeIds` is deduplicated. A test asserts that every finding in
+every fixture graph names each entity and each relationship once, and that finding ids are unique.
+
+**Why.** Found by the browser check, which fails on any console error: React reported a duplicate
+key, and the key was `deployment_component:repoatlas`. A C4 element projected from one graph entity
+carries that entity's own id in `graphNodeIds`, and the rule was building `nodeIds` as
+`[node.id, ...node.graphNodeIds]` — so the same entity appeared twice in every
+`container-without-code` finding.
+
+Nothing was wrong with the finding itself, which is why no test caught it: the projection's own
+gate checks *support*, not uniqueness. The damage was downstream, in every consumer that keys a list
+by entity id. A finding that repeats an entity is also a worse answer — a reader counting the
+entities involved counts one twice.
+
+The general rule: **an id list a consumer will key by must be unique at the point it is built**, not
+at the point someone is surprised by it.
+
 ### D-066 - A Python route decorator names the function below it
 
 **Decision.** An `http.route` marker from a decorator is held until the next definition at the same

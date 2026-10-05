@@ -213,7 +213,11 @@ function containerWithoutCode(c4Container: Artifact, graph: ProjectionContext['g
       detail:
         'The container is declared in a deployment file, but no module in the graph is attributed to it, so sequence and activity cannot show what runs inside it.',
       artifacts: ['c4-container', 'sequence', 'activity'],
-      nodeIds: [node.id, ...(node.graphNodeIds ?? [])],
+      // Deduplicated because a C4 element projected from one graph entity has `graphNodeIds`
+      // containing its own id, so `node.id` appears twice. The duplicate is harmless as a
+      // finding but breaks any consumer that keys a list on the entity id - which the UI does,
+      // and which React reported as a duplicate-key error in browser verification.
+      nodeIds: [...new Set([node.id, ...(node.graphNodeIds ?? [])])],
       edgeIds: [],
       evidenceExpected: 'A deploys relationship placing at least one module inside this container.',
       evidenceFound: 'None. The container may still be correct; the repository does not state which code runs in it.',

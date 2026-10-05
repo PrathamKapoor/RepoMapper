@@ -406,24 +406,21 @@ function ChainPanel({
       {selected ? (
         <div className="card" style={{ marginTop: 16 }}>
           <h3>{trace?.subject.name ?? selected}</h3>
-          <p className="small dim">
-            {view.kind === 'complete' ? (
-              view.text
-            ) : view.kind === 'broken' ? (
-              <>
-                {view.text}
-                <ul className="small">
-                  {view.breaks.map((entry) => (
-                    <li key={entry.kind}>
-                      <strong>{entry.kind}</strong>: {entry.reason}
-                    </li>
-                  ))}
-                </ul>
-              </>
-            ) : (
-              view.text
-            )}
-          </p>
+          {/*
+              A list inside a paragraph is invalid HTML: the browser closes the <p> before the
+              <ul>, which React reports as a hydration mismatch. The browser check caught it.
+              The text and the list are siblings here, so the nesting problem cannot recur.
+            */}
+            <p className="small dim">{view.text}</p>
+            {view.kind === 'broken' ? (
+              <ul className="small">
+                {view.breaks.map((entry) => (
+                  <li key={entry.kind}>
+                    <strong>{entry.kind}</strong>: {entry.reason}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
 
           <div className="row wrap" style={{ margin: '8px 0' }}>
             {chainCounts(trace).map((entry) => (

@@ -190,6 +190,19 @@ describe('consistency restraint', () => {
     expect(real.map((item) => item.id)).not.toContain('entry-point-untested:use_case:api_endpoint:api_endpoint:get-/ping');
   });
 
+  it('names each entity of a finding once', () => {
+    // D-067. A C4 element projected from one graph entity lists its own id in `graphNodeIds`,
+    // so prefixing `node.id` produced the same entity twice. Harmless as a finding; it broke
+    // every consumer that keys a list on the entity id, which the browser check reported as a
+    // React duplicate-key error.
+    const report = checkConsistency({ graph: FULL_GRAPH, maxElements: 5_000 });
+    for (const item of report.findings) {
+      expect(new Set(item.nodeIds).size, `${item.id} repeats an entity`).toBe(item.nodeIds.length);
+      expect(new Set(item.edgeIds).size, `${item.id} repeats a relationship`).toBe(item.edgeIds.length);
+    }
+    expect(new Set(report.findings.map((item) => item.id)).size).toBe(report.findings.length);
+  });
+
   it('does not claim agreement it did not check', () => {
     const report = checkConsistency({ graph: EMPTY_GRAPH, maxElements: 5_000 });
     expect(report.counts.CONSISTENT).toBe(0);
