@@ -305,9 +305,75 @@ import os.path
     expect(result.problems.some((problem) => problem.code === 'PY_UNTERMINATED_LITERAL')).toBe(true);
   });
 
-  it('marks a test-prefixed function as a test', () => {
+it('marks a test-prefixed function as a test', () => {
     const result = parser.parse('def test_report_repo():\n    assert True\n', PY_CONTEXT);
     expect(result.entities.find((entity) => entity.name === 'test_report_repo')?.kind).toBe('test');
+  });
+
+  it('names the handler a Flask route decorates', () => {
+    // D-066. The decorator names the route, not the function; without attaching it the endpoint
+    // node had nothing pointing at the code behind it and the sequence view reported no
+    // interaction for the whole repository.
+    const result = parser.parse(
+      `@app.route("/hello")
+def hello():
+    return "Hello"
+`,
+      PY_CONTEXT,
+    );
+    const marker = result.markers.find((entry) => entry.name === 'http.route');
+    expect(marker?.attributes).toMatchObject({ path: '/hello', handler: 'hello', handlerDerived: false });
+  });
+
+  it('names the handler a FastAPI route decorates', () => {
+    const result = parser.parse(
+      `@router.post("/users")
+async def create_user(request):
+    return await service.create(request)
+`,
+      PY_CONTEXT,
+    );
+    const marker = result.markers.find((entry) => entry.name === 'http.route');
+    expect(marker?.attributes).toMatchObject({ httpMethod: 'POST', handler: 'create_user' });
+  });
+
+  it('qualifies the handler with its class when the route is inside one', () => {
+    const result = parser.parse(
+      `class Api:
+    @app.route("/things")
+    def things():
+        return []
+`,
+      PY_CONTEXT,
+    );
+    const marker = result.markers.find((entry) => entry.name === 'http.route');
+    expect(marker?.attributes).toMatchObject({ handler: 'things', handlerQualifiedName: 'Api.things' });
+  });
+
+  it('does not attach a decorator to a definition nested deeper than it', () => {
+    // A decorator at column 0 decorates the next top-level definition. Reaching past it to a
+    // nested `def` would bind the endpoint to code that does not serve it.
+    const result = parser.parse(
+      `@app.route("/x")
+def outer():
+    if True:
+        def inner():
+            return 1
+    return 2
+`,
+      PY_CONTEXT,
+    );
+    const marker = result.markers.find((entry) => entry.name === 'http.route');
+    expect(marker?.attributes.handler).toBe('outer');
+  });
+
+  it('records a route whose decorator is never followed by a definition', () => {
+    // The endpoint is in the source. Reporting it without a handler is honest; dropping it
+    // would hide a declared route.
+    const result = parser.parse('@app.route("/orphan")\nx = 1\n', PY_CONTEXT);
+    const marker = result.markers.find((entry) => entry.name === 'http.route');
+    expect(marker?.attributes.path).toBe('/orphan');
+    expect(marker?.attributes.handler).toBeUndefined();
   });
 });
 

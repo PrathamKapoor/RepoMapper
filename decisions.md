@@ -1157,6 +1157,33 @@ the declaration that encloses its use — `return list(...)` inside a method cal
 variable shadowing an imported name. The edge would put a loop in a sequence view that the code
 never states, and it is exactly the kind of arrow a reader does not check.
 
+### D-066 - A Python route decorator names the function below it
+
+**Decision.** An `http.route` marker from a decorator is held until the next definition at the same
+indentation, and that definition's own name becomes the handler. The marker's line moves to the
+definition. A decorator with no matching definition is recorded with no handler.
+
+**Why.** Found by analysing Flask (pallets/flask) as the second real repository. It has 128
+recognised endpoints and, before this, **zero** of them connected to a handler — so the sequence
+view reported "no interaction" for the whole repository while the call graph was fully populated
+with 2078 calls. The symptom is indistinguishable from a repository with no behaviour, which is the
+specific confusion D-042 was written to fix for TypeScript; it had simply never been checked on
+Python.
+
+The root cause is that a decorator appears on the line *above* the function it serves, so the
+marker that names the route cannot see the handler. Attaching it is reading the source, not
+inferring: `@app.route("/hello")` above `def hello():` states that `hello` serves `/hello`.
+
+Two constraints keep the attachment honest. The definition must be at the same indentation, because
+that is what a decorator means in Python — reaching past it to a nested `def` would bind the
+endpoint to code that does not serve it. And unlike the TypeScript inline-handler case (D-042),
+`handlerDerived` is false: the name is the declaration's own, not one derived from the registration.
+
+Effect on Flask: sequence 40 flows with **0** messages became 40 flows with **176 calls, 23
+returns and 5 error paths**, and `route.handler` edges went from 0 to 169. The consistency report
+went from 131 missing-evidence findings to 7, because the endpoints were no longer reported as
+entry points nothing implements.
+
 ### D-063 - A status set on a response object is a response, and a response is not only a method call
 
 **Decision.** `reply.status(404)` / `res.code(201)` on a recognised response object is recorded as

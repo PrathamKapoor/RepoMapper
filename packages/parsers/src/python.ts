@@ -78,8 +78,23 @@ export class PythonSourceParser implements SourceParser {
      * Enclosing scopes derived from indentation. Python's block structure is
      * indentation, so this replaces a real parser's scope tracking.
      */
-    const scopes: { indent: number; qualifiedName: string }[] = [];
+const scopes: { indent: number; qualifiedName: string }[] = [];
     const calls: CallRecord[] = [];
+    /**
+     * Route markers waiting for the definition they decorate.
+     *
+     * A Flask or Fastify route is a decorator on the line *above* the function it serves:
+     * `@app.route("/hello")` then `def hello():`. The decorator therefore cannot name its own
+     * handler, and an endpoint node was created with nothing pointing at the code behind it.
+     * On Flask that left 128 endpoints with no handler, so the sequence view reported no
+     * interaction at all while the call graph was fully populated — indistinguishable from a
+     * repository with no behaviour (D-066).
+     *
+     * The marker is held until the next definition at the same indentation, which is what a
+     * decorator means in Python. It is attributed to that definition's line, because that is
+     * where the endpoint's behaviour is written.
+     */
+    const pendingRoute: { current: PendingRoute | undefined } = { current: undefined };
 
     for (const line of lines) {
       if (line.code === '') continue;
@@ -89,9 +104,16 @@ export class PythonSourceParser implements SourceParser {
       }
       const enclosing = scopes.at(-1)?.qualifiedName;
 
-      handlePythonLine(line, result, enclosing, calls);
-
       const declared = declaredNameFor(line);
+      const waiting = pendingRoute.current;
+      if (declared && waiting && line.indent === waiting.indent) {
+        attachRouteHandler(waiting.marker, declared, enclosing, line.line);
+        result.markers.push(waiting.marker);
+        pendingRoute.current = undefined;
+      }
+
+      handlePythonLine(line, result, enclosing, calls, pendingRoute);
+
       if (declared) {
         scopes.push({
           indent: line.indent,
@@ -99,6 +121,11 @@ export class PythonSourceParser implements SourceParser {
         });
       }
     }
+
+    // A decorator with no definition after it names a route nothing serves. It is recorded
+    // anyway: the endpoint exists in the source, and reporting it as unreached is more honest
+    // than dropping it.
+    if (pendingRoute.current) result.markers.push(pendingRoute.current.marker);
 
     for (const call of calls.slice(0, context.maxCalls)) result.calls.push(call);
     if (calls.length > context.maxCalls) {
@@ -129,6 +156,7 @@ function handlePythonLine(
   result: ParsedFile,
   enclosing: string | undefined,
   calls: CallRecord[],
+  pendingRoute: { current: PendingRoute | undefined },
 ): void {
   const code = line.code;
 
@@ -240,8 +268,47 @@ function handlePythonLine(
 
   // Markers read the literal-preserving view: a decorator's route path is a string
   // value, and blanking string bodies would make it undetectable.
-  const marker = pythonMarker(line.raw, line.line);
-  if (marker) result.markers.push(marker);
+const marker = pythonMarker(line.raw, line.line);
+  if (marker?.name === 'http.route') {
+    // Held for the definition it decorates rather than emitted now: see `parse`. `indent` is
+    // carried on the marker so the attach step can check that the definition is at the same
+    // level, which is what a decorator means in Python.
+    pendingRoute.current = { marker, indent: line.indent };
+} else if (marker) {
+    result.markers.push(marker);
+  }
+}
+
+/** A route decorator waiting for the definition it serves. */
+interface PendingRoute {
+  /** Indentation of the decorator, so only a definition at the same level can claim it. */
+  marker: Marker;
+  /** Decorator indentation, held beside the marker because `Marker` has no field for it. */
+  indent: number;
+}
+
+/**
+ * Points a route marker at the function it decorates.
+ *
+ * The handler name comes from the `def` below the decorator, which is what the source states — the
+ * decorator itself only names the route. `handlerDerived` is false because unlike a TypeScript
+ * inline callback (D-042) the name is not ours: it is the declaration's own name.
+ *
+ * The marker's line moves to the definition, because that is where the endpoint's behaviour is
+ * written; the decorator's line remains the evidence path in the file.
+ */
+function attachRouteHandler(
+  marker: PendingRoute['marker'],
+  declared: string,
+  enclosing: string | undefined,
+  line: number,
+): void {
+  const qualified = enclosing ? `${enclosing}.${declared}` : declared;
+  marker.line = line;
+  marker.attributes.handler = declared;
+  marker.attributes.handlerQualifiedName = qualified;
+  marker.attributes.handlerDerived = false;
+  marker.attributes.scope = qualified;
 }
 
 /**
