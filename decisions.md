@@ -1157,6 +1157,63 @@ the declaration that encloses its use — `return list(...)` inside a method cal
 variable shadowing an imported name. The edge would put a loop in a sequence view that the code
 never states, and it is exactly the kind of arrow a reader does not check.
 
+### D-063 - A status set on a response object is a response, and a response is not only a method call
+
+**Decision.** `reply.status(404)` / `res.code(201)` on a recognised response object is recorded as
+a response with `statusOnly: true`, even when no producing call follows. A configuring call that
+another call is built on (`reply.status(201).send(x)`) does not also record one.
+
+**Why.** `void reply.status(404); return { error };` is Fastify's documented way of answering, and
+this repository uses it on all 22 endpoints. Recognising only `res.json(...)`, `res.send(...)` and
+`return Response.json(...)` produced **zero** response arrows on the repository's own API — a real
+answer to a real endpoint recorded as no answer, which is the exact confusion Phase 4 exists to
+remove.
+
+`statusOnly` is separate from the method because the claim is narrower than a method implies: the
+code sets this status, and the body comes from the return statement. The sequence arrow says so
+(`responds 404 (status set, body returned from the handler)`) rather than implying the handler
+wrote a body, and the edge is `STRONGLY_INFERRED` rather than `EXPLICIT` for the same reason.
+
+Two constraints keep this from manufacturing responses. The receiver must be a known response
+object (`reply`, `res`, `response`, `ctx`, `this`) — `queue.status(200)` is written identically and is
+not a response. And a status with a producer is counted once, decided after the walk because the
+producer is visited before the configuring call it is built on.
+
+### D-065 - The sequence budget bounds calls, not messages, so every drawn call keeps its return
+
+**Decision.** The walk stops following new calls at `MAX_SEQUENCE_MESSAGES` and always emits the
+returns and error paths closing the calls it has already drawn. A flow can exceed the number by
+exactly the closing messages its drawn calls earned.
+
+**Why.** Found by running the real projection and asking which graph facts reached the diagram: all
+19 HTTP responses on this repository's own API were in the graph and none were drawn.
+
+The cause is the interaction of two correct decisions. Returns are emitted after everything their
+callee did, which is the only ordering that matches the code; and the flow is capped at 60 messages.
+Composed, the response for the entry point's own handler landed at position 93 on the shortest flow
+and 825 on the longest, so every one of them fell outside the cap. The diagram showed requests going
+out and nothing ever coming back — precisely the incompleteness Phase 4 was built to remove, now
+appearing for a different reason and looking identical to the thing it replaced.
+
+Bounding calls rather than messages fixes the class of problem, not the instance: a limit on *new
+work* can never orphan the hand-back of work already shown. The cut is still reported in
+`omitted[]`, and the reason text now says what was cut (calls) rather than what was removed
+(messages), because those numbers differ.
+
+### D-064 - A rule consumes one input, and gates on that input
+
+**Decision.** `addHttpResponses` gates on the presence of an `http.response` marker, not on
+`file.responses`.
+
+**Why.** The gate and the body read different fields. That is not a style point: it is the mechanism
+behind D-054, where a parser that emitted only the record had its responses silently dropped, and it
+would hide a response from any parser that emits only the marker. A rule that reads field X and
+gates on field Y couples the parser to an implementation detail of the consumer, and the failure
+mode is silence — the one failure mode with no visible symptom.
+
+This was found by a test written after the fix, not by reading the code: the new behaviour test
+passed a marker without a record and the edge did not appear.
+
 ### D-059 - HTTP responses are observed from the response object, never from the route
 
 **Decision.** A response edge exists only where the handler's body contains a response-producing

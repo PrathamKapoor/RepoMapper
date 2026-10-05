@@ -218,6 +218,49 @@ describe('sequence projection', () => {
     expect(artifact.scope).toContain('A call with no recorded return is drawn as a call with no return');
   });
 
+  it('draws an HTTP response back to the endpoint that asked', () => {
+    const artifact = sequenceOf(
+      graphOf([
+        parsedFile('src/routes.ts', {
+          entities: [fn('handler', 1, 6, true)],
+          markers: [
+            { name: 'http.route', line: 1, attributes: { httpMethod: 'GET', path: '/x', handler: 'handler' } },
+            { name: 'http.response', line: 5, attributes: { method: 'send', status: 201, scope: 'handler' } },
+          ],
+        }),
+      ]),
+    );
+
+    const response = artifact.edges.find((edge) => edge.kind === 'returns');
+    expect(response).toBeDefined();
+    // The arrow points at the requester: a response goes back to the endpoint, not out of it.
+    expect(response?.target).toContain('api_endpoint');
+    expect(response?.source).toBe('function:handler');
+    expect(response?.label).toContain('201');
+    expect(response?.supportingEdgeIds?.length).toBe(1);
+  });
+
+  it('states that a status-set response carries its body from the return, not a method call', () => {
+    // `reply.status(404); return { error };` — the arrow must not imply the handler wrote a body,
+    // because it did not. The label and the derivation say where the body comes from.
+    const artifact = sequenceOf(
+      graphOf([
+        parsedFile('src/routes.ts', {
+          entities: [fn('handler', 1, 6, true)],
+          markers: [
+            { name: 'http.route', line: 1, attributes: { httpMethod: 'GET', path: '/x', handler: 'handler' } },
+            { name: 'http.response', line: 5, attributes: { method: 'status', status: 404, statusOnly: true, scope: 'handler' } },
+          ],
+        }),
+      ]),
+    );
+
+    const response = artifact.edges.find((edge) => edge.kind === 'returns');
+    expect(response?.label).toContain('404');
+    expect(response?.label).toContain('body returned from the handler');
+    expect(response?.derivation).toContain('returns a value from its own body');
+  });
+
   it('marks an asynchronous call only where the declaration says so', () => {
     const artifact = sequenceOf();
     const toService = artifact.edges.find((edge) => edge.target === 'function:findall');
@@ -307,6 +350,44 @@ describe('sequence projection', () => {
     ]);
     const artifact = sequenceOf(graph);
     expect(artifact.edges.length).toBe(MAX_SEQUENCE_MESSAGES);
+    expect(artifact.omitted.some((entry) => entry.reason.includes(`beyond ${MAX_SEQUENCE_MESSAGES}`))).toBe(true);
+  });
+
+  it('keeps the response on a call whose callee walks past the message limit', () => {
+    // The defect this guards: a return is emitted after everything its callee did, so under a
+    // plain message cap the entry point's own response lands hundreds of messages in and is cut.
+    // The diagram then shows a request going out and nothing ever coming back. The budget is
+    // spent on new calls only, so every drawn call keeps the return that belongs to it.
+    const depth = Array.from({ length: 200 }, (_, index) => fn(`deep${index}`, 1, 2));
+    const graph = graphOf([
+      parsedFile('src/routes.ts', {
+        entities: [fn('handler', 1, 40, true)],
+        markers: [
+          { name: 'http.route', line: 1, attributes: { httpMethod: 'GET', path: '/deep', handler: 'handler' } },
+          { name: 'http.response', line: 39, attributes: { method: 'json', status: 200, scope: 'handler' } },
+        ],
+      }),
+      parsedFile('src/handler.ts', {
+        entities: [fn('handler', 1, 40, true), fn('deep0', 1, 2, true), ...depth],
+        calls: depth.map((_entity, index) => ({
+          callee: `deep${index}`,
+          line: 4,
+          fromQualifiedName: 'handler',
+          isLocalIdentifier: true,
+          argCount: 0,
+        })),
+      }),
+    ]);
+
+    const artifact = sequenceOf(graph);
+    // The flow is bounded on the calls it follows…
+    const calls = artifact.edges.filter((edge) => edge.kind === 'calls');
+    expect(calls.length).toBeLessThanOrEqual(MAX_SEQUENCE_MESSAGES);
+    // …and the endpoint still answers.
+    const response = artifact.edges.find((edge) => edge.kind === 'returns' && edge.target.includes('api_endpoint'));
+    expect(response).toBeDefined();
+    expect(response?.evidence.length).toBeGreaterThan(0);
+    // And the cut is stated rather than silent.
     expect(artifact.omitted.some((entry) => entry.reason.includes(`beyond ${MAX_SEQUENCE_MESSAGES}`))).toBe(true);
   });
 

@@ -136,6 +136,47 @@ describe('HTTP responses', () => {
     const result = parseTs('function handler() {\n  return new URL("https://example.test");\n}');
     expect(result.responses).toHaveLength(0);
   });
+
+  it('records a status the handler sets and returns from, which is how Fastify answers', () => {
+    // The status is stated in the code and the body comes from the return statement. Recognising
+    // only `res.json(...)` and `reply.send(...)` reported zero responses across this
+    // repository's own 22 endpoints, which reads as "these endpoints answer nothing".
+    const result = parseTs(
+      'app.get("/things", async (request, reply) => {\n' +
+        '  void reply.status(404);\n' +
+        '  return { error: "missing" };\n' +
+        '});',
+    );
+    expect(result.responses?.[0]).toMatchObject({ method: 'status', status: 404, statusOnly: true });
+    const marker = result.markers.find((entry) => entry.name === 'http.response');
+    expect(marker?.attributes).toMatchObject({ status: 404, statusOnly: true });
+    expect(String(marker?.attributes.scope)).toContain('GET /things handler');
+  });
+
+  it('records the status but not an invented body', () => {
+    // The claim is the status. The body is a separate fact from the return statement, so a
+    // status-only record carries no payload rather than a guessed one.
+    const result = parseTs(
+      'app.get("/things", (request, reply) => {\n  reply.code(201);\n});',
+    );
+    expect(result.responses?.[0]).toMatchObject({ status: 201, statusOnly: true });
+    expect(result.responses?.[0]?.payload).toBeUndefined();
+  });
+
+  it('does not record a status on an unrelated object as a response', () => {
+    const result = parseTs('function load() {\n  queue.status(200);\n}');
+    expect(result.responses).toHaveLength(0);
+  });
+
+  it('records a chained status once, as the response it configures', () => {
+    const result = parseTs(
+      'app.post("/things", (request, reply) => {\n  void reply.status(201).send({ ok: true });\n});',
+    );
+    expect(result.responses).toHaveLength(1);
+    expect(result.responses?.[0]).toMatchObject({ method: 'send', status: 201 });
+    // The producer carries the status, so the configuring call is not also a response of its own.
+    expect(result.responses?.[0]?.statusOnly).toBeUndefined();
+  });
 });
 
 describe('error paths', () => {

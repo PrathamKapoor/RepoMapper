@@ -46,7 +46,14 @@ import {
 /** Hard bound on sequence depth. A cycle must terminate; a long chain must not run forever. */
 export const MAX_SEQUENCE_DEPTH = 8;
 
-/** Most messages drawn for one flow. Beyond this the diagram stops being readable. */
+/**
+ * Most calls followed in one flow. Beyond this the diagram stops being readable.
+ *
+ * Bounds calls rather than total messages, so the returns and error paths that close the calls
+ * already drawn are always emitted. A flow can therefore exceed this number slightly, by exactly
+ * the number of closing messages its drawn calls earned — which is the property that keeps every
+ * drawn call paired with the hand-back that belongs to it (D-065).
+ */
 export const MAX_SEQUENCE_MESSAGES = 60;
 
 /** Most flows drawn in one view. */
@@ -123,13 +130,14 @@ export function buildSequence(context: ProjectionContext, options: SequenceOptio
   }
 
   for (const entry of selected) {
-    const messages = sequenceMessages(graph, entry);
-    const truncated = messages.length > MAX_SEQUENCE_MESSAGES;
-    const drawn = messages.slice(0, MAX_SEQUENCE_MESSAGES);
-    if (truncated) {
-      // Aggregated rather than repeated per flow: one note counting the cut-off messages is
-      // more useful than the same sentence twenty times.
-      cappedMessages += messages.length - MAX_SEQUENCE_MESSAGES;
+    // The walk bounds itself rather than being sliced afterwards, so a flow never exceeds the
+    // limit and every drawn call keeps its own return. What the cap cut is *calls the walk chose
+    // not to follow*, which is a different number from messages removed.
+    const drawn = sequenceMessages(graph, entry);
+    if (drawn.filter((message) => message.kind === 'calls').length >= MAX_SEQUENCE_MESSAGES) {
+      // Aggregated rather than repeated per flow: one note counting the cut is more useful than
+      // the same sentence twenty times.
+      cappedMessages += 1;
       cappedFlows.push(entry.name);
     }
 
@@ -217,7 +225,7 @@ export function buildSequence(context: ProjectionContext, options: SequenceOptio
       ...(cappedMessages > 0
         ? [
             {
-              reason: `messages beyond ${MAX_SEQUENCE_MESSAGES} in a flow; the interaction is longer than a readable diagram, and the cut is at the limit rather than in the graph`,
+              reason: `calls beyond ${MAX_SEQUENCE_MESSAGES} in a flow; the walk stops following new calls at the limit and closes the calls it has already drawn, so every drawn call keeps its return. The interaction continues past what is shown`,
               count: cappedMessages,
               examples: cappedFlows.slice(0, 3),
             },
@@ -306,10 +314,79 @@ function sequenceMessages(graph: SoftwareGraph, entry: GraphNode): SequenceMessa
     else index.set(key, [edge]);
   }
 
-  const messages: SequenceMessage[] = [];
+const messages: SequenceMessage[] = [];
   const visited = new Set<string>([entry.id]);
   let order = 0;
+  let calls = 0;
 
+  /** Emits the return and error messages for one call. Shared so the budget check cannot differ between paths. */
+  const closing = (edge: GraphEdge): void => {
+    const pairKey = `${edge.to}->${edge.from}`;
+    for (const returned of returnsByPair.get(pairKey) ?? []) {
+      const http = returned.attributes?.httpResponse === true;
+      order += 1;
+      messages.push({
+        kind: 'returns',
+        from: returned.from,
+        to: returned.to,
+        callee: '',
+        edgeId: returned.id,
+        confidence: returned.confidence,
+        evidence: returned.evidence,
+        async: returned.attributes?.awaited === true,
+        order,
+        ...(http
+          ? {
+              httpResponse: true,
+              label: responseLabel(returned),
+              derivation:
+                returned.attributes?.statusOnly === true
+                  ? 'The handler sets this status on the response and returns a value from its own body, which the framework sends. The status comes from the call in the code and the body from the return statement; neither is inferred from the route name.'
+                  : 'A response call in the handler body. The status and method come from that call, never from the route name.',
+            }
+          : {
+              label: `returns${returned.attributes?.awaited === true ? ' (awaited)' : ''}`,
+              derivation:
+                returned.attributes?.inferred === true
+                  ? `A local binding assigned from this call (${String(returned.attributes?.via ?? 'variable')}) is returned by the caller. The return statement names the variable, not the call, so the link is an inference and is drawn as one.`
+                  : 'A return statement in the caller hands this callee value on. The returned value is not resolved to a type, so the arrow states the fact and not a shape.',
+            }),
+      });
+    }
+
+    for (const thrown of throwsByPair.get(pairKey) ?? []) {
+      order += 1;
+      messages.push({
+        kind: 'throws',
+        from: thrown.from,
+        to: thrown.to,
+        callee: '',
+        edgeId: thrown.id,
+        confidence: thrown.confidence,
+        evidence: thrown.evidence,
+        async: thrown.attributes?.rejects === true,
+        order,
+        label: `throws${thrown.attributes?.via === 'reject' || thrown.attributes?.rejects === true ? ' (rejects)' : ''}`,
+        derivation:
+          'An explicit throw, reject or raise inside the callee. A function with no recorded failure site produces no error arrow, which is not a claim that it cannot fail.',
+      });
+    }
+  };
+
+  /**
+   * Depth-first walk, bounded by message count as well as depth.
+   *
+   * The bound matters because of ordering. A return is emitted after everything its callee did, so
+   * on a dense call graph the return for the *entry point's own handler* can land hundreds of
+   * messages in. Under a plain message cap it is then cut off, and the diagram shows a request
+   * going out with nothing ever coming back — which is exactly the incompleteness Phase 4
+   * removed. On this repository that put all 19 HTTP responses past the cap.
+   *
+   * So the budget is spent on *new calls* only: once the limit is reached the walk stops
+   * descending and keeps closing the calls it has already drawn. Every drawn call therefore keeps
+   * the return that belongs to it, which is the property that makes the diagram honest, and the
+   * cut is reported in `omitted[]` rather than hidden.
+   */
   const walk = (source: string, depth: number): void => {
     const edges = (outgoing.get(source) ?? []).slice().sort((a, b) => (a.id < b.id ? -1 : 1));
     for (const edge of edges) {
@@ -318,6 +395,8 @@ function sequenceMessages(graph: SoftwareGraph, entry: GraphNode): SequenceMessa
       // A package is a dependency, not a participant: its behaviour was not analysed.
       if (target.kind === 'package') continue;
 
+      if (calls >= MAX_SEQUENCE_MESSAGES) return;
+      calls += 1;
       order += 1;
       messages.push({
         kind: 'calls',
@@ -337,55 +416,8 @@ function sequenceMessages(graph: SoftwareGraph, entry: GraphNode): SequenceMessa
         walk(target.id, depth + 1);
       }
 
-      const pairKey = `${edge.to}->${edge.from}`;
-      for (const returned of returnsByPair.get(pairKey) ?? []) {
-          const http = returned.attributes?.httpResponse === true;
-          order += 1;
-          messages.push({
-            kind: 'returns',
-            from: returned.from,
-            to: returned.to,
-            callee: '',
-            edgeId: returned.id,
-            confidence: returned.confidence,
-            evidence: returned.evidence,
-            async: returned.attributes?.awaited === true,
-            order,
-            ...(http
-              ? {
-                  httpResponse: true,
-                  label: `responds ${String(returned.attributes?.status ?? '')}${returned.attributes?.status ? ' ' : ''}${String(returned.attributes?.method ?? '')}`.trim(),
-                  derivation:
-                    'A response call in the handler body. The status and method come from that call, never from the route name.',
-                }
-              : {
-                  label: `returns${returned.attributes?.awaited === true ? ' (awaited)' : ''}`,
-                  derivation:
-                    returned.attributes?.inferred === true
-                      ? `A local binding assigned from this call (${String(returned.attributes?.via ?? 'variable')}) is returned by the caller. The return statement names the variable, not the call, so the link is an inference and is drawn as one.`
-                      : 'A return statement in the caller hands this callee value on. The returned value is not resolved to a type, so the arrow states the fact and not a shape.',
-                }),
-          });
-        }
-
-        for (const thrown of throwsByPair.get(pairKey) ?? []) {
-          order += 1;
-          messages.push({
-            kind: 'throws',
-            from: thrown.from,
-            to: thrown.to,
-            callee: '',
-            edgeId: thrown.id,
-            confidence: thrown.confidence,
-            evidence: thrown.evidence,
-            async: thrown.attributes?.rejects === true,
-            order,
-            label: `throws${thrown.attributes?.via === 'reject' || thrown.attributes?.rejects === true ? ' (rejects)' : ''}`,
-            derivation:
-              'An explicit throw, reject or raise inside the callee. A function with no recorded failure site produces no error arrow, which is not a claim that it cannot fail.',
-          });
-        }
-      }
+      closing(edge);
+    }
   };
 
   walk(entry.id, 0);
@@ -572,6 +604,22 @@ function entryPointsOf(graph: SoftwareGraph): GraphNode[] {
   }
 
   return entry.sort((a, b) => (a.id < b.id ? -1 : 1));
+}
+
+/**
+ * What a response arrow says on its face.
+ *
+ * `res.status(201).json(order)` says how it answered. `reply.status(404); return { error }` says
+ * only the status, because the body comes from the return statement rather than from a method -
+ * and the arrow label is the one place a reader decides whether the endpoint sent a body.
+ */
+function responseLabel(edge: GraphEdge): string {
+  const status = typeof edge.attributes?.status === 'number' ? String(edge.attributes.status) : '';
+  const method = typeof edge.attributes?.method === 'string' ? edge.attributes.method : '';
+  if (edge.attributes?.statusOnly === true) {
+    return status ? `responds ${status} (status set, body returned from the handler)` : 'responds (status set, body returned from the handler)';
+  }
+  return `responds ${[status, method].filter(Boolean).join(' ')}`.trim();
 }
 
 function participantsOf(graph: SoftwareGraph, entry: GraphNode, messages: readonly SequenceMessage[]): GraphNode[] {

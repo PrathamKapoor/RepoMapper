@@ -550,6 +550,15 @@ export interface HttpResponseRecord {
   method: string;
   /** Numeric status when the code states a literal, e.g. `status(201)`. */
   status?: number;
+  /**
+   * Phase 4. True when the code sets a status without producing a body here:
+   * `void reply.status(404); return { error };`, which is how Fastify answers.
+   *
+   * Recorded as its own flag rather than folded into `method`, because the claim is narrower than
+   * a response method implies: the status is stated in the code, and whether a body accompanies
+   * it is a separate fact established by the return statement.
+   */
+  statusOnly?: boolean;
   /** Expression handed to the response, when it is an identifier, call or constructor. */
   payload?: string;
   /** Payload shape, as for `CallResult`. */

@@ -68,6 +68,7 @@ const ctx: WalkContext = {
       returnedExpressions: new Map(),
       responseStatus: new Map(),
       pendingResponseStatus: [],
+      pendingStatusOnly: [],
     };
 
     for (const statement of sourceFile.statements) {
@@ -108,6 +109,14 @@ interface WalkContext {
   responseStatus: Map<ts.Node, number>;
   /** `res.status(201).json(…)` pairs awaiting the status their configuring call records. */
   pendingResponseStatus: { producer: ts.Node; configurer: ts.Node }[];
+  /**
+   * Phase 4. A status set on a response object with no call yet known to produce a body.
+   *
+   * Held rather than recorded immediately because `reply.status(201).send(x)` also matches, and
+   * in that case the status belongs to the producing call. Recording both would report one
+   * answered request as two.
+   */
+  pendingStatusOnly: { node: ts.CallExpression; status: number; scope: string | undefined }[];
 }
 
 /**
@@ -891,7 +900,18 @@ function scriptKindFor(path: string): ts.ScriptKind {
 const RESPONSE_METHODS = new Set(['json', 'jsonp', 'send', 'sendFile', 'sendStatus', 'download', 'redirect', 'write', 'end']);
 
 /** Methods that configure a response rather than produce it. */
-const RESPONSE_CONFIGURERS = new Set(['status', 'statusCode', 'set', 'header', 'setHeader', 'type', 'contentType', 'location']);
+const RESPONSE_CONFIGURERS = new Set(['status', 'statusCode', 'code', 'set', 'header', 'setHeader', 'type', 'contentType', 'location']);
+
+/**
+ * Identifiers that name a response object.
+ *
+ * `reply.status(404)` is a response; `queue.status(200)` is not, and the two are written
+ * identically. Without this the extractor reports an HTTP response for every object in the
+ * repository that happens to have a `status` method — the fabricated-evidence failure mode the
+ * whole design exists to avoid. Naming the object is the same evidence a reader would use, taken
+ * from the code rather than from convention about what a handler looks like.
+ */
+const RESPONSE_OBJECTS = new Set(['reply', 'res', 'response', 'ctx', 'this']);
 
 /**
  * Records that a call is the operand of `await`.
@@ -928,7 +948,7 @@ function recordReturn(node: ts.Node, ctx: WalkContext): void {
 
   const expression = unwrapParens(node.expression);
   const line = lineOf(ctx, safeStart(node, ctx));
-  const result = classifyReturnedExpression(expression, line, ctx);
+  const result = classifyReturnedExpression(expression, line);
   if (!result) return;
 
   ctx.returnedExpressions.set(expression, result);
@@ -1010,7 +1030,7 @@ function isInAsyncScope(ctx: WalkContext): boolean {
   );
 }
 
-function classifyReturnedExpression(expression: ts.Expression, line: number, ctx: WalkContext): CallResult | undefined {
+function classifyReturnedExpression(expression: ts.Expression, line: number): CallResult | undefined {
   const awaitedByAwait = ts.isAwaitExpression(expression);
   const inner = awaitedByAwait ? unwrapParens(expression.expression) : expression;
 
@@ -1027,8 +1047,8 @@ function classifyReturnedExpression(expression: ts.Expression, line: number, ctx
     return { kind: 'constructor', ...(name ? { name } : {}), line };
   }
   if (ts.isIdentifier(inner)) return { kind: 'identifier', name: inner.text, line };
-  if (isLiteralExpression(inner)) return { kind: 'literal', line };
-  return { kind: 'expression', line, ...(ctx.stack.at(-1) ? {} : {}) };
+if (isLiteralExpression(inner)) return { kind: 'literal', line };
+  return { kind: 'expression', line };
 }
 
 function isLiteralExpression(node: ts.Expression): boolean {
@@ -1072,6 +1092,17 @@ if (!ts.isCallExpression(node) && !ts.isNewExpression(node)) return;
   if (RESPONSE_CONFIGURERS.has(method) && isCall) {
     const status = literalStatusArgument(node);
     if (status !== undefined) ctx.responseStatus.set(node, status);
+    // `void reply.status(404); return { error };` — Fastify's own idiom, and the one this
+    // repository uses on every one of its endpoints. The configuring call produces no response
+    // on its own, so it is recorded as a response *intent*: the status is stated in the code,
+    // and whether a value comes back is a separate fact the return pass establishes.
+    if (status !== undefined && RESPONSE_OBJECTS.has(callee.split('.')[0] ?? '')) {
+      // Not a response on its own when another call is built on it: `reply.status(201).send(x)`
+      // produces the response, and the producer records it with this status. The producing call
+      // is visited first, so the decision is made after the walk (see
+      // `resolveChainedResponseStatuses`).
+      ctx.pendingStatusOnly.push({ node, status, scope: ctx.stack.at(-1) });
+    }
     return;
   }
 
@@ -1083,7 +1114,7 @@ if (!ts.isCallExpression(node) && !ts.isNewExpression(node)) return;
 
   const line = lineOf(ctx, safeStart(node, ctx));
   const payload = node.arguments?.[0];
-  const payloadShape = payload ? classifyReturnedExpression(payload, line, ctx) : undefined;
+  const payloadShape = payload ? classifyReturnedExpression(payload, line) : undefined;
   const own = isCall ? literalStatusArgument(node) : undefined;
 
   // `res.status(201).json(order)`: the configuring call is the receiver of this one, and a parent
@@ -1128,7 +1159,7 @@ if (!ts.isCallExpression(node) && !ts.isNewExpression(node)) return;
  * producing call is visited before the configuring call it is built on.
  */
 function resolveChainedResponseStatuses(ctx: WalkContext): void {
-  if (ctx.pendingResponseStatus.length === 0) return;
+  if (ctx.pendingResponseStatus.length === 0 && ctx.pendingStatusOnly.length === 0) return;
 
   for (const { producer, configurer } of ctx.pendingResponseStatus) {
     const status = ctx.responseStatus.get(configurer);
@@ -1139,6 +1170,54 @@ function resolveChainedResponseStatuses(ctx: WalkContext): void {
     const marker = ctx.result.markers.find((entry) => entry.name === 'http.response' && entry.line === line);
     if (marker && marker.attributes.status === undefined) marker.attributes.status = status;
   }
+
+  // A configuring call another call is built on does not answer by itself: the producer does,
+  // and it has just been given this status. Recording both would count one answer twice.
+  const configurers = new Set(ctx.pendingResponseStatus.map((pair) => pair.configurer));
+  for (const { node, status, scope } of ctx.pendingStatusOnly) {
+    if (configurers.has(node)) continue;
+    recordStatusOnlyResponse(node, status, scope, ctx);
+  }
+}
+
+/**
+ * Records a status the code sets on a response without producing one.
+ *
+ * `void reply.status(404); return { error };` is Fastify's documented way of answering, and this
+ * repository uses it on all 22 endpoints. Recognising only `res.json(...)` / `reply.send(...)`
+ * meant the response arrows on this repository's own API were zero — a real answer to a real
+ * endpoint recorded as no answer at all, which is the failure mode Phase 4 exists to remove.
+ *
+ * What is claimed is narrow and stated in the record: the code sets this status. Whether a body
+ * is then returned is recorded separately by the return pass, so `statusOnly` stays true and a
+ * reader can tell "this endpoint sets 404 and returns a value" from "this endpoint only sets 404".
+ * Nothing here is derived from the route path.
+ */
+function recordStatusOnlyResponse(
+  node: ts.CallExpression,
+  status: number,
+  scope: string | undefined,
+  ctx: WalkContext,
+): void {
+  const line = lineOf(ctx, safeStart(node, ctx));
+
+  (ctx.result.responses ??= []).push({
+    line,
+    method: 'status',
+    status,
+    statusOnly: true,
+  });
+
+  ctx.result.markers.push({
+    name: 'http.response',
+    line,
+    attributes: {
+      method: 'status',
+      status,
+      statusOnly: true,
+      ...(scope ? { scope } : {}),
+    },
+  });
 }
 
 /** Status literal from `res.status(201)`, when the code states a number. */

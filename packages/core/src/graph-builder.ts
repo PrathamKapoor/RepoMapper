@@ -1828,9 +1828,13 @@ function addHttpResponses(
   evidence: EvidenceStore,
   file: ParsedFile,
   symbolIndex: ReadonlyMap<string, SymbolRef>,
-  staged: StagedAttributes,
+staged: StagedAttributes,
 ): void {
-  if ((file.responses?.length ?? 0) === 0) return;
+  // Gated on the marker, not on `file.responses`. The marker is what this function reads, and the
+  // record is the extractor's own copy - gating on the record while consuming the marker is the
+  // coupling that let a Python response be extracted and then dropped (D-054), and it would hide
+  // a response for any parser that emits the marker alone.
+  if (!file.markers.some((marker) => marker.name === 'http.response')) return;
 
   // Endpoint → handler, from the route.handler edges the marker pass already created.
   const handlerEndpoints = new Map<string, string[]>();
@@ -1871,8 +1875,8 @@ function addHttpResponses(
         builder.addEdge({
           from: scope.id,
           to: endpoint,
-          kind: 'returns',
-          confidence: 'EXPLICIT',
+kind: 'returns',
+          confidence: marker.attributes.statusOnly === true ? 'STRONGLY_INFERRED' : 'EXPLICIT',
           evidence: [responseEvidence],
           attributes: {
             httpResponse: true,
@@ -1880,6 +1884,9 @@ function addHttpResponses(
             ...(marker.attributes.status ? { status: marker.attributes.status } : {}),
             ...(marker.attributes.payload ? { payload: marker.attributes.payload } : {}),
             ...(marker.attributes.payloadKind ? { payloadKind: marker.attributes.payloadKind } : {}),
+            // Carried so a reader can tell an answered endpoint that writes its body from one
+            // that only states a status and returns the body from the handler's return value.
+            ...(marker.attributes.statusOnly === true ? { statusOnly: true } : {}),
           },
         });
       }
