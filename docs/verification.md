@@ -40,34 +40,38 @@ npm run verify     # lint -> typecheck -> build -> test
 | Lint | `npm run lint` | **0 problems.** Type-aware ESLint 9 with `typescript-eslint` 8 |
 | Typecheck | `npm run typecheck` | **0 errors.** `tsc --noEmit` over source *and* tests in all 6 packages |
 | Build | `npm run build` | **Success.** 5 backend packages via `tsc`; web bundled by Vite |
-"| Tests | 
-| Tests | `npm run test` | **489 passed, 18 files, 0 failed** |
+"| Tests | `npm run test` | **654 passed, 22 files, 0 failed** |
 
 ### Test breakdown
 
 | File | Tests | Covers |
 |---|---|---|
 | `packages/core/test/core.test.ts` | 42 | Confidence algebra, id stability, limits, redaction, evidence store, graph builder, diagnostics |
-| `packages/core/test/graph-builder.test.ts` | 40 | Module naming, import and callee resolution, every graph relationship kind, deployment attribution, base-image classification, test-to-endpoint attribution, digests, determinism, limits |
+| `packages/core/test/graph-builder.test.ts` | 59 | Module naming, import and callee resolution, every graph relationship kind, deployment attribution, base-image classification, test-to-endpoint attribution, query-expression and unclassified-statement identity, digests, determinism, limits |
 | `packages/core/test/requirements.test.ts` | 28 | Requirement and use-case models: declared versus derived, status, evidence, step limits, determinism |
 | `packages/core/test/traceability.test.ts` | 15 | The requirement to use case to implementation to test chain, broken joints, cycle safety, determinism |
-| `packages/core/test/drift.test.ts` | 34 | Snapshot identity and serialisation, node/edge/evidence/confidence drift, truncation, rename rules, determinism |
+| `packages/core/test/drift.test.ts` | 36 | Snapshot identity and serialisation, node/edge/evidence/confidence drift, truncation, rename rules, schema and extractor version incomparability, determinism |
 | `packages/ingest/test/ingest.test.ts` | 32 | Path containment, symlink escapes, allow-list, archive entries, language detection, binary sniffing, ignore stack, discovery limits |
-| `packages/parsers/test/parsers.test.ts` | 59 | TS entities, imports, calls, routes, inline route handlers, tests, control flow, syntax errors; Python entities, imports, continuations, docstrings; config, manifests, Markdown requirements, SQL including `ALTER TABLE` foreign keys, compose scoping and both `build:` forms, Dockerfile |
+| `packages/parsers/test/parsers.test.ts` | 64 | TS entities, imports, calls, routes, inline route handlers, tests, control flow, syntax errors; Python entities, imports, continuations, docstrings, route decorators naming their handler; config, manifests, Markdown requirements, SQL including `ALTER TABLE` foreign keys, compose scoping and both `build:` forms, Dockerfile |
+| `packages/parsers/test/sql.test.ts` | 52 | The statement analyser: single and multi-table reads, joins in every modifier form, comma lists with `AS` aliases, schema qualification, subqueries, `EXISTS`, derived tables, CTEs, read/write classification, unparseable and unsupported input, determinism |
+| `packages/parsers/test/returns.test.ts` | 38 | Return, throw, binding and HTTP-response records for TypeScript and Python: shapes, awaited calls, status chaining, status-only responses, constructors, `new Response`, unresolved returns |
 | `packages/artifacts/test/artifacts.test.ts` | 27 | Dependency, module, class and ER projections, mermaid rendering, cycle detection, omission log, gap analysis invariants |
-| `packages/artifacts/test/behaviour.test.ts` | 28 | Sequence and activity projections, data flow, data lineage: message rules, declared asynchrony, source ordering, limits, determinism |
-| `packages/artifacts/test/consistency.test.ts` | 19 | Cross-artifact consistency: projection integrity, absence never reported as contradiction, entry-point and data coverage, recorded agreement |
+| `packages/artifacts/test/behaviour.test.ts` | 35 | Sequence and activity projections, data flow, data lineage: call/return/error/response arrows, source ordering, declared asynchrony, arrow-id uniqueness, budget behaviour, limits, determinism |
+| `packages/artifacts/test/data-flow-multi.test.ts` | 13 | Multi-table data flow: one flow per table, reads kept distinct from writes, unclassified queries reported as queries, CTEs as query results, lineage read/write counts |
+| `packages/artifacts/test/consistency.test.ts` | 27 | Cross-artifact consistency: projection integrity, absence never reported as contradiction, return and response support, query expressions never stored as tables, entity-id uniqueness, entry-point and data coverage, recorded agreement |
 | `packages/artifacts/test/c4.test.ts` | 32 | C4 context/container/component mapping, evidence and confidence, base-image exclusion, relationship integrity, determinism, cross-artifact consistency |
 | `packages/server/test/analyze.test.ts` | 26 | Full pipeline on TS and Python fixtures, error paths, truncation, secret redaction, determinism, configuration |
 | `packages/server/test/api.test.ts` | 25 | Every Phase 1 endpoint, status codes, validation, graph integrity, persistence round trip, stored-analysis limit |
 | `packages/server/test/phase3-api.test.ts` | 22 | Requirements, use cases, consistency, traceability and lineage over HTTP: origins, statuses, validation, and the difference between a missing subject and a broken chain |
+| `packages/server/test/phase4-pipeline.test.ts` | 17 | Phase 4 end to end through the real pipeline: multi-table access reaching the graph, returns and responses reaching the sequence, lineage read/write separation, consistency over the new facts |
 | `packages/server/test/drift-api.test.ts` | 15 | Snapshot identity over HTTP, drift detection through the real store, rename, ordering, validation, failed-analysis refusal, reproducibility |
 | `packages/web/test/presentation.test.ts` | 17 | The decisions behind the C4 and Drift views: which snapshot a change belongs to, report state classification, relationship support, default comparison |
-| `packages/web/test/phase3-presentation.test.ts` | 21 | The decisions behind the Phase 3 views: stated versus derived wording, requirement order, consistency headline and ordering, chain completeness |
+| `packages/web/test/phase3-presentation.test.ts` | 25 | The decisions behind the Phase 3 views: stated versus derived wording, requirement order, consistency headline and ordering, chain completeness, lineage hop and usage wording |
 | `e2e/self-analysis.test.ts` | 7 | This repository analysed for real; invariants only |
 
 **What the web tests do not cover.** There is no DOM or browser test in this repository.
-`presentation.test.ts` covers the logic those views make, not their rendering. See §5.
+`presentation.test.ts` covers the logic those views make, not their rendering. The CDP driver in
+§4c exercises the real UI in a real browser; it asserts on DOM content, not on appearance. See §5.
 
 ### Tests that found real defects
 
@@ -97,6 +101,33 @@ Defects found by **real repository and container verification** rather than by a
 | D-014 | Linux image failed to build: `ignore` not callable under NodeNext, while Windows succeeded |
 | D-038 | Container reported `schemaVersion: 1` and a digest that did not match the one recorded at analysis time — the store stamped rebuilt graphs with the *database* schema version |
 | D-039 | C4 container level of this repository contained a named compose **volume** and a Docker **base image**, plus a component literally named `unknown` from `EXPOSE` |
+
+### Phase 4 defects found by probing the new code against real repositories
+
+All seven were found in this session by running the new extraction and projection code against this
+repository, Flask, and purpose-built fixtures — not by reading it. Each has a regression test.
+
+| Defect | Symptom as observed | Found by |
+|---|---|---|
+| D-050 | `LEFT OUTER JOIN b` reported a table named **`JOIN`**; `STRAIGHT_JOIN b ON 1` reported a table named **`ON`** | probing `analyzeSql` with adversarial input |
+| D-051 | `FROM users AS u, orders AS o` read **one** table; `public.users u, public.orders o` read one | same probe, after D-050 |
+| D-052 | Two same-named CTEs in two functions became **one** node with two producers, reading as one query result fed by two stores | a fixture with two `WITH recent AS` statements |
+| D-053 | Two identical unclassified statements counted as **one** | same fixture |
+| D-049 | **175 of 1205** sequence arrows shared an id with another arrow, so the evidence panel showed whichever came first | self-analysis of the sequence artifact |
+| D-054 | A FastAPI handler's response was extracted into `ParsedFile.responses` and then **dropped** — the graph held no fact that the endpoint answered | parsing a FastAPI fixture |
+| D-055 | `new Response(body)` was unreachable behind a guard that returned for anything not a call | reading the guard against the constructor check it preceded |
+| D-056 | A breadth-first walk would draw `service -> handler` returning **before** `service -> database` | reading the walk order |
+| D-058 | A self-directed `returns` edge put a **loop** in the sequence view | reading the resolution path |
+| D-063 | All **19** HTTP responses on this repository's own API were in the graph and **none** were drawn; the diagram showed requests going out with nothing coming back | asking which graph facts reached the diagram |
+| D-064 | `addHttpResponses` gated on `file.responses` while reading the `http.response` marker | a test written after D-054 |
+| D-065 | Every HTTP response landed past the 60-message cap (positions 93–825) and was cut | the same query as D-063 |
+| D-066 | Flask: **128** endpoints, **0** connected to a handler, sequence reported no interaction at all | analysing Flask as a second real repository |
+| D-067 | React reported a duplicate key `deployment_component:repoatlas` — every `container-without-code` finding named the same entity twice | the CDP browser check, over a container build |
+
+The pattern worth naming: **D-063, D-064, D-065 and D-066 all presented as a working feature.** In
+each case the code ran, the tests passed, and the artifact looked plausible. They were found by
+asking a question of the output that the code was not designed to answer — *which facts in the graph
+reached the picture?* — and comparing the count to the count in the graph.
 
 ---
 
@@ -149,6 +180,44 @@ Edge kinds  contains=3121, calls=1801, branches=1276, loops=204,
             declared_in=53, re_exports=39, exposes=22, reads=6, extends=3,
             implements=3, writes=1, authored_by=1
 ```
+
+The same command re-run in **Phase 4** against the Phase 4 tree:
+
+```
+Repository       RepoMapper  (C:\Projects\RepoMapper)
+Commit           88d87c2                                     branch=main
+Graph            5568 nodes, 8532 edges, 11858 evidence records
+
+Node kinds  constant, condition, test, function, configuration, interface, module,
+            type, requirement, package, api_endpoint, class, table,
+            deployment_component, repository
+Edge kinds  contains=3700, calls=2170, branches=1582, loops=256, configures=197,
+            imports=126, deploys=116, depends_on=104, re_exports=40, throws=49,
+            returns=78, exposes=22, reads=18, writes=11, declared_in=57,
+            extends=3, implements=3
+```
+
+Projections built from that graph, same run:
+
+| Artifact | Nodes | Edges | Notes |
+|---|---|---|---|
+| sequence | 224 | 1265 | 1205 calls, **32 returns**, **19 HTTP responses**, 9 error paths, 22 flows |
+| activity | 2209 | 3239 | decision points in source order |
+| data-flow | 23 | 29 | `reads` 18 / `writes` 11; two stores from DDL plus references from SQL |
+| er-diagram | 21 | 0 | no declared relationship between the tables in this repository's schema |
+| c4-component | 115 | 240 | |
+| dependency-graph | 110 | 270 | |
+
+Phase 4's own facts are visible in those numbers:
+
+| Observation | Why it is evidence of extraction rather than configuration |
+|---|---|
+| **19 `returns` edges carrying `httpResponse`**, all 19 drawn in the sequence view | Recovered from `reply.status(201)` / `reply.status(404)` in this repository's own Fastify handlers. Asking *which graph facts reached the picture* is what showed all 19 were in the graph and none were drawn (D-063, D-065). |
+| **78 `returns` and 49 `throws` edges** | Every one carries the `return`/`throw` statement as evidence, and `returns` is never created from the existence of a call (D-057). |
+| **`reads` 18 with 5 from `join` role** | The join reads come from multi-table statements in this repository's own test fixtures; each edge names the clause it came from, and a read is never recorded as a write. |
+| **28 unclassified SQL statements**, each carrying its reason | A `CALL` in a test fixture, a `select` with no resolvable table, an `insert` with no target. Each is reported rather than guessed at (D-060). |
+| **`data-flow` shows 23 nodes for 2 declared tables** | The extra nodes are code units and query expressions, not fabricated stores. No store appears that no statement or schema names. |
+| **Sequence 1205 calls with 1154 having no return drawn** | The ratio is the honest answer: most calls in this repository have their result discarded or bound without returning it. The view states it rather than drawing an empty arrow. |
 
 Phase 3's own facts are visible in that count and in the projections built from it:
 
@@ -405,6 +474,68 @@ service, a database wrapper, and a Markdown document stating one requirement.
 Every Phase 3 endpoint therefore works inside the Linux container on Node 24.21.0, a different
 runtime from the host it was developed on.
 
+### 4c-ter. Phase 4 in the container — VERIFIED
+
+Container rebuilt from the Phase 4 tree (image `repoatlas:phase4`) and re-run on Node **v24.21.0**,
+against a read-only fixture mounted at `/repos/fixture`. The fixture was written to contain exactly
+what Phase 4 claims: a `LEFT OUTER JOIN`, a CTE, a chained status with a returned body, a local
+binding returned by its caller, a two-table schema with an `ALTER TABLE` foreign key, and three
+routes.
+
+| Check | Result |
+|---|---|
+| `docker build` | **Success** |
+| Container startup and logs | `repoatlas listening`, bound to `127.0.0.1:4300` and `172.17.0.2:4300`; no errors |
+| `GET /api/health` | 200 — `ok`, `environment: production`, `pathAllowListEnforced: true`, `allowedRootCount: 1`, `node: v24.21.0` |
+| `GET /api/meta` | 200 — **10 artifacts**; `edgeKinds` now includes **`returns`** and **`throws`** |
+| `POST /api/analyses` `{"/repos/fixture"}` | **201** — 25 nodes, 41 edges, 35 evidence records; `sql: 1, typescript: 1` |
+| `GET .../artifacts/sequence` | 200 — **6 calls, 1 return, 1 HTTP response**, 3 flows. The response arrow reads `responds 404 (status set, body returned from the handler)` and points at the endpoint, not out of it |
+| `GET .../artifacts/data-flow` | 200 — `loadUsers` reads **both** `users` (FROM) and `orders` (JOIN); `findUser` reads `users`; `saveOrder` reads `orders`; `recentOrders` **produces** the query expression and reads `orders`. Two omission entries: unclassified statements and query expressions |
+| `GET .../lineage/table:orders` | 200 — **3 inbound hops, `usage: { read: 3, write: 0, unclassified: 0 }`**, each hop carrying `operation`, `role` and `statement`, cited to `src/service.ts:2`, `:10`, `:14` |
+| `GET .../lineage/table:users` | 200 — `usage: { read: 2, write: 0 }` — reads counted separately from writes |
+| `GET .../artifacts/er-diagram` | 200 — both tables with their columns; the foreign key from `ALTER TABLE` present in the `orders.user_id` detail |
+| `GET .../requirements` | 200 — 4 stated requirements |
+| `GET .../use-cases` | 200 — 3 use cases; the first has **2 steps** |
+| `GET .../traceability` | 200 — index over the 3 recovered entry points |
+| `GET .../consistency` | 200 — `CONTRADICTION: 0`, 3 `MISSING_EVIDENCE` (entry points with no test relationship), 2 `CONSISTENT` |
+| `GET /` | 200 `text/html`, contains `id="root"` |
+| `GET /assets/index-*.js` | 200 — 716 169 bytes, the web bundle from the image |
+| `POST /api/analyses` `{"/etc"}` | **403** `PATH_NOT_ALLOWED` |
+| `POST /api/analyses` `{"/repos/fixture/../../../etc"}` | **403** `PATH_NOT_ALLOWED` — the escaping path resolved and was refused, not sanitised |
+| `GET .../lineage/..%2F..%2Fetc%2Fpasswd` | **404** with the message that no data relationship traces to it — no file read attempted |
+| Write inside the mounted fixture | **Refused** — `Read-only file system` |
+| Container user | `uid=1000(node)`, not root |
+
+**Containment was re-checked, not assumed.** The three traversal probes above are the Phase 1
+security checks (D-034, D-040) re-run against the Phase 4 image; all three still refuse.
+
+### 4d-bis. Second real repository — Flask — VERIFIED
+
+`pallets/flask` cloned at depth 1 and analysed through the real pipeline, as a check that Phase 4's
+claims are not specific to this repository's own dialect of Fastify.
+
+| | |
+|---|---|
+| Graph | 2534 nodes, 8131 edges, 6932 evidence records |
+| Python entity coverage | 2253 `calls`, 470 `branches`, 61 `loops`, 47 `extends`, 387 `depends_on`, 169 `exposes` |
+| Entry points | **128** API endpoints recognised, **all now resolving to a handler** |
+| `route.handler` edges | **169** (was **0** before D-066) |
+| Sequence | 40 flows — **176 calls, 23 returns, 5 error paths** (was 40 flows with **0 messages**) |
+| Failure sites | **240** `throws` edges from explicit `raise` statements |
+| Data access | 6 `reads`, 5 `writes` across `insert_into`, `update_target` and `delete_target` roles |
+| Lineage | `user`: read 3, write 1 · `post`: read 3, write 4 |
+| Data flow | 11 edges over 2 tables, `insufficientEvidence: false` |
+| Consistency | `CONTRADICTION: 0`, 7 `MISSING_EVIDENCE`, 1 `PARTIAL_EVIDENCE`, 2 `CONSISTENT` — down from **131** missing-evidence findings before the decorator fix |
+| SQL not read | 19 unclassified statements, each carrying its reason rather than producing a guessed read |
+
+**What Flask did and did not exercise.** It is a Python web framework, so it proved the Python
+extraction paths: route decorators naming handlers, `raise` producing failure sites, `return`
+producing returns, and the same SQL analyser reading Python string literals. It is **not** a
+multi-table-SQL repository — its 6 reads and 5 writes all come from documentation examples and test
+fixtures, so this run does **not** demonstrate richer data access on a third-party codebase. The
+multi-table, subquery and CTE claims rest on the `sql.test.ts` fixtures and on the Phase 4 fixture
+repository, and that is stated rather than papered over.
+
 ### 4d. Browser — PARTIALLY VERIFIED
 
 Phase 1 recorded browser rendering as *unknown*. It is no longer unknown: a real headless
@@ -455,6 +586,45 @@ and never reacted to `hashchange`. Fixed, with the `hashchange` listener now in
 `packages/web/src/app.tsx` — and deep links are worth having on their own, since an
 architecture or drift view is what a person wants to send to a colleague.
 
+### 4d-ter. Phase 4 in the browser — VERIFIED for function, not for appearance
+
+Run against the **container** build with two analyses of the Phase 4 fixture, so the driver, the
+server and the image are all the ones being shipped.
+
+**Run 1 — two analyses of unchanged content: 43/43 passed.**
+
+| Check | Result |
+|---|---|
+| All ten tabs render | pass |
+| Behaviour: sequence renders | pass |
+| Sequence draws the participants the artifact names | pass — **9 participants, 8 messages** |
+| **A return message in the graph is drawn in the sequence view** | pass — the artifact carries **2 return messages** and the view is not truncated |
+| A failure message in the graph is drawn | pass — 0 failure messages in this fixture, reported as such rather than asserted |
+| The sequence view states what it could not read | pass |
+| Lineage traces a store or says the repository moves no data to one | pass |
+| Traceability: requirements, use cases, chain index, and a chain with all four joints | pass |
+| Consistency names what it compared and says absence is not a contradiction | pass |
+| Drift reports no change between two identical analyses and says the digests match | pass |
+| Architecture, Structure, Evidence, Gaps, Diagnostics render their content | pass |
+| **No uncaught exceptions and no console errors** | pass |
+
+**Run 2 — after a real change (a new multi-table function was added to the fixture): 45/45 passed.**
+The two extra checks are the drift rows: the change summary, the individual changes with evidence on
+both sides, the inspect action, and the drill-through to the entity inspector.
+
+**This run found a real defect (D-067).** The first attempt failed one check: React reported a
+duplicate key `deployment_component:repoatlas`. Every `container-without-code` consistency finding
+listed the same entity twice, because a C4 element projected from one graph entity carries its own
+id in `graphNodeIds` and the rule prefixed `node.id` to that list. No test caught it — the
+projection's integrity gate checks *support*, not uniqueness — and the artifact itself was correct;
+the damage was entirely in the consumers. `nodeIds` is now deduplicated, and a test asserts across
+every fixture graph that no finding repeats an entity, a relationship, or an id.
+
+**The evidence panel for a single arrow is not browser-verified.** The driver checks that returns
+and failures are drawn and that omissions are stated; it does not click an individual arrow and
+assert the panel's contents. That panel is covered by the projection tests and by rendering
+inspection, not by the CDP driver.
+
 **Still not verified, and deliberately not claimed:** visual layout, styling and responsive
 behaviour at any viewport; React Flow zoom, pan and drag; and any browser other than the
 Chromium builds installed here. The driver asserts on DOM content and node counts, not on
@@ -468,7 +638,8 @@ Stated plainly. None of these are claimed as working.
 
 | Item | Status | Why |
 |---|---|---|
-| **Browser rendering of the UI** | **Partially verified** | Driven in real headless Chromium via the DevTools Protocol (`scripts/verify-browser.mjs`): **41/41** checks pass with two analyses and a real change between them, **38/38** with one analysis. Rendering *and* the click paths are covered. **Still unverified:** visual layout and styling at any viewport, React Flow zoom and drag, and any non-Chromium browser. See §4d. |
+| **Browser rendering of the UI** | **Partially verified** | Driven in real headless Chromium via the DevTools Protocol (`scripts/verify-browser.mjs`): **45/45** checks pass against the container build with two analyses and a real change between them, **43/43** with unchanged content. Rendering *and* the click paths are covered, including that return and failure messages present in the artifact reach the sequence view. **Still unverified:** visual layout and styling at any viewport, React Flow zoom and drag, any non-Chromium browser, and the per-arrow evidence panel's contents. See §4d-ter. |
+| **Return messages in a browser** | **Partially verified** | The sequence view is asserted to draw every return and failure message the artifact carries, and to state what it could not read. The evidence panel opened by clicking a single arrow is **not** asserted by the driver. Covered by projection tests only. |
 | **C4 rendering in a browser** | **Verified** | All three levels draw (1, 2 and 43 canvas nodes on the fixture; 2, 3 and 97 on this repository), each shows its omission table, and selecting an element opens its derivation, its evidence locations and the graph support of each relationship. |
 | **Drift rendering in a browser** | **Verified** | Identity table, change summary and individual changes with evidence on both sides render; a change row drills through to the entity inspector; the single-analysis empty state explains itself and is not presented as "nothing changed". |
 | **Git-backed facts** (commits, contributors, ownership) | **Verified** | Confirmed against real history: `branch=main`, HEAD resolved, and `commit`, `contributor` and `authored_by` entities produced. `modifies` edges from multi-commit history are covered by unit tests. **Exception:** inside the container, a bind-mounted repository owned by another user is refused by `git` as dubious ownership, so no history is read there (D-040). |
@@ -480,6 +651,10 @@ Stated plainly. None of these are claimed as working.
 | **Archive upload over HTTP** | **Not implemented** | `extractTarArchive()` is implemented and unit-tested (unsafe paths, empty archive, size ceiling, real tarball). No route reaches it. |
 | **CORS** | **Parsed but not applied** | `REPOATLAS_CORS_ORIGIN` is validated by configuration but never wired into the Fastify instance. Cross-origin browser clients will be blocked. |
 | **Rate limiting / API authentication** | **Not implemented** | Known gap. Documented in `docs/deployment.md`. The service must not be described as production-secure. |
+| **ORM and query-builder data access** | **Unsupported by decision** | `reads` and `writes` come only from table names in SQL the analyser read. Prisma, SQLAlchemy, Knex, Drizzle, Sequelize and Django ORM produce no data relationship. A declared table nothing touches is reported as `MISSING_EVIDENCE` with the reason, so the gap is visible and attributed to the extractor (D-061). **This is the largest remaining gap in the data views**, and it is not a bug to be fixed by guessing: mapping `db.users.findMany()` to a `users` table is a guess about which call touches which store. |
+| **Column-level data lineage** | **Not implemented** | Every lineage hop is table-level, because that is what a SQL statement names. A column-level edge would have to be inferred from a projection list the analyser does not resolve. |
+| **Multi-table SQL on a third-party repository** | **Partially verified** | Richer access is verified by 52 analyser tests and by the Phase 4 fixture, and this repository's own SQL extracts 18 reads including 5 from a join. The Flask run (§4d-bis) did **not** exercise it — Flask's queries are all single-table documentation examples. No third-party application repository with real multi-table SQL was analysed. |
+| **Return-value resolution** | **Not implemented, deliberately** | A return records that the caller hands a value back, not what type. `return user;` is not resolved to `User`. Resolving it would mean inferring a type from a value, which the source does not state (D-057). |
 | **Performance characteristics at scale** | **Not measured** | No benchmark suite. The observations in §6 are single runs, not benchmarks, and say nothing about a 40 000-file monorepo. |
 | **Memory profile** | **Not measured** | No instrumentation. |
 | **Symlink tests on Windows** | **Partially covered** | Creating symlinks needs elevation, so those two tests early-return. The traversal logic is covered by non-symlink cases; real symlink coverage happens in Linux CI. |
@@ -520,14 +695,21 @@ added before any claim about where time is spent.
 **Working and verified:** the pipeline from a repository path to a fully-cited knowledge
 graph; evidence and confidence on every fact; **ten artifact projections** — dependency,
 module, class and ER diagrams, three C4 levels, sequence, activity and data flow — each with
-honest omission reporting; requirements and use cases read from the repository, with a
+honest omission reporting; **multi-table data access** with joins, subqueries, CTEs and correct
+read/write separation, and SQL this analyser cannot read reported as such rather than guessed;
+**return, failure and HTTP-response messages** in the sequence, each citing the statement that
+established it; requirements and use cases read from the repository, with a
 requirement-to-use-case-to-implementation-to-test chain; a cross-artifact consistency engine
 that reports absence as absence; gap analysis with auditable `NOT_FOUND` claims;
 immutable, content-addressed snapshots; deterministic drift detection over nodes, edges,
 citations and confidence, with rename proved rather than guessed and removals withheld when
 the target analysis was incomplete; SQLite persistence; the HTTP API with correct status
 codes and containment; the built web bundle and its served shell; a working container image
-verified through Phase 3; **489 passing tests**; clean lint and typecheck.
+verified through Phase 4; **654 passing tests**; clean lint and typecheck.
+
+Verified against two real repositories: **this one** (5568 nodes, 8532 edges; 19 HTTP responses,
+78 returns, 49 throws, 18 reads across 11 writes) and **`pallets/flask`** (2534 nodes, 8131 edges;
+128 endpoints all resolving to handlers, 240 failure sites, 23 returns).
 
 **Partial and labelled as such:** language coverage (TS/JS solid, Python structural);
 call resolution (name-based, never labelled explicit); C4 component boundaries (derived from
@@ -537,7 +719,9 @@ UI (logic tested, rendering verified by CDP assertions rather than by pixels).
 
 **Not built:** the deployment diagram; business requirements held outside the repository;
 semantics-level contradiction detection; symbol-level and Git-corroborated renames; the
-archive-upload endpoint; CORS; rate limiting; API authentication.
+archive-upload endpoint; CORS; rate limiting; API authentication; **ORM and query-builder
+data access** (unsupported by decision, D-061); **column-level lineage**.
 
-**Unknown:** visual layout, styling, zoom and drag in the browser, and non-Chromium browsers; performance at scale;
-memory profile; coverage percentage.
+**Unknown:** visual layout, styling, zoom and drag in the browser, and non-Chromium browsers; the
+per-arrow evidence panel's rendered contents; multi-table SQL on a third-party application
+repository; performance at scale; memory profile; coverage percentage.

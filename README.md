@@ -6,9 +6,11 @@ Point it at a repository and it produces a **Software Knowledge Graph** in which
 entity and every relationship is traceable to a file and a line, labelled with how strongly
 it is actually supported. Multiple engineering views - dependency graph, module structure,
 class diagram, ER diagram, C4 architecture, sequence, activity and data flow - are then
-*projections* of that one graph, so they cannot contradict each other. Requirements and use
-cases are read from what the repository states and evidences, and any entry point can be
-followed through to the code and the test that serve it. A consistency report compares every
+*projections* of that one graph, so they cannot contradict each other. SQL in code is read as
+data access — every table a statement touches, with reads and writes kept apart — and sequence
+diagrams draw returns, failures and HTTP responses, each citing the statement that established it.
+Requirements and use cases are read from what the repository states and evidences, and any entry
+point can be followed through to the code and the test that serve it. A consistency report compares every
 view against the others and reports absence as absence. Each analysis is an immutable,
 content-addressed **snapshot**, and any two snapshots can be compared to show exactly what
 changed and how well that change is evidenced. A gap report states plainly where the
@@ -22,22 +24,24 @@ repository → ingestion → analysis → evidence → canonical graph
 
 ## Status
 
-**STATUS: PARTIAL** - Phases 1, 2 and 3 complete and verified. Usable and deployable for its
+**STATUS: PARTIAL** - Phases 1 to 4 complete and verified. Usable and deployable for its
 stated scope; deliberately incomplete beyond it. Per-capability status is in
 [`docs/verification.md`](docs/verification.md).
 
 | | |
 |---|---|
-| Analyses real repositories | Yes — verified against this repository, over HTTP and in a container |
+| Analyses real repositories | Yes — verified against this repository and `pallets/flask`, over HTTP and in a container |
 | Behaviour, data and traceability | Yes - sequence, activity, data flow and lineage; requirements, use cases, cross-artifact consistency |
 | Drift between two states | Yes — verified on a real change set, in a container too |
-| Tests | 489 passing (`npm run test`) |
+| Tests | 654 passing (`npm run test`) |
 | Lint / typecheck / build | Clean |
-| Container image | Builds and runs; verified through Phase 3, including every Phase 3 endpoint |
+| Container image | Builds and runs; verified through Phase 4, including multi-table SQL, returns and responses |
 | Artifacts | Dependency graph, module structure, class diagram, ER diagram, C4 x 3 levels, sequence, activity, data flow |
+| Data access | Joins, comma lists, subqueries, CTEs, `UPDATE…FROM`, `DELETE…USING`, several statements per literal — with read and write kept apart. **No ORM or query-builder support**, by decision |
+| Return messages | Yes — drawn from `return`/`await`/`throw`/response statements, each citing the statement that established it; never inferred from the existence of a call |
 | Requirements and use cases | Yes - read from documents and evidenced entry points, with a requirement-to-test chain; issues-tracker requirements are not recovered |
-| Browser rendering of the UI | **Partially verified** - driven in real headless Chromium, 41/41 checks with two analyses; layout, zoom and non-Chromium browsers are not verified |
-| Not built | Deployment diagram; issues-tracker requirements; semantics-level contradiction detection; symbol-level and Git-corroborated renames; archive-upload endpoint; API auth and rate limiting |
+| Browser rendering of the UI | **Partially verified** - driven in real headless Chromium, 45/45 checks against the container build with two analyses; layout, zoom and non-Chromium browsers are not verified |
+| Not built | Deployment diagram; issues-tracker requirements; semantics-level contradiction detection; symbol-level and Git-corroborated renames; archive-upload endpoint; API auth and rate limiting; column-level lineage |
 
 ## Quick start
 

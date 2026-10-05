@@ -197,7 +197,12 @@ Selection is by language detected from the extension during ingestion. Order mat
 specific parsers are tried before the catch-all configuration scanner, so `tsconfig.json`
 is never handed to a source parser.
 
-`ParsedFile` contains `imports`, `entities`, `calls`, `markers`, `problems`, `durationMs`.
+`ParsedFile` contains `imports`, `entities`, `calls`, `markers`, `problems`, `durationMs`, and
+from Phase 4 four more: `responses`, `throws`, `returns`, `bindings`.
+
+**Those four are all optional, and a rule that reads one must gate on that one.** A record the
+graph builder does not read is dead weight, and its absence is invisible — that is exactly how a
+FastAPI response was extracted and then dropped (D-054, D-064).
 
 ### 5a. TypeScript / JavaScript
 
@@ -209,14 +214,32 @@ TypeScriptSourceParser.parse(source, context)       packages/parsers/src/typescr
       ├─ import/export/require declarations        → imports[]
       ├─ describeDeclaration(node)                 → entities[]
       │    └─ opensScope only for callable containers
-      ├─ handleCallExpression(node)
-      │    ├─ ImportKeyword                        → dynamic import
-      │    ├─ calleeName()                        → calls[]
-      │    ├─ routeMarker()                        → http.route marker
-      │    ├─ middlewareMarker()                   → middleware.mount marker
-      │    └─ testMarker()                         → test.case / test.suite marker
-      └─ push/pop ctx.stack around scoped bodies
+├─ handleCallExpression(node)
+       │    ├─ ImportKeyword                        → dynamic import
+       │    ├─ calleeName()                        → calls[]
+       │    ├─ sqlQueryMarkers()                    → sql.query / sql.cte / sql.statement
+       │    ├─ routeMarker()                        → http.route marker
+       │    ├─ middlewareMarker()                   → middleware.mount marker
+       │    ├─ testMarker()                         → test.case / test.suite marker
+       │    └─ call.result / call.awaited           Phase 4: what the source does with the result
+       ├─ recordAwait(node)         Phase 4: await  → the call it wraps
+       ├─ recordReturn(node)        Phase 4: return → its shape, name and awaited-ness
+       ├─ recordThrow(node)         Phase 4: throw / reject → throws[]
+       ├─ recordBinding(node)       Phase 4: const x = <call> → bindings[]
+       ├─ recordHttpResponse(node)  Phase 4: res.json / reply.send / Response.json
+       │                                  / new Response / reply.status(404)
+       └─ push/pop ctx.stack around scoped bodies
+     resolveChainedResponseStatuses(ctx)   after the walk
 ```
+
+**Why the Phase 4 records are visited before anything else.** The source file is parsed with
+`setParentNodes: false`, so a call cannot ask whether it is `await`ed or what a `return` does with
+its value. The `await` and `return` nodes register the fact first — a parent is always visited
+before its children — and the call reads it.
+
+**Why statuses resolve after the walk.** In `res.status(201).json(order)` the producing call is
+visited before the configuring call it is built on, so the status is not yet known. The same
+ordering decides whether a status is a response of its own or belongs to a producer (D-063).
 
 **Why `opensScope` is explicit.** Only callable containers own the code inside them. A
 `const value = compute(x)` does not make `compute` a call made *by* `value`; treating it
@@ -240,13 +263,21 @@ PythonSourceParser.parse(source, context)           packages/parsers/src/python.
       ├─ from/import statements      → imports[]
       ├─ def / class                 → entities[]  (indent stack → qualified names)
       ├─ UPPER_CASE assignment        → constants
-      ├─ collectCalls()               → calls[]
-      └─ pythonMarker(line.raw)      → http.route / async.task markers
+├─ collectCalls()               → calls[]
+       ├─ pythonSqlMarkers()          Phase 4: sql.query / sql.cte / sql.statement
+       ├─ recordPythonReturn/Throw/Response   Phase 4: return / raise / response
+       └─ pythonMarker(line.raw)      → http.route / async.task markers
 ```
 
 **Why two views.** Definitions are detected on `code` so a `def` inside a docstring is
 invisible. Markers are detected on `raw` because a route path is a string value — reading
 it from the blanked view made route detection impossible (fixed in this phase).
+
+**Why a route marker is held, not emitted.** A Flask or Fastify decorator sits on the line
+*above* the function it serves, so the marker that names the route cannot see its handler. It is
+held until the next definition at the same indentation, and that definition's own name becomes the
+handler (D-066). Before this, Flask produced 128 endpoints and zero of them connected to code, so
+the sequence view reported no interaction for the whole repository while the call graph was full.
 
 Scope comes from indentation, which is Python's block structure. This is not a complete
 Python grammar; anything requiring evaluation is reported as a marker or a problem rather
@@ -256,12 +287,46 @@ than guessed at.
 
 ```
 ConfigSourceParser.parse(source, context)           packages/parsers/src/config.ts
- ├─ package.json          → manifest.dependency / manifest.script / manifest.entrypoint
- ├─ docker-compose.yml    → compose.service
- ├─ Dockerfile            → docker.base_image / docker.expose / docker.build_stage
- ├─ *.sql                 → schema.table + schema.column  (tables emitted first)
- └─ other JSON / YAML     → config.key
+  ├─ package.json          → manifest.dependency / manifest.script / manifest.entrypoint
+  ├─ docker-compose.yml    → compose.service
+  ├─ Dockerfile            → docker.base_image / docker.expose / docker.build_stage
+  ├─ *.sql                 → schema.table + schema.column  (tables emitted first)
+  └─ other JSON / YAML     → config.key
 ```
+
+### 5d. SQL in code (Phase 4)
+
+```
+analyzeSql(text) → SqlStatementAnalysis | null       packages/parsers/src/sql.ts
+  ├─ splitStatements(text)      top-level semicolons only; a semicolon in a literal is not a split
+  └─ per statement: analyzeOne(segment)
+       ├─ tokenizeSql()         comments dropped, string bodies opaque, quoted identifiers kept
+       ├─ WITH … AS ( … )       cteBodies() → each body re-analysed, so its tables are read
+       ├─ VERB_CLAUSE_REQUIREMENTS   a keyword must carry the clause its verb needs
+       └─ linear token walk
+            FROM / JOIN / USING / INTO / UPDATE
+              └─ tableReferenceAt()  → SqlTableAccess { table, operation, role }
+```
+
+**A tokeniser, not a regular expression.** Phase 3 read data access with regexes restricted to one
+statement and one table; widening that with more regexes would have made it wrong a new way each
+time (`SELECT * FROM x -- FROM y` reporting a read of `y`). Comments and string bodies are dropped
+rather than matched, and anything not classified deterministically returns `unsupportedReason`.
+
+**What it reads.** Joins (including `LEFT OUTER` and `STRAIGHT_JOIN`), comma lists with `AS`
+aliases, schema-qualified names, subqueries at any depth, `EXISTS` and `IN` subqueries, derived
+tables, `UPDATE … FROM`, `DELETE … USING`, `DELETE alias FROM …`, `INSERT … SELECT`, set
+operations, and several statements in one literal.
+
+**What it does not claim.** A CTE is not a store: it is recorded as a query expression, and the
+physical tables its body reads are attributed to the function whose statement defined it (D-052).
+`SELECT … FOR UPDATE` is read, not written — the row lock is not modelled. `MERGE`, `CREATE`,
+`TRUNCATE` and friends are reported as recognised but unclassified, with the reason, so "a query is
+here and I could not read it" is distinguishable from "no database access here" (D-060).
+
+**No ORM.** `reads` and `writes` come only from table names in SQL the extractor read. Mapping
+`db.users.findMany()` to a `users` table would be a guess about which call touches which store
+(D-061).
 
 ---
 
@@ -297,8 +362,31 @@ buildGraph(input)                                     packages/core/src/graph-bu
   │         └─ attributeBuildContext()              modules inside a compose `build:` context
   │                                              → deploys edge, STRONGLY_INFERRED
   │
-  └─ PASS 9: git facts → commit, contributor, authored_by, modifies
+  ├─ PASS 9: git facts → commit, contributor, authored_by, modifies
+  │
+  └─ PASS 10: return facts (Phase 4)                addReturnFacts()
+       ├─ addReturnStatements()   hasReturn, returnCount, returnsShape
+       │    └─ return <callee>(…)  → returns edge, callee → caller, STRONGLY_INFERRED
+       ├─ addBindingReturns()     const rows = await f(); return rows;
+       │    └─ single assignment  → returns edge, WEEKLY_INFERRED, inferred: true, via: <var>
+       ├─ addThrowRelationships() explicit throw / reject / raise in the callee
+       │    └─ callers read from the CALL graph, not this file  → throws edge
+       └─ addHttpResponses()      http.response markers → returns edge, handler → endpoint
 ```
+
+**Direction is what makes the new edges meaningful.** `returns` and `throws` run callee → caller:
+at `return service.find(id)` the caller hands the callee's value to *its* caller, so the arrow
+points at the caller. `http.response` runs handler → endpoint, because the endpoint is the
+requester.
+
+**A self-directed edge is dropped.** A function does not hand its value to itself. This arises when
+a returned name resolves to the declaration enclosing its use (`return list(...)` inside a method
+called `list`) and would put a loop in a sequence view the code never states (D-058).
+
+**Attributes are staged and flushed once.** `addNode` keeps the attributes a node already has, so a
+count written from two passes silently keeps only the first value. Counts are collected in
+`StagedAttributes` and written once per node, which is also why the counts can be trusted to be
+counts.
 
 **Pass 3 is why inheritance works at all.** Indexing during entity creation made
 resolution depend on file order, so a class extending a later-declared base silently lost
@@ -320,6 +408,10 @@ Confidence assignment:
 | inheritance, call with a resolved callee | `STRONGLY_INFERRED` | the statement exists; the target identity was resolved by us |
 | module inside a declared build context | `STRONGLY_INFERRED` | the context says what is sent to the builder, not what is copied |
 | call from a module with no identified caller | `WEEKLY_INFERRED` | weaker claim about the origin |
+| response written by the handler (`res.json`, `reply.send`, `Response.json`) | `EXPLICIT` | the handler's body contains the response call |
+| status set with the body returned (`reply.status(404); return { … }`) | `STRONGLY_INFERRED` | the status is stated; that the framework sends the returned body is framework behaviour (D-063) |
+| `return <callee>(…)` | `STRONGLY_INFERRED` | the statement names the callee; which value comes back is not resolved to a type |
+| return through a single-assignment local | `WEEKLY_INFERRED` | the return names a variable, not the call; labelled `inferred: true` |
 | unresolvable | *not created* | no edge rather than a guessed one |
 
 Nothing is created without an evidence citation. Deduplication is by deterministic id
@@ -342,7 +434,7 @@ projectAtlas(graph)                                   packages/artifacts/src/ind
   │                                 cross-container imports/calls → depends_on
   ├─ buildC4(component)          module + deploys → component; module→module → depends_on
   └─ analyseGaps(graph)
-  → buildSequence()           api_endpoint | cli_command | event_consumer, `calls`; messages only, no returns
+  → buildSequence()           api_endpoint | cli_command | event_consumer, `calls` + `returns` + `throws` (Phase 4)
   → buildActivity()           function | test, `branches` | `loops` edges; ordered by source line
   → buildDataFlow()           `reads` | `writes` | `communicates_with` only
   → checkConsistency()        compares every artifact above over one graph
@@ -352,6 +444,10 @@ projectAtlas(graph)                                   packages/artifacts/src/ind
        → useCaseReachability       entry point with no reachable step
        → dataCoverage              table no analysed code reads or writes
        → behaviourCoverage         entry point with no tests relationship
+       → returnRelationshipSupport Phase 4: return/throws edge with no supporting call
+       → responseEndpointPairing   Phase 4: response arrow pointing at a non-endpoint
+       → queryExpressionAsStore    Phase 4: a CTE or subquery name reached a table node
+       → unclassifiedStatements    Phase 4: SQL read but not classified, with the count
        → crossArtefactAgreement    recorded agreement, so problems have context
        ├─ deploymentArchitecture   compose services, base images, deploys edges
        ├─ apiSurface               api_endpoint count
@@ -367,6 +463,36 @@ projectAtlas(graph)                                   packages/artifacts/src/ind
 
 Every artifact reports `omitted[]`, `insufficientEvidence` and a `scope` string, so an
 incomplete view is never mistaken for a complete one (D-020).
+
+### 7c. Sequence walk and return messages (Phase 4)
+
+```
+sequenceMessages(graph, entry) → SequenceMessage[]      packages/artifacts/src/behaviour.ts
+  walk(source, depth):                                    ← DEPTH-FIRST
+    for each `calls` edge, id-sorted:
+      emit the call
+      walk(callee, depth + 1)         whatever the callee does happens before its value comes back
+      emit `returns` for (callee → source), then `throws`
+  bounded by MAX_SEQUENCE_DEPTH (8), a visited set, and MAX_SEQUENCE_MESSAGES (60) calls
+```
+
+**Depth-first, because breadth-first drew the return first.** `handler -> service`,
+`service -> database`, then `service -> handler` returning reads as though the callee handed back a
+value before doing the work that produced it. That is not a cosmetic ordering problem — it asserts a
+sequence the code does not have (D-056).
+
+**Pairing is by `(callee, caller)`, never by position.** A `returns` edge is drawn only on the call
+whose caller is that edge's target, so a return can never appear against a call it does not belong
+to, and the order is deterministic for a given graph.
+
+**The budget bounds calls, not messages.** A limit on *new work* can never orphan the hand-back of
+work already shown. Bounding messages did exactly that: on this repository every HTTP response
+landed past the cap (positions 93–825) and the diagram showed requests going out with nothing coming
+back — the same incompleteness Phase 4 removed, looking identical to it (D-065).
+
+**Projected arrow ids name their flow** (`seq:<entry>:<order>:<from>-><to>`). The order counter
+restarts per flow, so `seq:2:service->repo` was produced once per entry point and two arrows shared
+an id — and a view that selects an arrow by id then shows whichever came first (D-049).
 
 Every `NOT_FOUND` gap reports `checked` and `whatWouldResolve`, and hedges where the
 capability may live outside the repository (D-008). Two tests enforce this.
@@ -434,6 +560,17 @@ describe the *claim that it is gone*, which is only assertable when the target a
 complete (D-028). A truncated target sets `removalConfidence: 'INDETERMINATE'` and attaches a
 `reason` to every removal.
 
+**Phase 4 moved both version constants, deliberately.**
+
+| Constant | Was | Now | Why |
+|---|---|---|---|
+| `GRAPH_SCHEMA_VERSION` | 3 | **4** | the graph gained `returns` and `throws` edges, `role`/`statement` on data-access edges, and the function attributes behind them. A sequence drawn from a version 3 graph and one drawn from a version 4 graph disagree about what an interaction hands back, so the two must not be diffed against each other |
+| `EXTRACTOR_VERSION` | 1.0.0 | **1.1.0** | unchanged source now produces different facts: the SQL scanner reads every table in a statement, and return, rejection and response records became graph facts |
+
+Both are part of the digest, so a snapshot taken under either old value no longer compares as though
+nothing changed. `incomparabilityReason()` reports which of the two differs rather than silently
+reinterpreting old data.
+
 ---
 
 ## 8. Persistence and API
@@ -495,6 +632,11 @@ Notes that matter:
   previous analysis" would silently pick whichever row happened to sort first.
 - `/drift` reads no filesystem. It takes two analysis ids and nothing else, so the
   `REPOATLAS_ALLOWED_ROOTS` boundary is untouched by it.
+- **Phase 4 added no endpoint.** The new facts are already reachable: `/artifacts/sequence` carries
+  the return, error and response messages, `/artifacts/data-flow` the multi-table flows, and
+  `/lineage/:nodeId` now also reports `usage` — `{ read, write, unclassified }` counted from the
+  relationships that touch the subject. A new endpoint would have been a new surface with nothing
+  new to expose.
 - Request validation goes through `parseOrThrow()`, converting `ZodError` into a 400
   naming each offending field (D-016).
 - The single not-found handler is owned by `buildApp()` and delegated, because Fastify
@@ -529,6 +671,28 @@ main.tsx → App                                        packages/web/src/app.tsx
 `graph.tsx` renders an artifact deterministically (D-021) with confidence encoded as
 solid versus dashed edges. Clicking a node opens the inspector, which is where a selected
 entity connects across representations.
+
+### 9b. Interaction evidence (Phase 4)
+
+```
+click an arrow  →  InteractionPanel                  packages/web/src/phase3.tsx
+  ├─ message kind: call / return / error path
+  ├─ confidence badge
+  ├─ derivation, in the words of the rule that drew it
+  ├─ both participants, each opening the entity inspector
+  ├─ every evidence record: path, line range, kind, producer
+  └─ the graph edge that justifies the arrow
+```
+
+An arrow is a claim about the repository, so it has to be inspectable on its own. Selecting the two
+endpoints instead would show *what exists*, not *what the repository says happens between them*.
+
+**Progressive disclosure is preserved.** The list of arrows is unchanged; the panel only appears when
+one is selected. An empty evidence list is stated as empty rather than hidden.
+
+**A status-set response says where its body came from.** `reply.status(404); return { error }` renders
+as `responds 404 (status set, body returned from the handler)` — not `responds 404`, which would
+imply the handler wrote a body (D-063).
 
 ### 9a. The chain the UI must preserve
 
@@ -621,10 +785,31 @@ Stated so this document is not read as a claim of completeness:
   has no HTTP entry point.
 - No CORS, rate limiting or authentication middleware. `REPOATLAS_CORS_ORIGIN` exists but
   is not yet wired into the Fastify instance.
-- No requirement, sequence, DFD, use-case, activity or deployment projection. They are
-  absent because the graph does not yet hold their facts.
-- No in-graph **consistency** checker. Drift compares two states; it does not look for
-  contradictions inside one graph.
 - C4 recovers only what the graph holds: no human actors, no package-as-container, and no
   components for a container that declares an image but no build context. Each is recorded
   in the level's `omitted[]` rather than drawn.
+
+Phase 4 additions, stated as limits rather than as oversights:
+
+- **No ORM or query-builder extraction.** `reads` and `writes` come only from table names in SQL
+  the analyser read. A repository behind Prisma, SQLAlchemy, Knex or Drizzle shows stores the
+  repository never evidences, and a declared table nothing touches is reported as missing evidence
+  with the reason (D-061). This is the largest remaining gap in the data views.
+- **Table-level data access only.** No column-level lineage: a `SELECT` list names columns, but the
+  relationships recorded are the tables a statement touches, and inventing column edges from a
+  projection list the analyser does not resolve would be a guess.
+- **`SELECT … FOR UPDATE` is read, not written.** The statement reads; the row lock is not
+  modelled.
+- **`MERGE`, `TRUNCATE`, `CREATE`, `ALTER` and `DROP` are recognised but unclassified.** They appear
+  in the omission log with the reason rather than contributing a guessed read or write (D-060).
+- **A status-set response is a framework inference.** `reply.status(404); return { … }` is recorded
+  because the status is in the code and the return is in the code; that the framework sends the
+  returned body is Fastify's documented behaviour, and the edge is `STRONGLY_INFERRED` for that
+  reason (D-063).
+- **A return value is never resolved to a type.** `return user;` records that the caller hands a
+  value back, not that it is a `User`. The sequence states the fact and not a shape (D-057).
+- **Returns through a local are explicitly weaker.** `const rows = await findAll(); return rows;` is
+  recorded at `WEEKLY_INFERRED` with `inferred: true` and the variable named, and only when that name
+  has exactly one assignment (D-057).
+- **Python records no constructor return shape.** `User(1)` is written exactly like a call and Python
+  has no `new`, so distinguishing them would need a naming convention (D-062).

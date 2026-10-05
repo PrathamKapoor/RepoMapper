@@ -6,21 +6,20 @@ Read this file first, then `decisions.md` and `flow.md`, before starting work.
 
 ## 1. Current Phase
 
-**Phase 3 — behaviour, data and traceability: complete, verified and committed.**
+**Phase 4 — richer data access and return messages: complete, verified and committed.**
 
-The graph now carries the facts behaviour and data views need: explicit control flow, SQL data
-access, schema keys and constraints, declared requirements, and a test-to-endpoint link. On top
-of them the product projects sequence, activity and data-flow views, recovers requirements and
-use cases, follows any entry point through to the code and test that serve it, and compares
-every view against the others.
+The graph now carries what a sequence diagram needs to be more than a call graph. Data access
+reads every table a SQL statement touches — joins, comma lists, subqueries, CTEs,
+`UPDATE … FROM`, `DELETE … USING`, several statements in one literal — with reads and writes kept
+apart and each edge naming the clause it came from. Sequence views draw return, failure and HTTP
+response arrows, every one citing the statement that established it. A statement the analyser will
+not read is reported as unread rather than ignored.
 
 The product is **usable and deployable for its stated scope** and **explicitly partial** beyond
-it. Rendering is verified by CDP assertions (38/38 with one analysis, 41/41 with two and a real
-change), not by pixels; visual layout, zoom, drag and non-Chromium browsers remain unverified
-(D-041, D-048). Per-capability status is in `docs/verification.md`.
-docs/verification.md
-`
-.
+it. Rendering is verified by CDP assertions (43/43 with two identical analyses, 45/45 with a real
+change between them, both against the container build), not by pixels; visual layout, zoom, drag,
+non-Chromium browsers and the per-arrow evidence panel remain unverified (D-041, D-048).
+Per-capability status is in `docs/verification.md`.
 
 ---
 
@@ -31,7 +30,57 @@ graph, gap analysis, persistence, the API, the UI, the container image and CI. C
 from Phase 2: snapshots and drift, content digests, the C4 projections at three levels,
 deployment attribution by build context, and the Snapshot and Drift views.
 
-Phase 3 added, in dependency order:
+Carried over from Phase 3: explicit control flow, SQL data access, schema constraints, declared
+requirements, requirement → use case → implementation → test traceability, the behaviour and
+data projections, and the cross-artifact consistency engine.
+
+Phase 4 added, in dependency order:
+
+- **A SQL statement analyser** (`parsers/src/sql.ts`) replacing Phase 3's single-table regular
+  expressions. A tokeniser plus a clause walker, not a grammar: it reads joins in every modifier
+  form, comma lists with `AS` aliases, schema-qualified names, subqueries at any depth, `EXISTS`
+  and `IN` subqueries, derived tables, `UPDATE … FROM`, `DELETE … USING`, `INSERT … SELECT` and
+  several statements in one literal. Comments and string bodies are dropped during tokenisation,
+  which is what stops `SELECT * FROM x -- FROM y` reporting a read of `y`. Anything it cannot
+  classify returns a reason.
+- **Read and write kept apart, per table.** One `reads` or `writes` edge per table, carrying the
+  clause the name appeared in and the statement it came from. A table in a `WHERE` is not a store
+  this statement writes; a joined table is not a write target. A statement that both reads and
+  writes is recorded as both, on different tables.
+- **CTEs as query expressions, never as stores.** `WITH recent AS (…) SELECT … FROM recent`
+  produces a query-expression node held by the function whose statement defined it, plus the
+  physical tables its body reads. A CTE name never reaches a table node, and the consistency
+  engine contradicts it if one ever does.
+- **Unclassified SQL is reported.** A statement recognised and declined produces a node with the
+  reason, a consistency finding, and an entry in the data-flow omission log — so "a query is here
+  that I could not read" never reads as "no database access here".
+- **Return, failure and response facts** (`returns` and `throws` edges, `hasReturn`,
+  `returnCount`, `throwSites`). Recovered from `return`/`await`/`throw`/`reject`/`raise` and
+  response calls. Never inferred from the existence of a call, which is the one thing that would
+  have made the diagram look complete and be wrong.
+- **A Python route decorator names the function below it.** Before this, Flask produced 128
+  endpoints and none connected to a handler, so the sequence view reported no interaction for the
+  whole repository (D-066).
+- **A depth-first sequence walk that always closes its calls.** A return is drawn after the work
+  that produced it, and the budget bounds new calls rather than messages, so a drawn call can
+  never lose its hand-back (D-056, D-065).
+- **Lineage says how a store is used** — reads, writes and unclassified counted separately, each
+  hop carrying its operation, clause and statement.
+- **Four new consistency rules**, checking that returns and failures are backed by calls, that a
+  response is paired with an endpoint, that a query expression is not a stored table, and that
+  unclassified statements are reported.
+- **An evidence panel for a single arrow** in the behaviour view, and read/write usage wording in
+  the lineage panel.
+- **Graph schema version 4** and **extractor version 1.1.0**, so a version 3 snapshot is
+  reported incomparable rather than reinterpreted.
+- **165 new tests** (489 → 654), including fourteen defects found by running the new code against
+  real repositories.
+- **Verification**: real self-analysis (5568 nodes, 8532 edges; 19 HTTP responses, 78 returns,
+  49 throws, 18 reads), a second real repository (`pallets/flask`: 2534 nodes, 128 endpoints all
+  resolving to handlers, 240 failure sites), every endpoint exercised in a Linux container, and
+  the browser driver at 43/43 and 45/45 against the container build.
+
+### Phase 3 added, in dependency order:
 
 - **The facts behaviour views need.** Explicit control flow (`branches`, `loops` edges to
   `condition` nodes) for TypeScript and Python; `isAsync` where the declaration states it;
@@ -67,7 +116,32 @@ Phase 3 added, in dependency order:
   257/1205), every Phase 3 endpoint exercised in a Linux container, and the browser driver at
   38/38 and 41/41.
 
-### Bugs found and fixed during this phase
+### Bugs found and fixed during Phase 4
+
+Every one was found by running the new code against real repositories or adversarial input, not by
+reading it. Four presented as a working feature: the code ran, the tests passed, and the artifact
+looked plausible.
+
+| | Symptom | Root cause |
+|---|---|---|
+| D-050 | `LEFT OUTER JOIN b` reported a table named `JOIN`; `STRAIGHT_JOIN b ON 1` reported one named `ON` | A join modifier was treated as introducing the table instead of stepping towards `JOIN` |
+| D-051 | `FROM users AS u, orders AS o` read one table | The alias is two tokens; the walk consumed the `AS`. Same bug hid behind `public.users u` |
+| D-052 | Two same-named CTEs became one node with two producers, reading as one query result fed by two stores | Node id keyed by the CTE's name, which means nothing outside its statement |
+| D-053 | Two identical unclassified statements counted as one | Node id keyed by the statement's summary, which is a description |
+| D-054 | A FastAPI response was extracted and then dropped — the graph held no fact the endpoint answered | Python emitted `ParsedFile.responses` but not the `http.response` marker the graph builder reads |
+| D-055 | `new Response(body)` unreachable | A guard returned for anything that was not a call, ahead of the check written to accept it |
+| D-058 | A self-directed return put a loop in the sequence view | A returned name resolving to the declaration enclosing its use |
+| D-063 | All 19 HTTP responses on this repository's own API were in the graph and none were drawn | `reply.status(404); return { … }` is Fastify's way of answering and was not recognised |
+| D-064 | `addHttpResponses` gated on one field and read another | The mechanism behind D-054; found by a test written after the fix |
+| D-065 | Every response landed past the 60-message cap and was cut | Returns come after the callee's subtree; bounding messages orphaned the hand-back of work already drawn |
+| D-066 | Flask: 128 endpoints, 0 handlers, sequence reported no interaction | A decorator sits above the function it serves and cannot name it |
+| D-067 | React reported a duplicate key `deployment_component:repoatlas` | A C4 element lists its own id in `graphNodeIds`, and the rule prefixed `node.id` to that |
+
+The question that found most of them: **which facts in the graph reached the picture?** Comparing
+that count against the count in the graph is what turned "the feature works" into "the feature
+runs and is invisible".
+
+### Bugs found and fixed during Phase 3
 
 | | Symptom | Root cause |
 |---|---|---|
@@ -81,7 +155,45 @@ Phase 3 added, in dependency order:
 
 ## 3. Files Changed
 
-Phase 3 (this phase):
+Phase 4 (this phase):
+
+```
+packages/parsers/src/sql.ts             NEW   SQL tokeniser + clause walker: joins, subqueries,
+                                                 CTEs, multi-statement literals, read/write roles
+packages/parsers/src/typescript.ts              await/return/throw/binding/HTTP-response records;
+                                                 chained status resolution after the walk
+packages/parsers/src/python.ts                 return / raise / response records; route decorator
+                                                 attached to the definition below it
+packages/parsers/src/contract.ts               the four new ParsedFile fields, initialised
+packages/parsers/test/sql.test.ts       NEW   52 statement-analysis tests
+packages/parsers/test/returns.test.ts   NEW   38 return, throw and response tests
+packages/core/src/types.ts                     returns/throws edge kinds; ThrowRecord,
+                                                 ReturnRecord, BindingRecord, CallResult,
+                                                 HttpResponseRecord
+packages/core/src/graph.ts                     GRAPH_SCHEMA_VERSION 3 -> 4
+packages/core/src/snapshot.ts                  EXTRACTOR_VERSION 1.0.0 -> 1.1.0
+packages/core/src/graph-builder.ts             addReturnFacts (statements, bindings, throws,
+                                                 HTTP responses), query expressions, unclassified
+                                                 statements; scoped node ids
+packages/core/test/graph-builder.test.ts       CTE and statement identity, return facts
+packages/artifacts/src/behaviour.ts            depth-first walk, return/error/response arrows,
+                                                 call-bounded budget, per-flow arrow ids
+packages/artifacts/src/data-flow.ts            query-expression and unclassified omission entries;
+                                                 lineage operation, role, statement, usage
+packages/artifacts/src/consistency.ts          return support, response pairing, query-expression
+                                                 scope, unclassified statements; deduped ids
+packages/artifacts/test/behaviour.test.ts      return ordering, response labels, arrow-id uniqueness
+packages/artifacts/test/data-flow-multi.test.ts NEW  13 multi-table flow and lineage tests
+packages/artifacts/test/consistency.test.ts    the four new rules; entity-id uniqueness
+packages/server/test/phase4-pipeline.test.ts NEW  17 end-to-end tests over the real pipeline
+packages/web/src/phase3.tsx                    interaction evidence panel; lineage usage wording
+packages/web/src/graph.tsx                     selectable arrows
+packages/web/src/api.ts                        LineageHop.operation/role/statement, Lineage.usage
+packages/web/test/phase3-presentation.test.ts  lineage wording tests
+scripts/verify-browser.mjs                     return, failure and omission checks
+```
+
+Phase 3 (previous phase):
 
 ```
 packages/core/src/types.ts                  condition nodes; branches/loops/references/tests edge kinds; isAsync
@@ -154,9 +266,11 @@ parseFiles()                 packages/parsers/src/registry.ts     deterministic 
    │                         └─ contentDigest() per file, no extra I/O
    ▼
 buildGraph()                 packages/core/src/graph-builder.ts   THE canonical graph
-   │                         └─ attributeBuildContext(): deploys edges from compose `build:`
-   ▼
+    │                         ├─ attributeBuildContext(): deploys edges from compose `build:`
+    │                         └─ addReturnFacts(): returns, throws, HTTP responses
+    ▼
 createSnapshot()             packages/core/src/snapshot.ts        content-addressed identity
+    │                         extractor 1.1.0, graph schema 4
    │
    ├─ Store.saveAnalysis()   packages/server/src/store.ts
    │
@@ -175,7 +289,7 @@ Store (node:sqlite)          packages/server/src/store.ts
 Fastify API                  packages/server/src/app.ts
    │
    ▼
-React UI                     packages/web/src/    8 tabs
+React UI                     packages/web/src/    10 tabs
 ```
 
 Three invariants now hold the design together:
@@ -187,12 +301,15 @@ Three invariants now hold the design together:
 3. **A claim about absence is separate from a claim about existence.** `removalConfidence`
    and `indeterminate` say how well *we looked*; `confidence` says how well *the repository
    states it*. One value cannot answer both.
+4. **An arrow must name the statement that drew it.** A return is not implied by a call, a
+   response is not implied by a route, and a store is not implied by a query mentioning it. Every
+   relationship cites the line that established it, and what cannot be cited is reported unread.
 
 ---
 
 ## 5. Decisions Made
 
-40 entries in `decisions.md`. The ones a new contributor must know:
+67 entries in `decisions.md`. The ones a new contributor must know:
 
 | Decision | Summary |
 |---|---|
@@ -217,8 +334,20 @@ Three invariants now hold the design together:
 | D-044 | A stated requirement with no implementation is kept and marked partial, not dropped |
 | D-045 | A use case is capped at 40 steps and the cap is reported |
 | D-046 | The traceability index builds its models once; per-row model building was a 15 s request |
-| D-047 | Sequence messages are calls only; no return arrow is drawn |
+| D-047 | Sequence messages are calls only; no return arrow is drawn — **superseded by D-057** |
 | D-048 | Browser checks wait for content, not for controls |
+| D-050 | A join modifier steps towards `JOIN`; it never introduces a table |
+| D-051 | A comma-list steps over `AS` as well as the alias |
+| D-052 | A CTE's identity is its defining scope, not its name |
+| D-054 | A parser that records a response must also emit the marker the graph reads |
+| D-056 | The sequence walk is depth-first, because breadth-first drew returns first |
+| D-057 | A return comes from a `return` statement, never from the existence of a call |
+| D-060 | SQL this analyser will not read is reported as unread, not ignored |
+| D-061 | **ORM and query-builder extraction stays unsupported** |
+| D-063 | A status set on a response object is a response — and carries `statusOnly` |
+| D-065 | The sequence budget bounds calls, not messages |
+| D-066 | A Python route decorator names the function below it |
+| D-067 | A finding names each entity once |
 
 ---
 
@@ -249,7 +378,7 @@ npm ci                # reproducible install from the lockfile
 npm run lint          # eslint, type-aware
 npm run typecheck     # tsc --noEmit per package, source + tests
 npm run build         # all packages + web bundle
-npm run test          # vitest, 489 tests
+npm run test          # vitest, 654 tests
 npm run verify        # lint + typecheck + build + test, in that order
 ```
 
@@ -258,23 +387,31 @@ run without a build silently exercises the previous build (D-035).
 
 Verification, recorded with output in `docs/verification.md`:
 
-- **Real self-analysis.** This repository analysed at commit `954f3d7`: 4582 nodes, 6983 edges,
-  9144 evidence records, sequence 257 participants / 1205 messages, activity 1809 / 2565,
-  data flow 7 / 7, 31 requirements stated by documents plus 25 derived, and 37 use cases.
-  Phase 3's own facts are visible in the node and edge kinds, not only in the totals.
-- **Container.** Rebuilt from the Phase 3 tree; every Phase 3 endpoint exercised against
-  an isolated read-only fixture on Node 24.21.0, including a requirement read from a
-  document, a use case with three steps, a consistency report with zero contradictions,
-  and an ER diagram whose foreign key came from an `ALTER TABLE` statement.
-- **Browser.** Real headless Chromium over the DevTools Protocol, no added dependency:
-  **38/38** checks with one analysis, **41/41** with two and a real change between them.
-  Covers all ten tabs, the three behaviour views on demand, lineage, the requirements and
-  use-case lists, opening a chain from the index, and the consistency view.
+- **Real self-analysis.** This repository analysed at commit `88d87c2`: 5568 nodes, 8532 edges,
+  11858 evidence records. Sequence 224 participants / 1265 messages — 1205 calls, **32 returns,
+  19 HTTP responses, 9 error paths**; data flow 23 nodes / 29 relationships; 18 `reads` (5 from a
+  join) and 11 `writes`; 78 `returns` and 49 `throws`; 28 unclassified SQL statements, each with
+  its reason.
+- **A second real repository.** `pallets/flask`: 2534 nodes, 8131 edges. **128 endpoints, all
+  resolving to a handler** (169 `route.handler` edges, was 0); sequence 40 flows with **176 calls,
+  23 returns and 5 error paths** (was 0 messages); **240 `throws` edges** from `raise`. Flask's own
+  queries are single-table, so this run verified the Python paths rather than multi-table SQL —
+  stated as such rather than counted as evidence for a claim it did not exercise.
+- **Container.** Rebuilt from the Phase 4 tree on Node 24.21.0; every endpoint exercised against
+  an isolated read-only fixture, including a `LEFT OUTER JOIN` reading two tables, a CTE recorded as
+  a query expression rather than a store, a lineage hop reporting `usage: { read: 3, write: 0 }`,
+  an ER diagram whose foreign key came from `ALTER TABLE`, and the three traversal probes still
+  returning 403.
+- **Browser.** Real headless Chromium over the DevTools Protocol, no added dependency, against
+  the **container** build: **43/43** with two identical analyses, **45/45** after a real change.
+  Covers all ten tabs, the three behaviour views, return and failure messages reaching the
+  sequence view, lineage, traceability, consistency and drift.
 - **Performance, observed rather than benchmarked:** `/traceability` went from 15.2 s to
   2.9 s after D-046; the `/use-cases` payload for this repository is 538 KB for 37 use cases.
 
 **Not verified:** visual layout, styling and responsive behaviour at any viewport; React Flow
-zoom, pan and drag; and any browser other than the Chromium builds installed here. No
+zoom, pan and drag; any browser other than the Chromium builds installed here; the per-arrow
+evidence panel's rendered contents; multi-table SQL on a third-party application repository. No
 benchmark numbers are claimed. See `docs/verification.md` §5 for the full list.
 
 ---
@@ -290,8 +427,14 @@ benchmark numbers are claimed. See `docs/verification.md` §5 for the full list.
 | A container with an image but no build context gets no components | Level 3 is empty for such repositories | Recorded in `omitted[]`. Dockerfile `COPY` analysis would fix it |
 | Git history is unavailable inside the container for foreign-owned repositories | Commit, contributor and ownership facts are absent there | `GIT_UNAVAILABLE` diagnostic, analysis still succeeds. The guard is not disabled by default (D-040) |
 | Analyses run inline; long runs hold an HTTP connection | Proxies with short read timeouts need raising | Accepted, documented, D-006 |
-| `reads`/`writes` come only from single-table SQL in a string literal | A repository behind an ORM shows stores it never evidences, and the DFD is sparse | Deliberate and stated in `omitted[]`. Widening it is the first item of Phase 4 |
-| Sequence diagrams have no return arrow | A sequence shows calls but not returns, so it is incomplete in a way the view states | `omitted[]` says so (D-047). Returns are Phase 4 |
+| **No ORM or query-builder extraction** | A repository behind Prisma, SQLAlchemy, Knex or Drizzle shows stores it never evidences, and the DFD is sparse for it | **Unsupported by decision** (D-061). Mapping `db.users.findMany()` to a `users` table is a guess about which call touches which store. A declared table nothing touches is reported as `MISSING_EVIDENCE` with the reason, so the gap is visible and attributed to the extractor. Largest remaining gap in the data views |
+| **Table-level lineage only** | A reader wanting "which column becomes which" gets nothing | Not implemented. Every hop is table-level because that is what a statement names; a column-level edge would be inferred from a projection list the analyser does not resolve |
+| **Most calls in this repository draw no return** | 1154 of 1205 calls have no return arrow, so the sequence looks call-heavy | Correct and reported in `omitted[]`. Most calls here have their result discarded or bound without returning it. The alternative — drawing an arrow because a call happened — is the invention Phase 4 removed |
+| **A return records that a value comes back, not what it is** | `return user;` does not establish a `User` | Deliberate (D-057). Resolving a value to a type is inferring from the value, which the source does not state |
+| **A status-set response is a framework inference** | `reply.status(404); return {…}` is drawn as a response | `STRONGLY_INFERRED`, labelled `statusOnly`, and the arrow says the body came from the return (D-063). The status is in the code; that Fastify sends the returned body is framework behaviour |
+| **A sequence flow is capped at 60 calls** | A long endpoint shows its first 60 calls and says so | Deliberate, and the budget bounds *calls* so a drawn call always keeps its hand-back (D-065). The cut is reported in `omitted[]` |
+| **Python has no constructor return shape** | `return User(1)` is recorded as a call | Deliberate (D-062). Python writes it exactly like a call; distinguishing them needs a naming convention |
+| **Reads and writes are counted separately, but not derived** | Lineage says a store is read 3 times and written 0 — it does not say what the reads produce | Correct. Column-level lineage is not implemented |
 | Requirement status is `PARTIAL` for most stated requirements in a code-only repository | A document states an obligation nothing implements | Correct and reported. Not a defect in the repository |
 | No authentication on the API | Anyone who can reach the port can analyse paths the process can read | Mitigated by `REPOATLAS_ALLOWED_ROOTS`; bound to `127.0.0.1` in compose |
 | Python extraction is structural, not a full grammar | Dynamic/metaprogrammed code is not modelled | Documented, D-004. Facts stay ≤ `STRONGLY_INFERRED` |
@@ -306,57 +449,68 @@ benchmark numbers are claimed. See `docs/verification.md` §5 for the full list.
 
 Ordered by what unblocks the most downstream value. None of these are started.
 
-1. **Return messages and error paths in sequence diagrams.** The graph records calls and no
-   returns, so the sequence view draws no return arrow (D-047). Recovering returns needs data
-   flow within a function, which is a different extraction problem.
-2. **Dockerfile `COPY` analysis.** Would replace the build-context inference with a real
-   statement of which source is in the image, strengthening every C4 component boundary
-   (D-034).
-3. **ORM and query-builder extraction.** `reads`/`writes` currently come only from
-   single-table SQL in a string literal, so a repository behind an ORM shows stores it never
-   evidences. This is the largest remaining gap in the data views and the lineage answer.
-4. **State models.** 1480 condition nodes here name states but the graph holds no transition
+1. **ORM and query-builder extraction.** `reads`/`writes` come only from table names in SQL the
+   analyser read, so a repository behind Prisma, SQLAlchemy, Knex or Drizzle evidences no store at
+   all. This is the largest remaining gap in the data views and the lineage answer. Phase 4 declined
+   it deliberately (D-061) rather than shipping a mapping that guesses which call touches which
+   table — so whoever takes this on must start by agreeing what *evidence* names a store in each
+   framework, not by mapping path segments.
+2. **Column-level lineage.** Every hop is table-level. A `SELECT` list names columns, so column
+   lineage is derivable in principle, but resolving a projection list to real edges needs its own
+   extraction pass and its own evidence rule.
+3. **`communicates_with` for HTTP clients.** No extractor produces it, so a data flow always stops
+   at an unknown store rather than crossing the system boundary. The data-flow view already
+   reports the absence.
+4. **State models.** 1582 condition nodes here name states but the graph holds no transition
    relationship, so no state diagram is drawn. Transitions need an explicit representation.
-5. **Stronger rename detection.** `git log --follow` as corroboration where history exists;
-   symbol-level pairing for a class moved between files. Both must keep D-029's refusal to
-   guess.
-6. **Requirements from an issue tracker.** Out of reach by design; the tool reports them as not
+5. **Dockerfile `COPY` analysis.** Would replace the build-context inference with a real
+   statement of which source is in the image, strengthening every C4 component boundary (D-034).
+6. **Stronger rename detection.** `git log --follow` as corroboration where history exists;
+   symbol-level pairing for a class moved between files. Both must keep D-029's refusal to guess.
+7. **Return *values*, not just return *relationships*.** A return records that a value comes back
+   and where it goes; it does not record what the value is. Resolving a returned identifier to a
+   type would need data flow within a function, which is a different extraction problem from the
+   one Phase 4 solved.
+8. **Requirements from an issue tracker.** Out of reach by design; the tool reports them as not
    recovered rather than guessing.
-7. **Screenshot comparison in the browser driver.** Layout is still verified by DOM assertions
-   only, so a visual regression would not be caught.
-8. **Archive-upload endpoint, CORS, rate limiting, API authentication.** Unchanged from Phase 1;
-   `extractTarArchive` exists and is tested but unreachable.
+9. **Screenshot comparison in the browser driver.** Layout is still verified by DOM assertions
+   only, so a visual regression would not be caught. The driver also does not click an individual
+   arrow to assert the evidence panel's contents.
+10. **Archive-upload endpoint, CORS, rate limiting, API authentication.** Unchanged from Phase 1;
+    `extractTarArchive` exists and is tested but unreachable.
 
 ---
 
 ## 10. Next Subphase
 
-**Phase 4 - data access beyond string literals, plus returns.**
+**Phase 5 — to be chosen.**
 
-Why this order:
+Phase 4's two objectives are done: data access reads more than one table per statement, and
+sequence views draw returns, failures and responses with evidence. What that work exposed is a
+better guide to the next phase than the list above:
 
-- The data views are the weakest part of the product today. `reads` and `writes` come from one
-  narrow, honest rule, and this repository's own DFD is 7 relationships because of it. Widening
-  the rule is what turns "we can see six tables" into "we can see how data moves".
-- Return messages follow from the same work: both need to know what a function hands back, and
-  a single pass over return statements and typed results could produce both. Until then the
-  sequence diagram is honest but incomplete, and its `omitted[]` says so.
-- Everything else on the list is either a smaller improvement (Dockerfile `COPY`) or blocked on
-  something external (an issue tracker).
+- **The honest question to ask of the next feature is "which facts in the graph reached the
+  picture?"** Phase 4's most serious defects — all 19 HTTP responses present but undrawn, Flask's
+  128 endpoints with no handlers — presented as working features. The tests passed and the
+  artifact looked plausible. Any new projection should be checked the same way: count the facts,
+  count the arrows, and account for the difference.
+- **A recorded fact nothing consumes is invisible.** Two of Phase 4's defects were a record
+  extracted and then dropped, and a rule that gated on one field while reading another. When a new
+  `ParsedFile` field or edge kind is added, name the consumer in the same commit, and test that it
+  reads it.
+- **Bounded projections need their budget spent on new work, never on closing work already
+  shown.** The message cap that orphaned every return arrow was a reasonable-looking limit doing
+  something subtly wrong.
 
-Concrete first steps:
+Concrete first steps if Phase 5 continues the data thread:
 
-1. Record an explicit `returns` relationship from a function to the entity it returns, with the
-   `return` statement as evidence, for TypeScript and Python. Do not infer it from types: a
-   declared return type is a claim about the signature, not about the value.
-2. Widen SQL extraction to the query builders actually present in the target repositories —
-   Knex, Prisma, TypeORM, SQLAlchemy — one at a time, each with a fixture test, and keep the
-   single-table limitation stated wherever it applies.
-3. Add a `communicates_with` extractor for HTTP clients, so a data flow can cross the system
-   boundary instead of always stopping at an unknown store.
-4. Draw the sequence return arrow only where a `returns` relationship exists, and extend the
-   `omitted[]` note to count the returns that were not recorded.
-5. Extend the browser driver with a screenshot comparison, so layout stops being unverified.
+1. Decide the evidence rule for one query builder — Prisma or SQLAlchemy — and write it down before
+   writing the extractor. If no rule can be stated that a reader would accept as evidence, that is
+   the answer, and the tool should keep saying "unsupported".
+2. Add a `communicates_with` extractor for HTTP clients, so a data flow can cross the boundary.
+3. Extend the browser driver to click an individual arrow and assert the evidence panel's contents,
+   which is the one Phase 4 UI feature the driver does not check.
+4. Extend the browser driver with a screenshot comparison, so layout stops being unverified.
 
 ## 11. Critical Context
 
@@ -392,6 +546,35 @@ Things that are not obvious from the code and cost time to rediscover:
   (D-034).
 - **`SCHEMA_VERSION` in `store.ts` is the database version; `GRAPH_SCHEMA_VERSION` is the
   model version.** They collided once already (D-038). Do not use the same name twice.
+  `GRAPH_SCHEMA_VERSION` is **4** and `EXTRACTOR_VERSION` is **1.1.0**; both are inside the
+  snapshot digest, so a Phase 3 snapshot reports `comparable: false` rather than being read under
+  Phase 4 semantics.
+- **The return pass stages node attributes and flushes them once.** `addNode` keeps whatever
+  attributes a node already has, so a count written from two passes silently keeps the first value.
+  `StagedAttributes` exists so the counts can be trusted to be counts.
+- **A join modifier is not a table introducer.** `LEFT`, `OUTER`, `INNER` and friends step towards
+  `JOIN`; `STRAIGHT_JOIN` is the join keyword itself. Treating a modifier as introducing the table
+  put a table named `ON` in the graph (D-050).
+- **A comma list steps over `AS` as well as the alias, and over a schema qualifier.** Both are
+  multi-token, and assuming one token is how a table goes missing (D-051).
+- **A CTE or an unclassified statement must be keyed by its scope or its location, never by its
+  name.** Two statements can share a summary; two query expressions can share a name (D-052,
+  D-053).
+- **A Python route marker is held until the definition it decorates.** It cannot name its own
+  handler, and emitting it immediately left every Flask endpoint unattached (D-066).
+- **A chained status resolves after the walk.** `res.status(201).json(x)` visits the producer
+  before the configuring call, so the status is unknown during the walk (D-063).
+- **The sequence budget bounds calls, not messages.** A limit on new work can never orphan the
+  hand-back of work already shown; a limit on messages did exactly that (D-065).
+- **A rule that reads field X must gate on field X.** `addHttpResponses` gated on
+  `file.responses` and read the `http.response` marker, which is the mechanism behind two of
+  Phase 4's defects (D-054, D-064).
+- **A projected arrow id must be unique in the view, not in one flow.** The order counter restarts
+  per entry point, so two flows reaching the same call produced two arrows with one id, and a
+  view selecting arrows by id showed the wrong evidence (D-049).
+- **A finding's `nodeIds` must be deduplicated.** A C4 element lists its own id in `graphNodeIds`,
+  and prefixing `node.id` made every `container-without-code` finding name the same entity twice
+  (D-067).
 - **Analysis fixtures are built on disk in temp directories**, not committed as a tree.
 - **Symlink tests silently pass on Windows without elevation.** They early-return. Re-run on
   Linux CI for real coverage.
@@ -426,25 +609,38 @@ While changing:
    is "identical" or merely unknown — belongs in `packages/web/src/presentation.ts` with a
    test, not inline in a component.
 10. Record the decision, update the flow, update this file — in the same change.
+11. **A new `ParsedFile` field is not finished when the parser fills it.** Name the consumer in
+    the same commit, and test that the consumer reads *that* field rather than a parallel one.
+    Two of Phase 4's defects were exactly this (D-054, D-064).
+12. **After a feature works, ask which facts in the graph reached the picture** and account for
+    the difference. Phase 4's most serious defects all presented as working features; the tests
+    passed and the output looked plausible.
 
 Before committing:
 
-11. `npm run verify` green. If something cannot be verified, say which and why.
-12. `git status`, `git diff`, `git diff --cached`. Stage only intended files.
-13. Confirm no secrets, no absolute machine paths in committed config, no AI attribution.
-14. Commit message in the imperative, describing what changed and why.
-15. After committing: `git status` clean, `git log -1 --oneline`, then push to
+13. `npm run verify` green. If something cannot be verified, say which and why.
+14. `git status`, `git diff`, `git diff --cached`. Stage only intended files.
+15. Confirm no secrets, no absolute machine paths in committed config, no AI attribution.
+16. Commit message in the imperative, describing what changed and why.
+17. After committing: `git status` clean, `git log -1 --oneline`, then push to
     `origin main`.
 
 Honesty requirements:
 
-16. Never write "working", "verified", "production-ready" or "tests passing" unless you
+18. Never write "working", "verified", "production-ready" or "tests passing" unless you
     ran the check in this session.
-17. Record failed attempts in `decisions.md`, including the symptom and the workaround,
+19. Record failed attempts in `decisions.md`, including the symptom and the workaround,
     even when the root cause was not identified (see D-014, D-035).
-18. If a test asserts something trivial, delete it. A test that cannot fail is worse than
+20. If a test asserts something trivial, delete it. A test that cannot fail is worse than
     no test, because it inflates the count and hides the gap. D-030 is the worked example:
     a category that could only ever report zero was removed rather than kept.
-19. Run the thing against a real repository. Phase 2's best-found bug — compose volumes drawn
+    Phase 4 added a Python `constructor` branch whose pattern was byte-identical to the
+    `call` branch above it; it could never fire, and a test asserting it would have been a
+    test that could not fail (D-062).
+21. Run the thing against a real repository. Phase 2's best-found bug — compose volumes drawn
     as containers — was invisible to every test and obvious the moment C4 was run against
-    this repository.
+    this repository. Phase 4's were the same shape: all 19 HTTP responses present in the
+    graph and none drawn; Flask's 128 endpoints with no handlers.
+22. State what a verification run did **not** exercise. The Flask run proved the Python
+    extraction paths; it did not prove multi-table SQL, because Flask's own queries are
+    single-table. Saying otherwise would be a claim the run does not support.

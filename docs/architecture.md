@@ -63,6 +63,15 @@ Provenance — commit, branch, path, timestamp, truncation — is recorded along
 deliberately **not** part of the identity, so re-analysing unchanged content produces the same
 snapshot id and "nothing changed" is decidable (`decisions.md`, D-026).
 
+Both version inputs are inside the digest, and Phase 4 moved both. `GRAPH_SCHEMA_VERSION` is now
+**4** because the graph gained `returns` and `throws` edges and the attributes behind them; a
+sequence drawn from a version 3 graph and one drawn from a version 4 graph disagree about what an
+interaction hands back, so the two must not be diffed against each other. `EXTRACTOR_VERSION` is
+now **1.1.0** because unchanged source now yields different facts — the SQL scanner reads every
+table in a statement, and return, rejection and response records became graph facts. A snapshot
+taken under either old value reports `comparable: false` with the reason, rather than being
+reinterpreted under the new semantics.
+
 `compareSnapshots()` walks two indexed graphs and reports what changed. Two rules give the
 report its meaning:
 
@@ -75,7 +84,7 @@ report its meaning:
 
 ## The chain the product promises
 
-Phase 3 extends the same chain one stage further, in the direction a reader actually asks:
+Phase 3 extended the same chain one stage further, in the direction a reader actually asks:
 
 | Joint | What establishes it | What is reported when it is missing |
 |---|---|---|
@@ -169,9 +178,10 @@ Depends on nothing. Owns:
   caller cannot request an unbounded run; typed diagnostic codes, so stages report rather than
   throw and one bad file degrades one part of an analysis.
 
-The graph builder runs in nine passes. Pass 3 indexes every symbol **before** any
+The graph builder runs in ten passes. Pass 3 indexes every symbol **before** any
 relationship resolves; collapsing that into a single pass makes extraction
-order-dependent, which was a real bug (`decisions.md`, D-010).
+order-dependent, which was a real bug (`decisions.md`, D-010). Pass 10 adds the return,
+failure and response relationships Phase 4 introduced.
 
 ### `@repoatlas/ingest` — untrusted input
 
@@ -202,12 +212,22 @@ a contained change.
 |---|---|---|
 | `typescript.ts` | TypeScript compiler API, offline text mode | Only TS/JS |
 | `python.ts` | Tokeniser over logical lines, indentation-derived scope | Not a full grammar; no metaprogramming |
+| `sql.ts` | Tokeniser plus a clause walker over one statement | Not a SQL grammar; `MERGE`, DDL and vendor extensions are reported unclassified with a reason |
 | `config.ts` | Purpose-built per file type | JSON scanning reads scalars, not nested trees |
+
+`sql.ts` replaced Phase 3's regular expressions on purpose. Widening regexes to joins and
+subqueries would have made it wrong a new way each time — `SELECT * FROM x -- FROM y` would
+report a read of `y` — so comments and string bodies are dropped during tokenisation and anything
+the walker cannot classify deterministically returns a reason instead of a guess. The same module
+serves both language extractors, so a join is read identically in TypeScript and Python; two
+analysers would be two sets of bugs.
 
 `python.ts` produces two views per logical line: `code` with string bodies blanked, for
 detecting definitions and calls; and `raw` with literals intact, for markers that need
 real values such as a route path. Without the second view, route detection is impossible;
-without the first, a `def` inside a docstring becomes a phantom function.
+without the first, a `def` inside a docstring becomes a phantom function. A route marker is also
+*held* rather than emitted, because a Flask or FastAPI decorator sits on the line above the
+function it serves and cannot name its own handler (`decisions.md`, D-066).
 
 ### `@repoatlas/artifacts` — projections
 
@@ -229,20 +249,34 @@ they are the most inferential: a message arrow, a decision point and a data flow
 about how the system *runs*, not about what it is made of. Each follows one rule, and each
 states its own exceptions:
 
-- **Sequence** draws one message per `calls` relationship and **no return arrow**, because the
-  graph records no return values (`omitted[]` says so).
+- **Sequence** draws one arrow per `calls` relationship, and — since Phase 4 — a **return**, a
+  **failure path** and an **HTTP response** for the calls that earned them. The walk is
+  depth-first, so a return is drawn after the work that produced it rather than before it, and
+  the budget bounds *calls* rather than messages so a drawn call can never lose its hand-back.
+  Every return cites the `return`, `throw` or response statement that established it; none is
+  inferred from the existence of a call, and `omitted[]` counts the calls whose result the source
+  never hands back.
 - **Activity** orders decision points by source line and draws nothing for a function with no
   recorded branch, loop or handler — a call graph is not a workflow.
-- **Data flow** draws only data relationships. Imports and `depends_on` are explicitly
-  reported as *not* data flows, with a count.
+- **Data flow** draws only data relationships, one per table, so a statement touching two stores
+  produces two flows rather than one generic "database" node. Imports and `depends_on` are
+  explicitly reported as *not* data flows, with a count. A statement the analyser recognised and
+  declined to read appears in `omitted[]` with its reason, so "a query is here that I could not
+  read" never reads as "no database access here".
 - **Lineage** answers both directions from one entry point and returns `null` for a node the
-  graph does not hold, rather than an empty object that reads like an answer.
+  graph does not hold, rather than an empty object that reads like an answer. Each hop carries the
+  operation, the clause the table name appeared in, and the statement it came from, and the
+  subject's own usage counts reads, writes and unclassified relationships separately.
 
 `checkConsistency` is not an artifact but lives here, because it compares artifacts. It reads
 the same graph every projection reads, so it cannot see a different world from the views it
 checks. Five classes, and `CONTRADICTION` is reserved for two statements that cannot both be
-true; a missing relationship is always missing *evidence* (`decisions.md`, D-043).
-exactly the kind of claim this product must not make.
+true; a missing relationship is always missing *evidence* (`decisions.md`, D-043). Since Phase 4
+it additionally checks that every return and failure relationship is backed by a call, that every
+response is paired with an endpoint, and that a query expression was never recorded as a table.
+
+A finding names each entity once. It was not always true, and the duplicate broke every consumer
+that keys a list by entity id (`decisions.md`, D-067).
 
 Mermaid is the text format because it renders in the browser with no server-side renderer
 and no headless browser, keeping the deployment to one Node process

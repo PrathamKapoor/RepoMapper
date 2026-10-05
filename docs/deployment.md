@@ -91,6 +91,7 @@ than assumed away.
 | Non-root container user | `Dockerfile` | `USER node` |
 | Snapshot/drift read no filesystem | `packages/core/src/drift.ts` | `/drift` and `/snapshot` take analysis ids only, so they cannot widen the allow-list |
 | Untrusted build context ignored | `packages/core/src/graph-builder.ts` | An absolute or repository-escaping `build:` is dropped; only paths already inside the analysed repository are compared |
+| Repository code is never executed | `packages/parsers/*` | Extraction is source-level only: the compiler API in offline text mode, a tokeniser, and a clause walker. Nothing imports, evaluates or runs repository code, and no SQL is executed against a database. Phase 4 added no capability to run anything |
 
 ### What is not implemented — read before exposing
 
@@ -102,6 +103,8 @@ than assumed away.
 | **Results are not tenant-scoped** | Every stored analysis is readable by every client | Single-operator deployment assumption |
 | **No archive-upload route** | Archive extraction exists and is tested, but there is no HTTP endpoint yet | Not reachable, therefore not exposed |
 | **Git history may be unavailable for foreign-owned repositories** | Inside the container, a bind-mounted repository owned by another user is refused by git's dubious-ownership guard; commit facts are absent | Documented under *Git history inside the container*; the guard is not disabled by default |
+| **A repository behind an ORM shows no data access** | `reads` and `writes` come only from table names in SQL the analyser read. Prisma, SQLAlchemy, Knex, Drizzle, Sequelize and Django ORM produce no data relationship, so a repository that uses one appears to have no data layer | Unsupported by decision (`decisions.md`, D-061), not an oversight: mapping `db.users.findMany()` to a `users` table is a guess about which call touches which table. A declared table nothing touches is reported as `MISSING_EVIDENCE` naming the reason, so the gap is visible and attributed to the extractor rather than to the repository |
+| **Some SQL is read, some is reported unread** | Statements this analyser cannot classify produce no data relationship | Each produces a node carrying the reason, a consistency finding, and an entry in the data-flow view's `omitted[]`. "A query is here that I could not read" is never rendered as "no database access here" |
 
 **Recommended posture:** run with `REPOATLAS_ALLOWED_ROOTS` set, bind to `127.0.0.1`, and
 put it behind an authenticating reverse proxy if it must be reachable from anywhere else.
@@ -184,6 +187,18 @@ curl -fsS "http://127.0.0.1:4300/api/analyses/$id2/drift?against=$id" \
 # behaviour and traceability views
 curl -fsS "http://127.0.0.1:4300/api/analyses/$id2/artifacts/sequence" \
   | sed -E 's/.*"insufficientEvidence":(true|false).*/insufficient: \1/'
+
+# call, return and HTTP-response arrows actually drawn, and what was left out
+curl -fsS "http://127.0.0.1:4300/api/analyses/$id2/artifacts/sequence" \
+  | grep -o '"scope":"[^"]*"'
+
+# data flow: one relationship per table, and anything the analyser would not read
+curl -fsS "http://127.0.0.1:4300/api/analyses/$id2/artifacts/data-flow" \
+  | grep -o '"omitted":\[[^]]*\]'
+
+# how a store is used, reads and writes counted separately
+curl -fsS "http://127.0.0.1:4300/api/analyses/$id2/lineage/table%3Ausers" \
+  | grep -o '"usage":{[^}]*}'
 
 curl -fsS "http://127.0.0.1:4300/api/analyses/$id2/requirements" | head -c 400
 curl -fsS "http://127.0.0.1:4300/api/analyses/$id2/consistency" | head -c 400
