@@ -138,6 +138,13 @@ export const NODE_KINDS = [
   'configuration',
   'commit',
   'contributor',
+  // Phase 5. Deployment and security vocabulary.
+  //
+  // `network` is a network a declared service joins, evidenced by a compose `networks:` entry.
+  // `secret` is a *reference* to a named secret and never holds a value — the graph records that
+  // a repository names `DATABASE_URL`, never what it is set to.
+  'network',
+  'secret',
   /**
    * A decision point in the control flow of an enclosing function.
    *
@@ -230,6 +237,17 @@ export const EDGE_KINDS = [
   // return statement or a throw in the source, never from the existence of a call.
   'returns',
   'throws',
+  // Phase 5. Deployment and security relationships, each drawn from a declaration that says so.
+  //
+  // `depends_on` already existed for code; this reuses it for a declared service ordering, which
+  // is a weaker claim than a call and is recorded as such on the edge. `exposes` covers a
+  // published port; `authenticates` and `authorizes` cover a check that was found in code.
+  // None of these may be created from the *absence* of another fact: an endpoint with no
+  // authentication edge has unknown protection, not an insecure endpoint (D-043).
+  'joins_network',
+  'references_secret',
+  'listens_on',
+  'protected_by',
 ] as const;
 
 export type EdgeKind = (typeof EDGE_KINDS)[number];

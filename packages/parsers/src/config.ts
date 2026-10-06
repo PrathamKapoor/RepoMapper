@@ -31,15 +31,17 @@ export class ConfigSourceParser implements SourceParser {
       case 'package.json':
         parsePackageJson(source, result, context.maxProblems);
         break;
-      case 'docker-compose.yml':
-      case 'docker-compose.yaml':
-        parseCompose(source, result);
-        break;
       case 'Dockerfile':
         parseDockerfile(source, result);
         break;
       default:
-        if (/^Dockerfile\./.test(context.path)) parseDockerfile(source, result);
+        // Suffixed compose files are how multi-environment stacks are written in practice
+        // (`docker-compose.prod.yml`), and matching only the two canonical names silently
+        // reported nothing for them.
+        if (/^(?:docker-)?compose(?:\.[A-Za-z0-9_-]+)?\.ya?ml$/.test(context.path)) {
+          parseCompose(source, result);
+        } else if (/^Dockerfile\./.test(context.path)) parseDockerfile(source, result);
+        else if (/^\.github\/workflows\/[^/]+\.ya?ml$/.test(context.path)) parseWorkflow(source, result);
         else if (context.language === 'json') parseGenericJson(source, result);
         else if (context.language === 'sql') parseSql(source, result);
         else if (context.language === 'yaml') parseYaml(source, result);
@@ -184,11 +186,13 @@ function parseCompose(source: string, result: ParsedFile): void {
   }
   if (current) services.push(current);
 
+  const topLevelNetworks = listTopLevelKeys(source, 'networks');
+
   for (const service of services) {
     const block = service.body.join('\n');
     const image = /^\s+image:\s*(\S+)/m.exec(block)?.[1] ?? null;
     const build = buildContextOf(block);
-    const ports = [...block.matchAll(/^\s+-\s+["']?(\d+[:/]?\d*)["']?/gm)].map((entry) => entry[1] ?? '');
+    const ports = containerPortsOf(block);
     result.markers.push({
       name: 'compose.service',
       line: service.line,
@@ -196,10 +200,313 @@ function parseCompose(source: string, result: ParsedFile): void {
         service: service.service,
         image,
         build,
-        publishedPorts: ports.filter((port) => port.length > 0).join(','),
+        // Container ports, which is what the image has to listen on. The host side of a
+        // published port is the operator's choice and says nothing about the image.
+        publishedPorts: ports.join(','),
       },
     });
+
+    // Phase 5. Each of the following is a *declaration* read from this service's own block.
+    // Nothing here is inferred from the fact that another service exists: a service that shares
+    // no network key with `db` is not recorded as reaching it, because the compose file does not
+    // say that it does (D-072).
+    for (const dependency of declaredDependencies(block)) {
+      result.markers.push({
+        name: 'compose.depends_on',
+        line: lineOfKey(source, dependency),
+        attributes: { service: service.service, dependsOn: dependency },
+      });
+    }
+
+    for (const network of declaredNetworks(block, topLevelNetworks)) {
+      result.markers.push({
+        name: 'compose.network',
+        line: service.line,
+        attributes: { service: service.service, network },
+      });
+    }
+
+    for (const variable of environmentReferences(block)) {
+      result.markers.push({
+        name: 'compose.environment',
+        line: service.line,
+        attributes: { service: service.service, variable },
+      });
+    }
+
+    for (const volume of declaredVolumeMounts(block)) {
+      result.markers.push({
+        name: 'compose.volume_mount',
+        line: lineOfKey(source, volume),
+        attributes: { service: service.service, volume },
+      });
+    }
+
+    if (/^\s+healthcheck:/m.test(block)) {
+      result.markers.push({
+        name: 'compose.healthcheck',
+        line: service.line,
+        attributes: { service: service.service },
+      });
+    }
+
+    const restart = /^\s+restart:\s*(\S+)/m.exec(block)?.[1] ?? null;
+    if (restart) {
+      result.markers.push({
+        name: 'compose.restart_policy',
+        line: lineOfKey(source, 'restart'),
+        attributes: { service: service.service, restart },
+      });
+    }
   }
+
+  for (const network of topLevelNetworks) {
+    result.markers.push({
+      name: 'compose.network_declared',
+      line: lineOfKey(source, network),
+      attributes: { network },
+    });
+  }
+}
+
+/**
+ * The container ports a service's `ports:` block declares.
+ *
+ * Compose writes a published port as `[host_ip:]host_port:container_port[/protocol]`, so the
+ * container port — the one the image must listen on — is the **last** numeric segment. Reading
+ * the first segment reported `127` for `127.0.0.1:8080:8080`, which is an IP fragment rather than
+ * a port (D-075).
+ *
+ * Only the port is kept. `127.0.0.1:8080:8080` says a port is published on the loopback
+ * interface; whether anything is listening, and from where, is not established by the file.
+ */
+function containerPortsOf(block: string): string[] {
+  const found = new Set<string>();
+  const list = /^\s+ports:\s*$/m.exec(block);
+  const inline = /^\s+ports:\s*\[([^\]]*)\]/m.exec(block);
+
+  const candidates: string[] = [];
+  if (inline?.[1]) {
+    for (const part of inline[1].split(',')) candidates.push(part.trim().replace(/^["']|["']$/g, ''));
+  }
+  if (list) {
+    const tail = block.slice((list.index ?? 0) + list[0].length);
+    for (const line of tail.split('\n')) {
+      const item = /^\s+-\s+(.+)$/.exec(line);
+      if (!item?.[1]) {
+        if (line.trim().length > 0) break;
+        continue;
+      }
+      candidates.push(item[1].trim().replace(/^["']|["']$/g, ''));
+    }
+  }
+
+  for (const candidate of candidates) {
+    const withoutProtocol = candidate.split('/')[0] ?? '';
+    const segments = withoutProtocol.split(':');
+    const container = segments.at(-1) ?? '';
+    // A range (`8000-9000:80`) expands, because the image listens on all of it.
+    if (/^\d+-\d+$/.test(container)) {
+      const [from, to] = container.split('-').map(Number);
+      if (from !== undefined && to !== undefined && to >= from && to - from <= 64) {
+        for (let port = from; port <= to; port += 1) found.add(String(port));
+      }
+      continue;
+    }
+    if (/^\d+$/.test(container)) found.add(container);
+  }
+  return [...found].sort((a, b) => Number(a) - Number(b));
+}
+
+/**
+ * The top-level keys of one compose section, at the same indentation services are written at.
+ *
+ * `volumes:` and `networks:` hold named entries at the same indentation as `services:`, which is
+ * why the Phase 3 parser scoped itself to the `services:` block. Reading them here is safe
+ * because each entry is attributed to the section it was found in, and a named volume is not
+ * turned into a service or a container (D-039).
+ */
+function listTopLevelKeys(source: string, section: string): string[] {
+  const lines = source.split(/\r?\n/);
+  const found: string[] = [];
+  let inSection = false;
+  let indent = -1;
+
+  for (const line of lines) {
+    const topLevel = /^([A-Za-z0-9_.-]+):\s*(#.*)?$/.exec(line);
+    if (topLevel && !/^\s/.test(line)) {
+      inSection = topLevel[1] === section;
+      indent = -1;
+      continue;
+    }
+    if (!inSection || /^\s*#/.test(line)) continue;
+    if (indent < 0) {
+      const header = /^(\s+)([A-Za-z0-9_.-]+):\s*(#.*)?$/.exec(line);
+      if (!header?.[1]) continue;
+      indent = header[1].length;
+    }
+    const entry = new RegExp(`^\\s{${indent}}([A-Za-z0-9_.-]+):\\s*(#.*)?$`).exec(line);
+    if (entry?.[1]) found.push(entry[1]);
+  }
+  return found;
+}
+
+/**
+ * Services named in `depends_on`, from either supported form.
+ *
+ * The list form (`depends_on: [db, cache]`) and the mapping form
+ * (`depends_on:\n  db:\n    condition: service_healthy`) both occur, and the mapping form also
+ * carries a `condition` worth recording because "waits until healthy" is a stronger statement
+ * than "starts first".
+ */
+function declaredDependencies(block: string): string[] {
+  const found = new Set<string>();
+  const inline = /^\s+depends_on:\s*\[([^\]]*)\]/m.exec(block)?.[1];
+  if (inline) {
+    for (const part of inline.split(',')) {
+      const name = part.trim().replace(/^["']|["']$/g, '');
+      if (name.length > 0) found.add(name);
+    }
+  }
+
+  const mapping = /^\s+depends_on:\s*$/m.exec(block);
+  if (mapping) {
+    for (const name of blockEntriesAfter(block, mapping)) found.add(name);
+  }
+  return [...found];
+}
+
+/**
+ * The names written under a `key:` line that opens a nested block, until the indentation drops.
+ *
+ * Both spellings a compose file uses for a dependency or a network are read: `db:` (a mapping
+ * entry, which may carry a `condition:` beneath it) and a bare `db` or `- db` (a list entry).
+ * Reading only the mapping form silently dropped every dependency written as a list, which is
+ * the more common of the two for `networks:` (D-076).
+ *
+ * Stops at the first line that is less indented than the entries, or at a line that is neither a
+ * name nor a continuation of the entry above it — so a following `restart:` key ends the block
+ * rather than being read as a dependency called `restart`.
+ */
+function blockEntriesAfter(block: string, opener: RegExpExecArray): string[] {
+  const tail = block.slice((opener.index ?? 0) + opener[0].length);
+  const names: string[] = [];
+  let indent = -1;
+
+  for (const line of tail.split('\n')) {
+    if (line.trim().length === 0 || /^\s*#/.test(line)) continue;
+
+    const leading = /^\s*/.exec(line)?.[0].length ?? 0;
+    if (indent < 0) {
+      if (leading === 0) break;
+      indent = leading;
+    }
+    if (leading < indent) break;
+
+    const listEntry = /^\s*-\s*([A-Za-z0-9_.-]+)\s*:?\s*(#.*)?$/.exec(line);
+    if (listEntry?.[1]) {
+      names.push(listEntry[1]);
+      continue;
+    }
+    const mappingEntry = /^\s*([A-Za-z0-9_.-]+):\s*(#.*)?$/.exec(line);
+    if (mappingEntry?.[1]) {
+      names.push(mappingEntry[1]);
+      continue;
+    }
+    // A bare name with neither colon nor dash. Strictly this is not valid YAML for these keys,
+    // but it appears in hand-written files often enough that refusing it loses real
+    // dependencies, and within a block whose indentation is already fixed a bare token is
+    // unambiguous.
+    const bare = /^\s*([A-Za-z0-9_.-]+)\s*(#.*)?$/.exec(line);
+    if (bare?.[1] && !/^(true|false|null|yes|no|on|off)$/i.test(bare[1])) {
+      names.push(bare[1]);
+      continue;
+    }
+    // Deeper than an entry: a `condition:` beneath `db:`. Not a name of its own.
+    if (leading > indent) continue;
+    break;
+  }
+  return names;
+}
+
+/**
+ * Networks a service joins, from either supported form.
+ *
+ * `networks: [front]` and `networks:\n  front:\n    aliases: [web]` both occur. The short
+ * `default` network every compose project creates is not added: it is implicit rather than
+ * written, and a network nothing declares is not evidence of a boundary.
+ */
+function declaredNetworks(block: string, topLevel: readonly string[]): string[] {
+  const found = new Set<string>();
+  const inline = /^\s+networks:\s*\[([^\]]*)\]/m.exec(block)?.[1];
+  if (inline) {
+    for (const part of inline.split(',')) {
+      const name = part.trim().replace(/^["']|["']$/g, '');
+      if (name.length > 0) found.add(name);
+    }
+  }
+
+  const mapping = /^\s+networks:\s*$/m.exec(block);
+  if (mapping) {
+    for (const name of blockEntriesAfter(block, mapping)) found.add(name);
+  }
+
+  // A network is only recorded when the compose file declares it at the top level. An inline
+  // name that exists nowhere else is a reference to something this file does not define, and
+  // reporting it as a joined network would draw a boundary the file never describes.
+  return [...found].filter((name) => topLevel.includes(name));
+}
+
+/**
+ * Configuration a service receives, by *name*.
+ *
+ * Only the variable name is read. `- DATABASE_URL=postgres://user:pw@host/db` yields
+ * `DATABASE_URL`; the value never enters the marker, so it cannot reach the graph, the API, the
+ * UI or a snapshot (D-074). `- DATABASE_URL` with no `=` is a pass-through reference and is read
+ * the same way.
+ */
+function environmentReferences(block: string): string[] {
+  const found = new Set<string>();
+  const section = /^\s+environment:\s*$/m.exec(block);
+  if (!section) return [];
+  const tail = block.slice((section.index ?? 0) + section[0].length);
+
+  for (const line of tail.split('\n')) {
+    if (/^\s+[A-Za-z0-9_.-]+:\s*/.test(line) && /^\s{2,}[A-Za-z0-9_.-]+:\s*$/.test(line)) break;
+    const listItem = /^\s+-\s+["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*(=.*)?$/.exec(line);
+    if (listItem?.[1]) {
+      found.add(listItem[1]);
+      continue;
+    }
+    // `KEY: value` mapping form. The value is deliberately discarded.
+    const mapping = /^\s+([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$/.exec(line);
+    if (mapping?.[1]) {
+      found.add(mapping[1]);
+      continue;
+    }
+    if (line.trim().length > 0 && /^\s+[A-Za-z0-9_.-]+:/.test(line)) break;
+  }
+  return [...found];
+}
+
+/**
+ * Volumes a service mounts, in either the short (`- data:/var/lib`) or long
+ * (`- type: volume\n  source: data`) form.
+ *
+ * A named volume is not a container (D-039). It is recorded as a *mount* — the service and the
+ * volume, with the declaration as evidence — and the projection decides what to draw.
+ */
+function declaredVolumeMounts(block: string): string[] {
+  const found = new Set<string>();
+  const short = /^\s+-\s+([A-Za-z0-9_.-]+):\/[^\s]*\s*$/gm;
+  for (const match of block.matchAll(short)) {
+    if (match[1]) found.add(match[1]);
+  }
+  const long = /^\s+source:\s*([A-Za-z0-9_.-]+)\s*$/gm;
+  for (const match of block.matchAll(long)) {
+    if (match[1]) found.add(match[1]);
+  }
+  return [...found];
 }
 
 /**
@@ -219,36 +526,291 @@ function buildContextOf(block: string): string | null {
   return context ?? null;
 }
 
-/** Reads the base image and exposed ports from a Dockerfile. */
+/**
+ * Reads what a Dockerfile declares, and nothing it does not.
+ *
+ * Every marker here is a **declaration**. `EXPOSE 4300` states that the image declares a port;
+ * it does not state that the port is reachable from outside the container, and nothing in this
+ * extractor can establish that. `USER node` states a configured runtime user; it is not a
+ * statement that the resulting process is safe to run. Both are recorded as what they are and
+ * labelled that way downstream (D-071).
+ *
+ * `COPY` and `ADD` are read for the *paths* they mention, never executed. `RUN` is counted but
+ * its body is not interpreted: a `RUN` line can contain anything, and reading it as a command
+ * would mean analysing a shell script with a regex.
+ */
 function parseDockerfile(source: string, result: ParsedFile): void {
   const stages: string[] = [];
-  for (const line of source.split(/\r?\n/)) {
+  const lines = source.split(/\r?\n/);
+
+  for (const [index, line] of lines.entries()) {
     const trimmed = line.trim();
+    // A comment is not an instruction. Without this, a commented-out `EXPOSE` would appear as a
+    // declared port.
+    if (trimmed.length === 0 || trimmed.startsWith('#')) continue;
+    const lineNumber = index + 1;
+
     const base = /^FROM\s+(\S+)(?:\s+AS\s+(\S+))?/i.exec(trimmed);
     if (base) {
       stages.push(base[2] ?? 'default');
       result.markers.push({
         name: 'docker.base_image',
-        line: lineOfIndex(source, source.indexOf(line)),
+        line: lineNumber,
         attributes: { image: base[1] ?? '', stage: base[2] ?? 'default' },
       });
       continue;
     }
+
     const exposed = /^EXPOSE\s+(.+)/i.exec(trimmed);
     if (exposed) {
       result.markers.push({
         name: 'docker.expose',
-        line: lineOfIndex(source, source.indexOf(line)),
+        line: lineNumber,
         attributes: { ports: (exposed[1] ?? '').trim() },
       });
+      continue;
+    }
+
+    const workdir = /^WORKDIR\s+(\S+)/i.exec(trimmed);
+    if (workdir) {
+      result.markers.push({ name: 'docker.workdir', line: lineNumber, attributes: { path: workdir[1] ?? '' } });
+      continue;
+    }
+
+    // `USER node` or `USER 1001:1001`. Recorded as a configuration fact, not a judgement.
+    const user = /^USER\s+(\S+)/i.exec(trimmed);
+    if (user) {
+      result.markers.push({
+        name: 'docker.user',
+        line: lineNumber,
+        attributes: { user: user[1] ?? '', configured: 'true' },
+      });
+      continue;
+    }
+
+    const entrypoint = /^ENTRYPOINT\s+(.+)/i.exec(trimmed);
+    if (entrypoint) {
+      result.markers.push({
+        name: 'docker.entrypoint',
+        line: lineNumber,
+        attributes: { value: commandText(entrypoint[1] ?? '') },
+      });
+      continue;
+    }
+
+    const cmd = /^CMD\s+(.+)/i.exec(trimmed);
+    if (cmd) {
+      result.markers.push({ name: 'docker.cmd', line: lineNumber, attributes: { value: commandText(cmd[1] ?? '') } });
+      continue;
+    }
+
+    const volume = /^VOLUME\s+(.+)/i.exec(trimmed);
+    if (volume) {
+      result.markers.push({
+        name: 'docker.volume',
+        line: lineNumber,
+        attributes: { paths: (volume[1] ?? '').trim() },
+      });
+      continue;
+    }
+
+    if (/^HEALTHCHECK\b/i.test(trimmed)) {
+      // A configured healthcheck is recorded as configured. Nothing here can establish that the
+      // container was ever started, let alone that the check passed.
+      result.markers.push({
+        name: 'docker.healthcheck',
+        line: lineNumber,
+        attributes: { configured: 'true' },
+      });
+      continue;
+    }
+
+    // `ENV KEY value` and `ENV KEY=value`. Only names are recorded for variables whose name
+    // implies a credential; every other variable is recorded as configuration (D-074).
+    const env = /^ENV\s+(.+)/i.exec(trimmed);
+    if (env) {
+      for (const [name] of declaredEnvNames(env[1] ?? '')) {
+        result.markers.push({
+          name: 'docker.env',
+          line: lineNumber,
+          attributes: {
+            variable: name,
+            ...(looksLikeSecretName(name) ? { secretLike: 'true' } : { secretLike: 'false' }),
+          },
+        });
+      }
+      continue;
+    }
+
+    const copy = /^(COPY|ADD)\s+(.+)/i.exec(trimmed);
+    if (copy) {
+      const sources = (copy[2] ?? '')
+        .replace(/--[a-z-]+=\S+/gi, '')
+        .replace(/--(from|chown|chmod|as)=\S+/gi, '')
+        .trim()
+        .split(/\s+/)
+        .slice(0, -1);
+      result.markers.push({
+        name: 'docker.copy',
+        line: lineNumber,
+        attributes: { instruction: copy[1]!.toUpperCase(), sources: sources.filter((entry) => entry.length > 0).join(',') },
+      });
+      continue;
+    }
+
+    if (/^RUN\s+/i.test(trimmed)) {
+      // Counted, not interpreted. A `RUN` line is a shell command; reading it as one with a
+      // regex is how an analyser starts executing a repository's intentions in its own head.
+      result.markers.push({ name: 'docker.run', line: lineNumber, attributes: { present: 'true' } });
     }
   }
+
   if (stages.length > 0) {
     result.markers.push({
       name: 'docker.build_stage',
       line: 1,
       attributes: { stageCount: stages.length, stages: stages.join(',') },
     });
+  }
+}
+
+/** Strips the JSON-array or exec-form wrapper so the label reads as a command, not as syntax. */
+function commandText(raw: string): string {
+  return raw
+    .replace(/^\[\s*"?/, '')
+    .replace(/"?\s*\]$/, '')
+    .replace(/"/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+}
+
+/** Variable names in a Dockerfile `ENV`, from the space-separated and `=`-separated forms. */
+function declaredEnvNames(raw: string): [string][] {
+  const names: [string][] = [];
+  const pairs = raw.matchAll(/([A-Za-z_][A-Za-z0-9_]*)=(?:"[^"]*"|'[^']*'|\S*)/g);
+  for (const pair of pairs) {
+    if (pair[1]) names.push([pair[1]]);
+  }
+  if (names.length > 0) return names;
+
+  // Space-separated form: the first token is the name, the rest is the value.
+  const tokens = raw.trim().split(/\s+/);
+  if (tokens[0]) names.push([tokens[0]]);
+  return names;
+}
+
+/**
+ * Whether a variable *name* implies a credential.
+ *
+ * This is a name test and nothing more. It supports "this repository references a variable
+ * called `STRIPE_SECRET_KEY`", and it does not support any statement about what the variable
+ * contains or how it is managed.
+ */
+export function looksLikeSecretName(name: string): boolean {
+  return /(?:^|_)(?:SECRET|TOKEN|PASSWORD|PASSWD|APIKEY|API_KEY|PRIVATE_KEY|CREDENTIAL|CREDENTIALS|ACCESS_KEY|CLIENT_SECRET|AUTH)(?:$|_)/i.test(
+    name,
+  );
+}
+
+/**
+ * Reads a GitHub Actions workflow as **declared steps**, not as a deployment.
+ *
+ * The distinction is the whole point of this function. A workflow that runs `docker build`
+ * states that the workflow builds an image; it does not state that the image is deployed, and a
+ * step named `deploy` says no more about what happened than its name does. So each step records
+ * its name, its `run:` text or its `uses:` reference, and the *kind* of work it names — and
+ * whether a deployment step exists is left as a question the projection answers by looking for
+ * one, not something inferred from the presence of a build (D-073).
+ *
+ * `secrets.NAME` and `env.NAME` references are read as names only. A workflow's value is never
+ * read, so no secret can enter the graph through this path.
+ */
+function parseWorkflow(source: string, result: ParsedFile): void {
+  const lines = source.split(/\r?\n/);
+  let inJobs = false;
+  let jobIndent = -1;
+  let currentJob: { job: string; line: number; body: string[] } | null = null;
+  const jobs: { job: string; line: number; body: string[] }[] = [];
+
+  for (const [index, line] of lines.entries()) {
+    const topLevel = /^([A-Za-z0-9_.-]+):\s*(#.*)?$/.exec(line);
+    if (topLevel && !/^\s/.test(line)) {
+      inJobs = topLevel[1] === 'jobs';
+      jobIndent = -1;
+      if (currentJob) {
+        jobs.push(currentJob);
+        currentJob = null;
+      }
+      continue;
+    }
+    if (!inJobs || /^\s*#/.test(line)) continue;
+
+    if (jobIndent < 0) {
+      const header = /^(\s+)([A-Za-z0-9_.-]+):\s*(#.*)?$/.exec(line);
+      if (!header?.[1]) continue;
+      jobIndent = header[1].length;
+    }
+
+    const name = new RegExp(`^\\s{${jobIndent}}([A-Za-z0-9_.-]+):\\s*(#.*)?$`).exec(line);
+    if (name?.[1]) {
+      if (currentJob) jobs.push(currentJob);
+      currentJob = { job: name[1], line: index + 1, body: [] };
+      continue;
+    }
+    currentJob?.body.push(line);
+  }
+  if (currentJob) jobs.push(currentJob);
+
+  for (const job of jobs) {
+    const block = job.body.join('\n');
+
+    // The job itself is the declared unit of CI work. Without it, the deployment view can say a
+    // repository has CI but cannot name what that CI does, and a `secrets.X` reference has no job
+    // to belong to.
+    const runsOn = /^\s+runs-on:\s*(.+)$/m.exec(block)?.[1]?.trim().slice(0, 80) ?? '';
+
+    result.markers.push({
+      name: 'workflow.job',
+      line: job.line,
+      attributes: {
+        job: job.job,
+        ...(runsOn.length > 0 ? { runsOn } : {}),
+        stepCount: String([...block.matchAll(/^\s+-\s+(?:name:\s*.+|run:|uses:)/gm)].length),
+      },
+    });
+
+    const steps = [...block.matchAll(/^\s+-\s+(?:name:\s*(.+)|(run|uses):\s*(.+))/gm)];
+    for (const step of steps) {
+      const stepName = (step[1] ?? '').trim();
+      const kind = step[2];
+      const body = (step[3] ?? '').trim();
+      const uses = kind === 'uses';
+      result.markers.push({
+        name: 'workflow.step',
+        line: job.line,
+        attributes: {
+          job: job.job,
+          ...(stepName.length > 0 ? { step: stepName } : {}),
+          ...(uses ? { uses: body.slice(0, 120) } : { run: body.replace(/\s+/g, ' ').slice(0, 160) }),
+          // A step that *names* deployment work. The claim is about the text of the step, not
+          // about what it did; the projection is where that becomes a statement.
+          namesDeployment: /deploy|publish|release|push.*image|kubectl|helm/i.test(`${stepName} ${body}`)
+            ? 'true'
+            : 'false',
+          namesBuild: /build|compile|bundle/i.test(`${stepName} ${body}`) ? 'true' : 'false',
+          namesTest: /test|vitest|jest|pytest|spec/i.test(`${stepName} ${body}`) ? 'true' : 'false',
+        },
+      });
+    }
+
+    for (const secret of new Set([...block.matchAll(/secrets\.([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]!))) {
+      result.markers.push({
+        name: 'workflow.secret',
+        line: job.line,
+        attributes: { job: job.job, variable: secret },
+      });
+    }
   }
 }
 

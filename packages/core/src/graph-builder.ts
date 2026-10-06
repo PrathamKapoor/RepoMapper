@@ -576,8 +576,29 @@ function addMarkerFacts(
           break;
         case 'compose.service':
         case 'docker.base_image':
-        case 'docker.expose':
           addDeploymentComponent(builder, evidence, file, moduleId, marker, moduleByPath);
+          break;
+        case 'compose.depends_on':
+        case 'compose.network':
+        case 'compose.network_declared':
+        case 'compose.environment':
+        case 'compose.volume_mount':
+        case 'compose.healthcheck':
+        case 'compose.restart_policy':
+        case 'docker.expose':
+        case 'docker.workdir':
+        case 'docker.user':
+        case 'docker.entrypoint':
+        case 'docker.cmd':
+        case 'docker.volume':
+        case 'docker.env':
+        case 'docker.healthcheck':
+        case 'docker.copy':
+        case 'docker.run':
+        case 'docker.build_stage':
+        case 'workflow.step':
+        case 'workflow.secret':
+          addDeploymentFact(builder, evidence, file, moduleId, marker);
           break;
         default:
           addConfiguration(builder, evidence, file, moduleId, marker);
@@ -1288,10 +1309,6 @@ function addDeploymentComponent(
   marker: ParsedFileRef['markers'][number],
   moduleByPath: ReadonlyMap<string, string>,
 ): void {
-  // `EXPOSE 4300` states a port on an image, not a unit that runs. Creating a component for it
-  // produced a deployment component literally named "unknown" in the architecture view.
-  if (marker.name === 'docker.expose') return;
-
   const name = String(marker.attributes.service ?? marker.attributes.image ?? 'unknown');
   const markerEvidence = evidence.add({
     kind: 'INFRASTRUCTURE_FILE',
@@ -1327,6 +1344,212 @@ function addDeploymentComponent(
   if (marker.name === 'compose.service') {
     attributeBuildContext(builder, file, marker, componentId, markerEvidence, moduleByPath);
   }
+}
+
+/**
+ * Phase 5: deployment facts that are not themselves deployable units.
+ *
+ * A port, a network, a volume mount, a configured user, a secret *reference* and a workflow step
+ * are all real statements in a repository, and none of them is a thing that runs. Each is
+ * attached to the module that declares it, plus a relationship where one is evidenced:
+ *
+ * - `depends_on`, service → service, `EXPLICIT`: compose wrote the ordering.
+ * - `joins_network`, service → network, `EXPLICIT`: compose wrote the membership, and the
+ *   network is only recorded when the file declares it at the top level (D-072).
+ * - `references_secret`, module or service → `secret` node, `EXPLICIT` for the *reference*.
+ *   The node holds a name and never a value, so no credential can enter the graph by this path
+ *   (D-074).
+ * - `listens_on`, service → `deployment_component` for a base image the service names, and the
+ *   published ports stay attributes because a port is not a node kind this product has.
+ *
+ * Every one of these is a **declaration**. None of them was observed running, and the projection
+ * is where that distinction is stated rather than assumed (D-071).
+ */
+function addDeploymentFact(
+  builder: SoftwareGraphBuilder,
+  evidence: EvidenceStore,
+  file: ParsedFileRef,
+  moduleId: string,
+  marker: ParsedFileRef['markers'][number],
+): void {
+  const markerEvidence = evidence.add({
+    kind: 'INFRASTRUCTURE_FILE',
+    path: file.path,
+    startLine: marker.line,
+    endLine: marker.line,
+    symbol: String(marker.attributes.service ?? marker.attributes.variable ?? marker.attributes.network ?? marker.name),
+    // The excerpt is the marker name and its identifying attributes only. Compose and workflow
+    // values never reach this call, so a credential cannot be stored as evidence.
+    excerpt: `${marker.name}: ${safeAttributeSummary(marker.attributes)}`,
+    producer: file.producer,
+  });
+
+  switch (marker.name) {
+    case 'compose.depends_on': {
+      const service = String(marker.attributes.service ?? '');
+      const target = String(marker.attributes.dependsOn ?? '');
+      if (service.length === 0 || target.length === 0) return;
+      const from = nodeId('deployment_component', service);
+      const to = nodeId('deployment_component', target);
+      if (!builder.hasNode(from)) return;
+      builder.addEdge({
+        from,
+        to,
+        kind: 'depends_on',
+        // The file states the ordering. It does not state that the dependency is reachable, that
+        // it started, or that it is healthy — so the edge is named `depends_on` and nothing
+        // stronger is claimed from it.
+        confidence: 'EXPLICIT',
+        evidence: [markerEvidence],
+        attributes: { declaredIn: file.path, declared: true, scope: 'deployment' },
+      });
+      return;
+    }
+
+    case 'compose.network': {
+      const service = String(marker.attributes.service ?? '');
+      const network = String(marker.attributes.network ?? '');
+      if (service.length === 0 || network.length === 0) return;
+      const networkId = nodeId('network', network);
+      if (!builder.hasNode(networkId)) {
+        builder.addNode({
+          kind: 'network',
+          name: network,
+          qualifiedName: network,
+          path: file.path,
+          startLine: marker.line,
+          evidence: [markerEvidence],
+          // A named network section is stated; what it permits between the services on it is not.
+          confidence: 'EXPLICIT',
+          attributes: { declaredIn: file.path },
+        });
+      }
+      builder.addEdge({
+        from: nodeId('deployment_component', service),
+        to: networkId,
+        kind: 'joins_network',
+        confidence: 'EXPLICIT',
+        evidence: [markerEvidence],
+        attributes: { declaredIn: file.path },
+      });
+      return;
+    }
+
+    case 'compose.network_declared': {
+      const network = String(marker.attributes.network ?? '');
+      if (network.length === 0) return;
+      const networkId = nodeId('network', network);
+      if (builder.hasNode(networkId)) return;
+      builder.addNode({
+        kind: 'network',
+        name: network,
+        qualifiedName: network,
+        path: file.path,
+        startLine: marker.line,
+        evidence: [markerEvidence],
+        confidence: 'EXPLICIT',
+        attributes: { declaredIn: file.path, referencedByService: 'false' },
+      });
+      return;
+    }
+
+    case 'compose.environment':
+    case 'docker.env':
+    case 'workflow.secret': {
+      const variable = String(marker.attributes.variable ?? '');
+      if (variable.length === 0) return;
+      const service = typeof marker.attributes.service === 'string' ? marker.attributes.service : undefined;
+      const fromId = service ? nodeId('deployment_component', service) : moduleId;
+      if (!builder.hasNode(fromId)) return;
+
+      // A *credential-like* name becomes a secret node; every other variable is recorded as
+      // configuration. Calling `NODE_ENV` a secret would be as wrong as calling it a credential,
+      // and would bury the real ones among noise the Security view then has to explain away.
+      if (marker.attributes.secretLike !== 'true' && !looksCredentialName(variable)) {
+        addConfiguration(builder, evidence, file, moduleId, marker, markerEvidence);
+        return;
+      }
+
+      builder.addEdge({
+        from: fromId,
+        to: addSecretReference(builder, variable, file, marker.line, markerEvidence),
+        kind: 'references_secret',
+        // Explicit that a reference exists. What it holds, and how it is managed, are not stated
+        // by the name and are not claimed.
+        confidence: 'EXPLICIT',
+        evidence: [markerEvidence],
+        attributes: { referenceOnly: true, declaredIn: file.path },
+      });
+      return;
+    }
+
+    default:
+      // Every remaining deployment marker is a declared attribute of the declaring module. It
+      // gets a configuration node so the deployment projection can read it, and no relationship
+      // beyond that — `EXPOSE` says the image declares a port, not that anything listens.
+      addConfiguration(builder, evidence, file, moduleId, marker, markerEvidence);
+  }
+}
+
+/**
+ * A `secret` node holding a **name**, never a value.
+ *
+ * The node exists so the graph can answer "what does this repository expect to be configured?"
+ * without any path by which a credential reaches it. The only input is a variable name that a
+ * file stated; no value is read, and `nameLike` records that the node carries a name rather than
+ * a resolved secret.
+ */
+function addSecretReference(
+  builder: SoftwareGraphBuilder,
+  variable: string,
+  file: ParsedFileRef,
+  line: number,
+  markerEvidence: EvidenceRef,
+): string {
+  const secretId = nodeId('secret', variable);
+  if (builder.hasNode(secretId)) return secretId;
+
+  builder.addNode({
+    kind: 'secret',
+    name: variable,
+    qualifiedName: variable,
+    path: file.path,
+    startLine: line,
+    evidence: [markerEvidence],
+    // The reference is explicit. What the value is, and whether it is managed, are not.
+    confidence: 'EXPLICIT',
+    attributes: { referenceOnly: true, declaredIn: file.path },
+  });
+  return secretId;
+}
+
+/**
+ * Whether a name reads as a credential.
+ *
+ * A name test, and only a name test. It supports "this repository references a variable called
+ * `STRIPE_SECRET_KEY`" and supports nothing about what that variable holds or how it is managed.
+ */
+function looksCredentialName(name: string): boolean {
+  return /(?:^|_)(?:SECRET|TOKEN|PASSWORD|PASSWD|APIKEY|API_KEY|PRIVATE_KEY|CREDENTIAL|CREDENTIALS|ACCESS_KEY|CLIENT_SECRET|AUTH_KEY)(?:$|_)/i.test(
+    name,
+  );
+}
+
+/**
+ * The identifying attributes of a marker, for an evidence excerpt.
+ *
+ * Deliberately a whitelist. Compose and workflow values never reach this call, so a credential
+ * cannot be stored as evidence (D-074).
+ */
+function safeAttributeSummary(attributes: Readonly<Record<string, AttributeValue>>): string {
+  const allowed = ['service', 'variable', 'network', 'volume', 'dependsOn', 'image', 'user', 'path', 'ports', 'restart', 'job', 'step', 'publishedPorts'];
+  const parts: string[] = [];
+  for (const key of allowed) {
+    const value = attributes[key];
+    if (typeof value === 'string' && value.length > 0) parts.push(`${key}=${value.slice(0, 60)}`);
+    else if (typeof value === 'number') parts.push(`${key}=${value}`);
+  }
+  return parts.slice(0, 4).join(' ');
 }
 
 /**
@@ -1411,17 +1634,21 @@ function addConfiguration(
   file: ParsedFileRef,
   moduleId: string,
   marker: ParsedFileRef['markers'][number],
+  /** Supplied when the caller already built evidence, so one record is not created twice. */
+  providedEvidence?: EvidenceRef,
 ): void {
   const key = String(marker.attributes.key ?? marker.name);
-  const markerEvidence = evidence.add({
-    kind: 'CONFIG_KEY',
-    path: file.path,
-    startLine: marker.line,
-    endLine: marker.line,
-    symbol: key,
-    excerpt: `${marker.name}: ${truncate(JSON.stringify(marker.attributes), 160)}`,
-    producer: file.producer,
-  });
+  const markerEvidence =
+    providedEvidence ??
+    evidence.add({
+      kind: 'CONFIG_KEY',
+      path: file.path,
+      startLine: marker.line,
+      endLine: marker.line,
+      symbol: key,
+      excerpt: `${marker.name}: ${truncate(JSON.stringify(marker.attributes), 160)}`,
+      producer: file.producer,
+    });
 
   const configId = nodeId('configuration', `${file.path}#${marker.line}`);
   builder.addNode({

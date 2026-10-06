@@ -36,8 +36,15 @@ import type { GraphStats, SoftwareGraph } from './types.js';
  * clause it needs before treating text as a statement. Return, rejection and HTTP-response
  * records became graph facts. Unchanged source therefore produces different facts than it did
  * under 1.0.0, and a snapshot taken then must not compare as though nothing changed.
+ *
+ * 1.2.0 - Phase 5. The deployment and workflow scanners read dependencies, network membership,
+ * environment variable names, volume mounts, health checks, restart policies, base images,
+ * Dockerfile instructions and workflow jobs and steps. Unchanged source now yields additional
+ * facts — including corrected facts, since published ports, list-form dependencies and suffixed
+ * compose filenames were previously read wrongly or not at all — so a snapshot taken under 1.1.0
+ * must not compare as though nothing changed.
  */
-export const EXTRACTOR_VERSION = '1.1.0';
+export const EXTRACTOR_VERSION = '1.2.0';
 
 /** Field separators for the canonical digest input. Control characters, never in source. */
 const UNIT = '';

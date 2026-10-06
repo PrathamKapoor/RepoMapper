@@ -223,7 +223,7 @@ describe('snapshot identity', () => {
     const first = await runAnalysis({ repositoryPath: fixture.root, includeGitHistory: false });
     const second = await runAnalysis({ repositoryPath: fixture.root, includeGitHistory: false });
 
-    expect(first.graph.schemaVersion).toBe(4);
+    expect(first.graph.schemaVersion).toBe(5);
     expect(JSON.stringify(first.graph.nodes)).toBe(JSON.stringify(second.graph.nodes));
     expect(JSON.stringify(first.graph.edges)).toBe(JSON.stringify(second.graph.edges));
     expect(first.analysis.id).toBe(second.analysis.id);

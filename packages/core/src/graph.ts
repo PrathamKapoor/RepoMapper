@@ -19,21 +19,27 @@ import {
 /**
  * Graph schema version.
  *
- * Bumped when the *shape* of the graph changes — a new node kind, a new edge kind, or a new
+* Bumped when the *shape* of the graph changes — a new node kind, a new edge kind, or a new
  * attribute the projections depend on — because a snapshot written against an older shape
- * cannot be compared field-by-field with a newer one. Version 3 added `condition` nodes,
- * `branches`/`loops`/`references` edges, `isAsync` on function entities, SQL `reads`/`writes`,
- * and DDL primary keys, foreign keys, nullability and uniqueness. Version 3 also introduced
- * `tests` edges from a test to the endpoint its handler serves.
+ * cannot be compared field-by-field with a newer one.
+ *
+ * Version 5 adds the deployment and security vocabulary: `network` and `secret` nodes, and the
+ * `joins_network`, `references_secret`, `listens_on` and `protected_by` relationships. A
+ * deployment view drawn from a version 4 graph and one drawn from a version 5 graph answer
+ * different questions, so the two must not be diffed against each other.
  *
  * Version 4 adds `returns` and `throws` edges, `role`/`statement` on data-access edges, and the
- * function attributes behind them (`hasReturn`, `returnCount`, `throws`). A sequence drawn from
- * a version 3 graph and one drawn from a version 4 graph would disagree about what an
- * interaction hands back, so the two must not be diffed against each other.
+ * function attributes behind them. A sequence drawn from a version 3 graph and one drawn from a
+ * version 4 graph would disagree about what an interaction hands back, so the two must not be
+ * diffed against each other.
+ *
+ * Version 3 added `condition` nodes, `branches`/`loops`/`references`/`tests` edges, `isAsync` on
+ * function entities, SQL `reads`/`writes`, and DDL primary keys, foreign keys, nullability and
+ * uniqueness.
  *
  * Snapshots taken under an older version are reported incomparable rather than silently diffed.
  */
-export const GRAPH_SCHEMA_VERSION = 4;
+export const GRAPH_SCHEMA_VERSION = 5;
 
 export class GraphLimitError extends Error {
   readonly code = 'GRAPH_LIMIT_EXCEEDED';

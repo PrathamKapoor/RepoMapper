@@ -44,7 +44,7 @@ function build(files: ParsedFile[], commits: Parameters<typeof buildGraph>[0]['c
     limits: { maxNodes: 10_000, maxEdges: 20_000 },
     includeGitHistory: commits.length > 0,
   });
-  return { ...result, diagnostics };
+  return { ...result, diagnostics, evidence };
 }
 
 describe('module naming', () => {
@@ -388,6 +388,142 @@ describe('graph construction', () => {
     expect(result.truncated).toBe(true);
     expect(result.graph.nodes.length).toBeLessThanOrEqual(3);
     expect(diagnostics.list().some((item) => item.code === 'NODE_LIMIT_REACHED')).toBe(true);
+  });
+});
+
+describe('deployment topology, networks and secret references', () => {
+  const composeFile = (markers: ParsedFile['markers'], path = 'docker-compose.yml'): ParsedFile =>
+    parsedFile(path, { language: 'yaml', producer: 'config-scanner', markers });
+
+  const service = (name: string, extra: Record<string, string | null> = {}) => ({
+    name: 'compose.service',
+    line: 2,
+    attributes: { service: name, image: `repo/${name}:latest`, build: null, publishedPorts: '', ...extra },
+  });
+
+  it('links services by a declared dependency, without claiming anything was started', () => {
+    const { graph } = build([
+      composeFile([service('web'), service('db'), { name: 'compose.depends_on', line: 4, attributes: { service: 'web', dependsOn: 'db' } }]),
+    ]);
+    const edge = graph.edges.find((e) => e.kind === 'depends_on' && e.attributes?.scope === 'deployment');
+    expect(edge?.from).toBe('deployment_component:web');
+    expect(edge?.to).toBe('deployment_component:db');
+    expect(edge?.confidence).toBe('EXPLICIT');
+    expect(edge?.attributes?.declared).toBe(true);
+    // "Declared" is the whole claim. Nothing here observed an order, a health or a connection.
+    expect(edge?.attributes?.observed).toBeUndefined();
+    expect(edge?.evidence[0]?.path).toBe('docker-compose.yml');
+  });
+
+  it('records a service joining a network the file declares', () => {
+    const { graph } = build([
+      composeFile([
+        service('web'),
+        { name: 'compose.network', line: 5, attributes: { service: 'web', network: 'front' } },
+        { name: 'compose.network_declared', line: 20, attributes: { network: 'front' } },
+      ]),
+    ]);
+    expect(graph.nodes.filter((n) => n.kind === 'network').map((n) => n.name)).toEqual(['front']);
+    const edge = graph.edges.find((e) => e.kind === 'joins_network');
+    expect(edge?.from).toBe('deployment_component:web');
+    expect(edge?.to).toBe(nodeId('network', 'front'));
+    expect(edge?.confidence).toBe('EXPLICIT');
+  });
+
+  it('creates a network node for a membership even without a top-level declaration', () => {
+    // The membership is stated by the service. Creating the node keeps the edge resolvable, and its
+    // attributes record that the file did not separately declare it.
+    const { graph } = build([composeFile([service('web'), { name: 'compose.network', line: 5, attributes: { service: 'web', network: 'front' } }])]);
+    const network = graph.nodes.find((n) => n.kind === 'network');
+    expect(network?.name).toBe('front');
+    expect(network?.attributes?.declaredIn).toBe('docker-compose.yml');
+    expect(graph.edges.filter((e) => e.kind === 'joins_network')).toHaveLength(1);
+  });
+
+  it('adds no dependency edge for a service the file never declares', () => {
+    // A `depends_on` naming an undeclared service is a reference to something outside this
+    // repository. Creating the target would assert a component that is not in evidence.
+    const { graph } = build([
+      composeFile([service('web'), { name: 'compose.depends_on', line: 4, attributes: { service: 'web', dependsOn: 'ghost' } }]),
+    ]);
+    expect(graph.edges.filter((e) => e.kind === 'depends_on' && e.attributes?.scope === 'deployment')).toHaveLength(0);
+  });
+
+  it('makes a credential-like variable a secret node and a plain variable configuration', () => {
+    const { graph } = build([
+      composeFile([
+        service('api'),
+        { name: 'compose.environment', line: 7, attributes: { service: 'api', variable: 'STRIPE_SECRET_KEY' } },
+        { name: 'compose.environment', line: 8, attributes: { service: 'api', variable: 'NODE_ENV' } },
+      ]),
+    ]);
+    expect(graph.nodes.filter((n) => n.kind === 'secret').map((n) => n.name)).toEqual(['STRIPE_SECRET_KEY']);
+    // `NODE_ENV` as a secret would bury the real one under noise the Security view must explain away.
+    expect(
+      graph.nodes.some((n) => n.kind === 'configuration' && n.attributes?.variable === 'NODE_ENV'),
+    ).toBe(true);
+    const edge = graph.edges.find((e) => e.kind === 'references_secret');
+    expect(edge?.from).toBe('deployment_component:api');
+    expect(edge?.to).toBe(nodeId('secret', 'STRIPE_SECRET_KEY'));
+    expect(edge?.attributes?.referenceOnly).toBe(true);
+  });
+
+  it('never stores a value on a secret node, an edge, or its evidence', () => {
+    const { graph, evidence } = build([
+      composeFile([service('api'), { name: 'compose.environment', line: 7, attributes: { service: 'api', variable: 'API_TOKEN', secretLike: 'true' } }]),
+    ]);
+    const serialised = JSON.stringify({ graph, evidence });
+    expect(graph.nodes.some((n) => n.kind === 'secret')).toBe(true);
+    expect(serialised).toContain('API_TOKEN');
+    // A `value` key anywhere would mean the extractor had a path from a file's content to the graph.
+    expect(serialised).not.toMatch(/"value"\s*:/);
+  });
+
+  it('keeps a workflow secret reference attached to its declaring module', () => {
+    const { graph } = build([
+      parsedFile('.github/workflows/ci.yml', {
+        language: 'yaml',
+        producer: 'config-scanner',
+        markers: [{ name: 'workflow.secret', line: 12, attributes: { job: 'release', variable: 'NPM_TOKEN' } }],
+      }),
+    ]);
+    const edge = graph.edges.find((e) => e.kind === 'references_secret');
+    expect(edge?.to).toBe(nodeId('secret', 'NPM_TOKEN'));
+    // Attached to the workflow module, so the Security view can say *which* CI file expects this.
+    expect(edge?.from).toBe(graph.nodes.find((n) => n.path === '.github/workflows/ci.yml')?.id);
+    expect(edge?.evidence[0]?.path).toBe('.github/workflows/ci.yml');
+  });
+
+  it('records a port, user and restart policy as declarations of the module', () => {
+    const { graph } = build([
+      parsedFile('Dockerfile', {
+        language: 'dockerfile',
+        producer: 'config-scanner',
+        markers: [
+          { name: 'docker.user', line: 8, attributes: { user: 'app' } },
+          { name: 'docker.expose', line: 9, attributes: { ports: '4300' } },
+          { name: 'compose.restart_policy', line: 13, attributes: { service: 'api', restart: 'unless-stopped' } },
+        ],
+      }),
+    ]);
+    // These state facts about a declared image. None of them is evidence that anything ran, so
+    // none becomes a deployable component or a `listens_on` edge.
+    expect(graph.nodes.filter((n) => n.kind === 'deployment_component')).toHaveLength(0);
+    expect(graph.edges.filter((e) => e.kind === 'listens_on')).toHaveLength(0);
+    const configs = graph.nodes.filter((n) => n.kind === 'configuration');
+    expect(configs.some((n) => n.attributes?.marker === 'docker.user')).toBe(true);
+    expect(configs.some((n) => n.attributes?.marker === 'compose.restart_policy')).toBe(true);
+  });
+
+  it('puts the marker summary in evidence, not the whole attribute record', () => {
+    const { evidence } = build([
+      composeFile([service('api'), { name: 'compose.environment', line: 7, attributes: { service: 'api', variable: 'API_TOKEN' } }]),
+    ]);
+    const infra = evidence.list().filter((e) => e.path === 'docker-compose.yml');
+    // The excerpt names the marker and the variable. It must not be the whole attribute record,
+    // because a marker from a future parser could carry a value this phase has no reason to read.
+    expect(infra.some((e) => e.excerpt?.includes('compose.environment') && e.excerpt?.includes('API_TOKEN'))).toBe(true);
+    expect(infra.map((e) => e.excerpt).join(' | ')).not.toMatch(/\{"service"/);
   });
 });
 

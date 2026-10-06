@@ -542,12 +542,193 @@ networks:
     expect(result.markers.map((marker) => marker.line)).toEqual([2, 4]);
   });
 
-  it('reads Dockerfile base images and exposed ports', () => {
+it('reads Dockerfile base images and exposed ports', () => {
     const result = parser.parse('FROM node:22-alpine AS build\nRUN npm ci\nFROM alpine\nEXPOSE 3000\n', context('Dockerfile', 'dockerfile'));
     const images = result.markers.filter((marker) => marker.name === 'docker.base_image');
     expect(images).toHaveLength(2);
     expect(images[0]?.attributes.stage).toBe('build');
     expect(result.markers.some((marker) => marker.name === 'docker.expose')).toBe(true);
+  });
+
+  it('reads compose dependencies from the mapping form without swallowing the next key', () => {
+    // The mapping form carries a nested `condition:`, and the key after the block belongs to the
+    // service — not to `depends_on`. Reading the block by "lines that start with a name" consumed
+    // `restart:` as a dependency of a service that does not depend on anything called restart.
+    const result = parser.parse(
+      `services:
+  web:
+    image: acme/web:1
+    depends_on:
+      db:
+        condition: service_healthy
+      cache
+    restart: unless-stopped
+  db:
+    image: postgres:16
+  cache:
+    image: redis:7
+`,
+      context('docker-compose.yml', 'yaml'),
+    );
+    const edges = result.markers.filter((marker) => marker.name === 'compose.depends_on');
+    expect(edges.map((marker) => marker.attributes.dependsOn).sort()).toEqual(['cache', 'db']);
+    expect(edges.every((marker) => marker.attributes.service === 'web')).toBe(true);
+    expect(edges.some((marker) => marker.attributes.dependsOn === 'restart')).toBe(false);
+  });
+
+  it('reads dependencies and networks written as list entries', () => {
+    // `- db` and `- front` are the list spellings. A reader that only recognised `name:` reported
+    // no dependency at all for these, which reads as "declares nothing" rather than "declares
+    // this and the reader missed it".
+    const result = parser.parse(
+      `services:
+  web:
+    image: acme/web:1
+    depends_on:
+      - db
+    networks:
+      - front
+      - back
+  db:
+    image: postgres:16
+networks:
+  front:
+  back:
+`,
+      context('docker-compose.yml', 'yaml'),
+    );
+    expect(result.markers.filter((m) => m.name === 'compose.depends_on').map((m) => m.attributes.dependsOn)).toEqual(['db']);
+    expect(result.markers.filter((m) => m.name === 'compose.network').map((m) => m.attributes.network).sort()).toEqual(['back', 'front']);
+  });
+
+  it('records a service network only when the file declares that network', () => {
+    // An undeclared network name is a reference to something this repository does not define.
+    // Reporting it as a network of this repository would assert an existence not in evidence.
+    const result = parser.parse(
+      `services:
+  web:
+    image: acme/web:1
+    networks:
+      - front
+      - ghost
+networks:
+  front:
+`,
+      context('docker-compose.yml', 'yaml'),
+    );
+    expect(result.markers.filter((m) => m.name === 'compose.network').map((m) => m.attributes.network)).toEqual(['front']);
+    expect(result.markers.filter((m) => m.name === 'compose.network_declared').map((m) => m.attributes.network)).toEqual(['front']);
+  });
+
+  it('reads the container port out of a host, container and protocol triple', () => {
+    // `"127.0.0.1:4300:4300"` split on `:` and joined from the front yields `127`, which is a
+    // syntactically valid port number and a completely wrong fact.
+    const result = parser.parse(
+      `services:
+  repoatlas:
+    image: repoatlas:0.1.0
+    ports:
+      - "127.0.0.1:4300:4300"
+      - "5000-5002:5000-5002"
+      - "9000:9000/udp"
+`,
+      context('docker-compose.yml', 'yaml'),
+    );
+    expect(result.markers[0]?.attributes.publishedPorts).toBe('4300,5000,5001,5002,9000');
+  });
+
+  it('reads compose runtime declarations that the deployment view needs', () => {
+    const result = parser.parse(
+      `services:
+  api:
+    image: acme/api:1
+    environment:
+      DATABASE_URL: postgres://u:p@db:5432/api
+      API_TOKEN: shhh
+      NODE_ENV: production
+    volumes:
+      - api-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/api/health"]
+      interval: 30s
+    restart: unless-stopped
+`,
+      context('docker-compose.yml', 'yaml'),
+    );
+    const names = (marker: string): unknown[] =>
+      result.markers.filter((m) => m.name === marker).map((m) => m.attributes.variable ?? m.attributes.volume ?? m.attributes.restart);
+    expect(names('compose.environment')).toEqual(['DATABASE_URL', 'API_TOKEN', 'NODE_ENV']);
+    expect(names('compose.volume_mount')).toEqual(['api-data']);
+    expect(result.markers.some((m) => m.name === 'compose.healthcheck')).toBe(true);
+    expect(names('compose.restart_policy')).toEqual(['unless-stopped']);
+  });
+
+  it('never puts a compose value on a marker, only the variable name', () => {
+    // The single most important property of this phase: the graph can name what it expects to be
+    // configured and must have no path by which the value itself is carried.
+    const result = parser.parse(
+      `services:
+  api:
+    image: acme/api:1
+    environment:
+      STRIPE_SECRET_KEY: sk_live_hunter2
+      DATABASE_URL: postgres://user:hunter2@db:5432/api
+`,
+      context('docker-compose.yml', 'yaml'),
+    );
+    const serialised = JSON.stringify(result.markers);
+    expect(serialised).not.toContain('hunter2');
+    expect(serialised).not.toContain('sk_live_hunter2');
+    expect(serialised).toContain('STRIPE_SECRET_KEY');
+  });
+
+  it('reads Dockerfile instructions beyond FROM and EXPOSE', () => {
+    const result = parser.parse(
+      `FROM node:24-alpine AS build
+WORKDIR /app
+RUN npm ci
+COPY package.json ./
+ENV NODE_ENV=production
+USER app
+EXPOSE 4300
+CMD ["node", "dist/server.js"]
+`,
+      context('Dockerfile', 'dockerfile'),
+    );
+    const has = (name: string): boolean => result.markers.some((m) => m.name === name);
+    for (const marker of ['docker.workdir', 'docker.run', 'docker.copy', 'docker.env', 'docker.user', 'docker.expose', 'docker.cmd', 'docker.build_stage']) {
+      expect(has(marker), marker).toBe(true);
+    }
+    expect(result.markers.find((m) => m.name === 'docker.workdir')?.attributes.path).toBe('/app');
+  });
+
+  it('reads workflow jobs and the secrets they reference, by name', () => {
+    const result = parser.parse(
+      `name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+        env:
+          NPM_TOKEN: \${{ secrets.NPM_TOKEN }}
+`,
+      context('.github/workflows/ci.yml', 'yaml'),
+    );
+    expect(result.markers.some((m) => m.name === 'workflow.job')).toBe(true);
+    expect(result.markers.filter((m) => m.name === 'workflow.step').length).toBeGreaterThanOrEqual(2);
+    const secrets = result.markers.filter((m) => m.name === 'workflow.secret');
+    expect(secrets.map((m) => m.attributes.variable)).toContain('NPM_TOKEN');
+    expect(JSON.stringify(result.markers)).not.toContain('NPM_TOKEN=');
+  });
+
+  it('treats compose.yml and compose.yaml as compose files', () => {
+    for (const path of ['compose.yml', 'compose.yaml', 'docker-compose.yaml', 'docker-compose.prod.yml']) {
+      const result = parser.parse('services:\n  api:\n    image: acme/api:1\n', context(path, 'yaml'));
+      expect(result.markers.some((m) => m.name === 'compose.service'), path).toBe(true);
+    }
   });
 });
 
