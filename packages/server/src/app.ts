@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
-import Fastify, { type FastifyInstance } from 'fastify';
+import { createHmac } from 'node:crypto';
+import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import { z, ZodError } from 'zod';
 import {
   AnalysisError,
@@ -15,6 +16,8 @@ import { loadConfig, type ServerConfig } from './config.js';
 import { AnalysisService } from './service.js';
 import { Store } from './store.js';
 import { registerStaticUi, spaFallbackHandler, type NotFoundHandler } from './static.js';
+import fastifyCors from '@fastify/cors';
+import fastifyRateLimit from '@fastify/rate-limit';
 
 /**
  * HTTP API.
@@ -150,6 +153,50 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     // reaching the JSON parser.
     bodyLimit: config.maxUploadBytes,
     trustProxy: false,
+  });
+
+  // -------------------------------------------------------------- CORS
+  if (config.corsOrigin) {
+    await app.register(fastifyCors, {
+      origin: config.corsOrigin,
+      methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
+      credentials: false,
+    });
+  }
+
+  // -------------------------------------------------------------- Rate limiting
+  // Apply to all routes except health check
+  await app.register(fastifyRateLimit, {
+    max: config.isProduction ? 100 : 1000,
+    timeWindow: '1 minute',
+    keyGenerator: (request: FastifyRequest) => {
+      const apiKey = request.headers['x-api-key'] as string | undefined;
+      return apiKey ?? request.ip;
+    },
+    allowList: ['127.0.0.1', '::1'],
+    skipOnError: true,
+    hook: 'onRequest',
+  });
+
+  // -------------------------------------------------------------- Authentication
+  const apiKeys = config.apiKeys ?? new Set<string>();
+  const isPublicPath = (url: string): boolean => {
+    const path = url.split('?')[0];
+    return path === '/api/health' || path === '/api/meta';
+  };
+
+  app.addHook('onRequest', async (request, reply) => {
+    if (apiKeys.size === 0) return;
+    if (isPublicPath(request.url)) return;
+    const apiKey = request.headers['x-api-key'] as string | undefined;
+    if (!apiKey) {
+      return reply.status(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or missing API key' } });
+    }
+    const hashedKey = createHmac('sha256', apiKey).digest('hex');
+    if (!apiKeys.has(hashedKey)) {
+      return reply.status(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or missing API key' } });
+    }
   });
 
   app.setErrorHandler((error: unknown, request, reply) => {

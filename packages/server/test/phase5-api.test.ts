@@ -33,6 +33,7 @@ async function analysedApp(tree: FixtureTree) {
     NODE_ENV: 'test',
     REPOATLAS_LOG_LEVEL: 'silent',
     REPOATLAS_DB_PATH: ':memory:',
+    REPOATLAS_API_KEYS: 'test-key',
   } as NodeJS.ProcessEnv);
 
   const store = new Store(':memory:');
@@ -45,6 +46,7 @@ async function analysedApp(tree: FixtureTree) {
     method: 'POST',
     url: '/api/analyses',
     payload: { repositoryPath: repo.root, label: 'phase5' },
+    headers: { 'x-api-key': 'test-key' },
   });
   expect(created.statusCode).toBe(201);
   const analysisId = (created.json() as { analysis: { id: string } }).analysis.id;
@@ -56,7 +58,7 @@ const SECRET_VALUE = 'shhh-do-not-store-this';
 describe('deployment endpoint', () => {
   it('is listed in the artifact catalogue', async () => {
     const { app, analysisId } = await analysedApp(SAMPLE_DEPLOYED_PROJECT);
-    const response = await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts` });
+    const response =       await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts`, headers: { 'x-api-key': 'test-key' } });
     expect(response.statusCode).toBe(200);
     const kinds = (response.json() as { artifacts: { kind: string }[] }).artifacts.map((entry) => entry.kind);
     expect(kinds).toContain('deployment');
@@ -65,7 +67,7 @@ describe('deployment endpoint', () => {
 
   it('returns the declared services, networks and relationships', async () => {
     const { app, analysisId } = await analysedApp(SAMPLE_DEPLOYED_PROJECT);
-    const response = await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts/deployment` });
+    const response = await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts/deployment`, headers: { 'x-api-key': 'test-key' } });
     expect(response.statusCode).toBe(200);
     const artifact = response.json() as {
       nodes: { label: string; detail?: string }[];
@@ -90,7 +92,7 @@ describe('deployment endpoint', () => {
   it('says a port is declared rather than bound', async () => {
     const { app, analysisId } = await analysedApp(SAMPLE_DEPLOYED_PROJECT);
     const artifact = (
-      await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts/deployment` })
+      await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts/deployment`, headers: { 'x-api-key': 'test-key' } })
     ).json() as { nodes: { label: string; detail?: string }[] };
     const api = artifact.nodes.find((node) => node.label === 'api');
     expect(api?.detail).toContain('declared, not observed bound');
@@ -99,7 +101,7 @@ describe('deployment endpoint', () => {
   it('states in its scope that nothing was observed running', async () => {
     const { app, analysisId } = await analysedApp(SAMPLE_DEPLOYED_PROJECT);
     const artifact = (
-      await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts/deployment` })
+      await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts/deployment`, headers: { 'x-api-key': 'test-key' } })
     ).json() as { scope: string };
     expect(artifact.scope).toContain('Nothing here has been observed running');
   });
@@ -107,7 +109,7 @@ describe('deployment endpoint', () => {
   it('counts the credential without naming it, and never returns its value', async () => {
     const { app, analysisId } = await analysedApp(SAMPLE_DEPLOYED_PROJECT);
     const body = (
-      await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts/deployment` })
+      await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts/deployment`, headers: { 'x-api-key': 'test-key' } })
     ).body;
     // The credential is reported by the Security view. This view may say it has references to
     // report and may not disclose the name, and it can never carry the value.
@@ -121,18 +123,17 @@ describe('security endpoint', () => {
   it('returns the credential names the repository references', async () => {
     const { app, analysisId } = await analysedApp(SAMPLE_DEPLOYED_PROJECT);
     const artifact = (
-      await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts/security` })
+      await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts/security`, headers: { 'x-api-key': 'test-key' } })
     ).json() as { nodes: { kind: string; label: string }[] };
     const secrets = artifact.nodes.filter((node) => node.kind === 'secret_reference').map((node) => node.label);
     expect(secrets).toContain('STRIPE_SECRET_KEY');
     expect(secrets).toContain('NPM_TOKEN');
-    // NODE_ENV is a credential-looking name to nothing; reporting it would bury the real ones.
     expect(secrets).not.toContain('NODE_ENV');
   });
 
   it('never returns a secret value anywhere in the response', async () => {
     const { app, analysisId } = await analysedApp(SAMPLE_DEPLOYED_PROJECT);
-    const response = await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts/security` });
+    const response = await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts/security`, headers: { 'x-api-key': 'test-key' } });
     expect(response.body).toContain('STRIPE_SECRET_KEY');
     expect(response.body).not.toContain(SECRET_VALUE);
   });
@@ -140,7 +141,7 @@ describe('security endpoint', () => {
   it('carries no verdict on any element', async () => {
     const { app, analysisId } = await analysedApp(SAMPLE_DEPLOYED_PROJECT);
     const artifact = (
-      await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts/security` })
+      await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts/security`, headers: { 'x-api-key': 'test-key' } })
     ).json() as { nodes: { label: string; detail?: string; derivation?: string }[] };
     for (const node of artifact.nodes) {
       const text = `${node.label} ${node.detail ?? ''} ${node.derivation ?? ''}`.toLowerCase();
@@ -152,9 +153,7 @@ describe('security endpoint', () => {
 
   it('keeps the graph itself free of values', async () => {
     const { app, analysisId } = await analysedApp(SAMPLE_DEPLOYED_PROJECT);
-    // The limits are the endpoint's own maxima. What matters here is that a value written in a
-    // compose file has no path into any graph payload a client can fetch.
-    const response = await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/graph?limit=5000&edgeLimit=10000` });
+    const response = await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/graph?limit=5000&edgeLimit=10000`, headers: { 'x-api-key': 'test-key' } });
     expect(response.statusCode).toBe(200);
     expect(response.body).toContain('STRIPE_SECRET_KEY');
     expect(response.body).not.toContain(SECRET_VALUE);
@@ -162,7 +161,7 @@ describe('security endpoint', () => {
 
   it('returns 404 for a view that does not exist, listing what is available', async () => {
     const { app, analysisId } = await analysedApp(SAMPLE_DEPLOYED_PROJECT);
-    const response = await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts/nonexistent` });
+    const response = await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/artifacts/nonexistent`, headers: { 'x-api-key': 'test-key' } });
     expect(response.statusCode).toBe(404);
     expect((response.json() as { error: { message: string } }).error.message).toContain('deployment');
   });

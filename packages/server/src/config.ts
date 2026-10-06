@@ -1,4 +1,5 @@
 import { resolve } from 'node:path';
+import { createHmac } from 'node:crypto';
 import { z } from 'zod';
 
 /**
@@ -38,6 +39,11 @@ const envSchema = z.object({
   REPOATLAS_INCLUDE_GIT: booleanFromEnv.default(true),
   REPOATLAS_STATIC_DIR: z.string().default(''),
   REPOATLAS_ANALYSIS_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(300_000),
+  /**
+   * Comma-separated list of valid API keys. If empty, authentication is disabled.
+   * In production, this should always be set.
+   */
+  REPOATLAS_API_KEYS: z.string().default(''),
 });
 
 export interface ServerConfig {
@@ -58,6 +64,8 @@ export interface ServerConfig {
   staticDir: string | null;
   analysisTimeoutMs: number;
   isProduction: boolean;
+  /** Set of valid API keys. Empty when authentication is disabled. */
+  apiKeys: Set<string>;
 }
 
 export function loadConfig(source: NodeJS.ProcessEnv = process.env): ServerConfig {
@@ -75,6 +83,27 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): ServerConfi
     .filter((entry) => entry.length > 0)
     .map((entry) => resolve(entry));
 
+  const apiKeys = env.REPOATLAS_API_KEYS.split(/[;,]/)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+    .map((entry) => createHmac('sha256', entry).digest('hex'));
+
+  const isProduction = env.NODE_ENV === 'production';
+
+  if (isProduction && allowedRoots.length === 0) {
+    throw new Error(
+      'REPOATLAS_ALLOWED_ROOTS must be set in production mode. ' +
+      'An empty allow-list means the process can analyse any path it can read.'
+    );
+  }
+
+  if (isProduction && apiKeys.size === 0) {
+    throw new Error(
+      'REPOATLAS_API_KEYS must be set in production mode. ' +
+      'Without API keys, anyone who can reach the port can analyse repositories.'
+    );
+  }
+
   return {
     env: env.NODE_ENV,
     host: env.HOST,
@@ -90,7 +119,8 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): ServerConfi
     includeGitHistory: env.REPOATLAS_INCLUDE_GIT,
     staticDir: env.REPOATLAS_STATIC_DIR.length > 0 ? resolve(env.REPOATLAS_STATIC_DIR) : null,
     analysisTimeoutMs: env.REPOATLAS_ANALYSIS_TIMEOUT_MS,
-    isProduction: env.NODE_ENV === 'production',
+    isProduction,
+    apiKeys: new Set(apiKeys),
   };
 }
 

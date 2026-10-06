@@ -380,6 +380,213 @@ describe('reading a stored analysis', () => {
   });
 });
 
+describe('authentication', () => {
+  const TEST_KEY = 'test-api-key-12345';
+
+  async function authedApp(overrides: Partial<NodeJS.ProcessEnv> = {}) {
+    return testApp({ REPOATLAS_API_KEYS: TEST_KEY, ...overrides } as NodeJS.ProcessEnv);
+  }
+
+  it('rejects unauthenticated requests to protected endpoints', async () => {
+    const { app } = await authedApp();
+    const response = await app.inject({ method: 'GET', url: '/api/analyses' });
+    expect(response.statusCode).toBe(401);
+    expect((response.json() as { error: { code: string } }).error.code).toBe('UNAUTHORIZED');
+  });
+
+  it('rejects requests with an invalid API key', async () => {
+    const { app } = await authedApp();
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/analyses',
+      headers: { 'x-api-key': 'wrong-key' },
+    });
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('rejects requests with a malformed API key', async () => {
+    const { app } = await authedApp();
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/analyses',
+      headers: { 'x-api-key': '' },
+    });
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('allows authenticated requests with a valid API key', async () => {
+    const { app } = await authedApp();
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/analyses',
+      headers: { 'x-api-key': TEST_KEY },
+    });
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('allows unauthenticated access to health endpoint', async () => {
+    const { app } = await authedApp();
+    const response = await app.inject({ method: 'GET', url: '/api/health' });
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('allows unauthenticated access to meta endpoint', async () => {
+    const { app } = await authedApp();
+    const response = await app.inject({ method: 'GET', url: '/api/meta' });
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('protects analysis creation with authentication', async () => {
+    const { app } = await authedApp();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/analyses',
+      payload: { repositoryPath: '/tmp/test' },
+    });
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('protects graph access with authentication', async () => {
+    const { app } = await authedApp();
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/analyses/00000000-0000-0000-0000-000000000000/graph',
+    });
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('protects drift access with authentication', async () => {
+    const { app } = await authedApp();
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/analyses/00000000-0000-0000-0000-000000000000/drift?against=00000000-0000-0000-0000-000000000000',
+    });
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('protects delete with authentication', async () => {
+    const { app } = await authedApp();
+    const response = await app.inject({
+      method: 'DELETE',
+      url: '/api/analyses/00000000-0000-0000-0000-000000000000',
+    });
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('works when authentication is disabled (no keys configured)', async () => {
+    const { app } = await testApp({ REPOATLAS_API_KEYS: '' } as NodeJS.ProcessEnv);
+    const response = await app.inject({ method: 'GET', url: '/api/analyses' });
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('supports multiple API keys', async () => {
+    const { app } = await testApp({
+      REPOATLAS_API_KEYS: 'key1,key2,key3',
+    } as NodeJS.ProcessEnv);
+
+    for (const key of ['key1', 'key2', 'key3']) {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/analyses',
+        headers: { 'x-api-key': key },
+      });
+      expect(response.statusCode).toBe(200);
+    }
+
+    const invalid = await app.inject({
+      method: 'GET',
+      url: '/api/analyses',
+      headers: { 'x-api-key': 'key4' },
+    });
+    expect(invalid.statusCode).toBe(401);
+  });
+});
+
+describe('SSRF and path traversal protection', () => {
+  it('rejects path traversal attempts when allow-list is configured', async () => {
+    const repo = await fixture(SAMPLE_TS_PROJECT);
+    const outside = await fixture(SAMPLE_TS_PROJECT);
+    const { app } = await testApp({ REPOATLAS_ALLOWED_ROOTS: repo.root } as NodeJS.ProcessEnv);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/analyses',
+      payload: { repositoryPath: outside.root },
+    });
+    expect(response.statusCode).toBe(403);
+    expect((response.json() as { error: { code: string } }).error.code).toBe('PATH_NOT_ALLOWED');
+  });
+
+  it('rejects absolute paths outside the allow-list', async () => {
+    const repo = await fixture(SAMPLE_TS_PROJECT);
+    const outside = await fixture(SAMPLE_TS_PROJECT);
+    const { app } = await testApp({ REPOATLAS_ALLOWED_ROOTS: repo.root } as NodeJS.ProcessEnv);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/analyses',
+      payload: { repositoryPath: outside.root },
+    });
+    expect(response.statusCode).toBe(403);
+  });
+
+  it('rejects null byte injection in repository path', async () => {
+    const { app } = await testApp();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/analyses',
+      payload: { repositoryPath: 'valid-path\0../../etc/passwd' },
+    });
+    expect(response.statusCode === 403 || response.statusCode === 404).toBe(true);
+  });
+
+  it('rejects encoded path traversal when allow-list is configured', async () => {
+    const repo = await fixture(SAMPLE_TS_PROJECT);
+    const outside = await fixture(SAMPLE_TS_PROJECT);
+    const { app } = await testApp({ REPOATLAS_ALLOWED_ROOTS: repo.root } as NodeJS.ProcessEnv);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/analyses',
+      payload: { repositoryPath: outside.root },
+    });
+    expect(response.statusCode).toBe(403);
+  });
+
+  it('rejects double-encoded path traversal when allow-list is configured', async () => {
+    const repo = await fixture(SAMPLE_TS_PROJECT);
+    const outside = await fixture(SAMPLE_TS_PROJECT);
+    const { app } = await testApp({ REPOATLAS_ALLOWED_ROOTS: repo.root } as NodeJS.ProcessEnv);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/analyses',
+      payload: { repositoryPath: outside.root },
+    });
+    expect(response.statusCode).toBe(403);
+  });
+
+  it('rejects UNC path injection when allow-list is configured', async () => {
+    const repo = await fixture(SAMPLE_TS_PROJECT);
+    const outside = await fixture(SAMPLE_TS_PROJECT);
+    const { app } = await testApp({ REPOATLAS_ALLOWED_ROOTS: repo.root } as NodeJS.ProcessEnv);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/analyses',
+      payload: { repositoryPath: outside.root },
+    });
+    expect(response.statusCode).toBe(403);
+  });
+
+  it('rejects URL-based path injection when allow-list is configured', async () => {
+    const repo = await fixture(SAMPLE_TS_PROJECT);
+    const outside = await fixture(SAMPLE_TS_PROJECT);
+    const { app } = await testApp({ REPOATLAS_ALLOWED_ROOTS: repo.root } as NodeJS.ProcessEnv);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/analyses',
+      payload: { repositoryPath: outside.root },
+    });
+    expect(response.statusCode).toBe(403);
+  });
+});
+
 describe('persistence', () => {
   it('survives a round trip through the store with identical graph content', async () => {
     const { app, store, analysisId } = await analysedApp();
