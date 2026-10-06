@@ -4,14 +4,14 @@ import { projectAtlas, checkConsistency } from '@repoatlas/artifacts';
 
 function emptyGraph() {
   const input: GraphBuildInput = {
-    repository: { path: '/test/repo', name: 'test' },
+    repository: { absolutePath: '/test/repo', name: 'test' },
     files: [],
     parsed: [],
     commits: [],
     headCommit: null,
     branch: null,
     evidence: new EvidenceStore({ maxExcerptChars: 200 }),
-    diagnostics: { add: () => undefined, all: () => [] },
+    diagnostics: { add: () => undefined, list: () => [], size: 0, truncated: false } as unknown as import('@repoatlas/core').DiagnosticCollector,
     limits: { maxNodes: 10000, maxEdges: 20000 },
     includeGitHistory: false,
   };
