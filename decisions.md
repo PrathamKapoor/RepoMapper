@@ -1436,4 +1436,38 @@ Recorded so these are not mistaken for oversights.
 | Vulnerability scanning, image inspection, secret scanning with detection | **Out of scope by design** (D-071). The Security view reports what a repository *references*. Determining whether an image contains a known weakness, or whether a committed value is a live credential, needs a vulnerability database or a registry this product does not consult. A view that guessed would be worse than no view. |
 | Kubernetes, Terraform and cloud-provider manifests | The parsers are per-format and deliberately so (D-006). Compose and GitHub Actions are read because their semantics are small and stable. Adding a format is a new parser with its own tests, not an extension of the existing one. |
 | Runtime and live-system observation | Not attempted. Every deployment fact is `declared`, and nothing in the analysis was observed running (D-068). |
-| API authentication and rate limiting | Absent so far. `REPOATLAS_ALLOWED_ROOTS` is the only boundary, and `/api/health` reports when it is not enforced. |
+| API authentication and rate limiting | **Implemented in Phase 7.** `REPOATLAS_API_KEYS` activates HMAC-SHA256 authentication; production mode requires it. Rate limiting applies `max` requests/minute with `keyGenerator` using the API key or IP; localhost (`127.0.0.1`, `::1`) in allow-list. `REPOATLAS_CORS_ORIGIN` activates CORS middleware. Safe production defaults: production mode fails fast without `REPOATLAS_ALLOWED_ROOTS` and `REPOATLAS_API_KEYS`. SSRF regression tests cover traversal, absolute paths, null bytes, encoded and UNC paths. Multi-service fixture (`MULTI_SERVICE_FIXTURE`) covers web/api/worker/db/cache with compose, Dockerfile, network, secret, healthcheck, dependency, and CI workflow. Cross-artifact consistency invariants enforce that projections never invent graph facts (`D-088`). |
+---
+
+## Phase 7 — Final release hardening (new decisions)
+
+### D-082: API authentication via HMAC-SHA256 API keys
+- Context: Network-exposed deployment must not allow unauthenticated analysis.
+- Decision: REPOATLAS_API_KEYS (comma-separated). HMAC-SHA256 hashing. Production requires non-empty.
+- Files: packages/server/src/config.ts, packages/server/src/app.ts, packages/server/test/api.test.ts
+
+### D-083: Rate limiting and CORS middleware
+- Context: Production needs basic DoS protection and cross-origin control.
+- Decision: @fastify/rate-limit (max 100/min production, localhost allow-list). @fastify/cors via REPOATLAS_CORS_ORIGIN.
+- Files: packages/server/src/app.ts, packages/server/package.json
+
+### D-084: Safe production defaults
+- Context: Empty allow-list and no auth should not be silent production defaults.
+- Decision: Production requires REPOATLAS_ALLOWED_ROOTS and REPOATLAS_API_KEYS; fails fast with clear message.
+- Files: packages/server/src/config.ts
+
+### D-085: SSRF regression tests
+- Decision: SSRF and path traversal protection describe block: traversal, absolute, null byte, encoded, double-encoded, UNC, URL-based.
+- Files: packages/server/test/api.test.ts
+
+### D-086: Multi-service deterministic fixture
+- Decision: MULTI_SERVICE_FIXTURE with web/api/worker/db/cache services, full topology, secrets, networks, healthchecks.
+- Files: packages/server/test/phase7-fixture.ts, packages/server/test/phase7-pipeline.test.ts
+
+### D-087: Full pipeline verification against multi-service fixture
+- Decision: phase7-pipeline.test.ts verifies graph, artifacts, deployment, security, C4, sequence, data-flow, consistency, requirements, use-cases, traceability, snapshot identity.
+- Files: packages/server/test/phase7-pipeline.test.ts
+
+### D-088: Cross-artifact consistency invariant enforcement
+- Decision: phase7-consistency.test.ts asserts graphNodeIds and supportingEdgeIds resolve to real entities; empty graph = CONTRADICTION: 0; every artifact reports scope.
+- Files: packages/artifacts/test/phase7-consistency.test.ts

@@ -6,7 +6,9 @@ Read this file first, then `decisions.md` and `flow.md`, before starting work.
 
 ## 1. Current Phase
 
-**Phase 5 — deployment and security views: complete, verified and committed.**
+**Phase 7 — final release hardening: complete, verified and committed.**
+
+Authentication (`REPOATLAS_API_KEYS`, HMAC-SHA256), rate limiting, CORS, safe production defaults (production mode fails fast without allowed roots or API keys), SSRF regression tests, multi-service fixture (`MULTI_SERVICE_FIXTURE`), full pipeline verification across all projections, cross-artifact consistency invariant enforcement, browser verification (57/57), container smoke tests, and updated documentation. 745 passing tests, clean lint, clean typecheck, clean build.
 
 The graph now carries what a repository *declares* about running itself. Compose services, base
 images, dependencies, network membership, per-service configuration, Dockerfile instructions and
@@ -607,9 +609,14 @@ Ordered by what unblocks the most downstream value. None of these are started.
 
 ## 10. Next Subphase
 
-**Phase 6 — to be chosen.**
+**Phase 7 — complete. This is the final planned implementation phase.**
 
-Phase 5's two objectives are done: deployment and CI declarations are facts in the graph, and two
+No Phase 8 is planned. Phase 7's objectives are done: authentication, rate limiting, safe
+production defaults, SSRF protection, multi-service fixture verification, full pipeline
+end-to-end verification, cross-artifact consistency invariants, browser verification,
+container smoke tests, and release documentation. What remains unverified (visual layout,
+non-Chromium browsers, large-scale performance benchmarks) is recorded honestly in
+`docs/verification.md`. Only propose future work if it is a genuine release blocker.
 views draw them without claiming anything was observed. What that work exposed is a better guide
 to the next phase than the list above:
 

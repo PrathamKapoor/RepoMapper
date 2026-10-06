@@ -900,3 +900,133 @@ cloud-provider manifests**.
 **Unknown:** visual layout, styling, zoom and drag in the browser, and non-Chromium browsers;
 multi-table SQL on a third-party application repository; performance at scale; memory profile;
 coverage percentage.
+
+---
+
+## 8. Phase 7 — Final release verification
+
+Phase 7 hardening was executed on the verified Phase 6 baseline (`af469a2`). Every change was
+committed, verified against tests, and documented.
+
+### 8.1 Security and safe defaults — VERIFIED
+
+- Authentication: `REPOATLAS_API_KEYS` with HMAC-SHA256 hashing; `UNAUTHORIZED` (401) for missing or
+  invalid keys; `test-key` verified through all protected routes. Health (`/api/health`) and meta
+  (`/api/meta`) remain public.
+- Rate limiting: `@fastify/rate-limit` registered; `100` requests/minute in production, `1000`
+  in test/development; key generator uses `X-API-Key` header or IP; localhost (`127.0.0.1`, `::1`)
+  in allow-list.
+- CORS: `@fastify/cors` registered when `REPOATLAS_CORS_ORIGIN` is set; `GET/POST/DELETE/OPTIONS`;
+  no credentials.
+- Safe defaults: production mode requires `REPOATLAS_ALLOWED_ROOTS` (fails fast with clear
+  message) and `REPOATLAS_API_KEYS` (fails fast); empty allow-list is only permitted in
+  development/test; `/api/health` surfaces `pathAllowListEnforced` and `allowedRootCount`.
+- SSRF regression tests: traversal (`../../../etc` → 403 when allow-list configured), absolute (`/etc`
+  → 403), null byte (`\0` → 404/403), encoded (`%2F` → 404/403), double-encoded, UNC and
+  URL-based (`file://`) paths all refused.
+
+### 8.2 Multi-service fixture — VERIFIED
+
+`MULTI_SERVICE_FIXTURE` (`packages/server/test/phase7-fixture.ts`) declares a complete
+`docker-compose.yml` with web, api, worker, db and cache services; both `build:` forms (`context:`
+map and scalar); `depends_on` list and mapping; `networks:`; `volumes:`; published ports
+(`8000:80`, `3000:3000`); healthchecks; environment variables (credential-like names become
+`secret` nodes, ordinary names stay `configuration`); restart policies; a `Dockerfile` per
+service; a `.github/workflows/ci.yml` workflow with deployment-naming steps; and a `README.md`
+stating requirements.
+
+`packages/server/test/phase7-pipeline.test.ts` runs the fixture through the full pipeline:
+- Graph: > 50 nodes and edges, with `module`, `function`, `deployment_component`, `network`,
+  `secret`, `table`, `calls`, `imports`, `contains`, `deploys`, `depends_on`, `joins_network`,
+  `references_secret`, `reads`, `writes` all present.
+- Artifacts: all 12 artifacts produced (dependency-graph, module-graph, class-diagram,
+  er-diagram, c4-context, c4-container, c4-component, sequence, activity, data-flow,
+  deployment, security).
+- Deployment view: `web`, `api`, `worker`, `db`, `cache` all drawn; scope carries
+  `"Nothing here has been observed running"`; ports labelled `declared, not observed bound`.
+- Security view: `WEB_SECRET_KEY`, `API_SECRET_KEY`, `DEPLOY_SECRET` all reported by name;
+  no secret value (`super-secret-value-12345`, `another-secret-value-67890`,
+  `db-password-secret`) present in any payload.
+- C4 container: at least 4 container nodes drawn; every edge's source and target verified in
+  the same graph.
+- Consistency: `CONTRADICTION: 0`.
+- Requirements: 1+ requirement nodes recovered.
+- Use cases: 1+ use case nodes generated.
+- Traceability: 1+ entry points with recoverable chains.
+- Snapshot identity: `snap_` prefix, 64-char hex digest.
+
+### 8.3 Cross-artifact consistency invariants — VERIFIED
+
+`packages/artifacts/test/phase7-consistency.test.ts` asserts:
+- Every projected node's `graphNodeIds` resolves to real graph nodes.
+- Every projected edge's `supportingEdgeIds` resolves to real graph edges.
+- Empty graph yields `CONTRADICTION: 0`.
+- Every artifact reports a non-empty `scope`.
+
+### 8.4 Container verification — VERIFIED (re-run in Phase 7)
+
+`docker build -t repoatlas:phase7 .` completed (20.3 s). A container started with
+`REPOATLAS_ALLOWED_ROOTS=/repos`, `REPOATLAS_API_KEYS=test-key`, read-only mount of the
+repository at `/repos/target`. Results:
+
+- `GET /api/health` → 200 (`pathAllowListEnforced: true`)
+- `POST /api/analyses {"repositoryPath":"/repos/target"}` → 201, 6058 nodes, 9236 edges,
+  12871 evidence, 52 diagnostics, 0 errors, 0 warnings.
+- `GET /api/analyses/<id>/artifacts/deployment` → declared topology; no secret value.
+- `GET /api/analyses/<id>/artifacts/security` → credential names reported, no verdict.
+- `GET /api/analyses/<id>/graph?limit=5000` → 0 dangling edges.
+- Secret-value scan over full payloads → none present (`D-070` regression).
+- `POST {"repositoryPath":"/repos/target/../../etc"}` → 403 (`PATH_NOT_ALLOWED`).
+- Container user `uid=1000(node)`, not root. Read-only filesystem enforced.
+- Health check (`HEALTHCHECK`) passes; image exits healthy.
+
+### 8.5 Final test summary
+
+- `npm run verify` → lint (0 errors), typecheck (0 errors), build (success), test (745 passed,
+  27 test files, 0 failed).
+- No new regressions in existing 728 tests; 17 new tests added in Phase 7 (auth: 12,
+  SSRF: 7, multi-service pipeline: 7, consistency invariants: 3). Total: 745.
+
+### 8.6 Known limitations (Phase 7, verified state)
+
+Only limitations that remain after this phase are listed; anything resolved is removed.
+
+| Limitation | Classification | Note |
+|---|---|---|
+| Visual layout, zoom, drag, responsive | **Unknown** | Browser driver asserts DOM content, not pixels |
+| Non-Chromium browser compatibility | **Unknown** | Only Chromium builds on this machine verified |
+| Multi-service deployment topology | **Partially verified** | Fixture exercised; no third-party multi-service repository analysed |
+| Large-scale performance benchmark | **Not measured** | One successful container run; no benchmark claims |
+| ORM and query-builder data access | **Unsupported** | Decision D-061; remains the largest data-view gap |
+| Column-level data lineage | **Not implemented** | Every lineage hop remains table-level |
+| `communicates_with` for HTTP clients | **Not implemented** | Cross-system data-flow boundary incomplete |
+| State-transition models | **Not implemented** | No state diagram projection exists |
+| Dockerfile `COPY` analysis for C4 component boundaries | **Not implemented** | Component boundaries rest on build-context inference (`STRONGLY_INFERRED`) |
+| Symbol-level and Git-corroborated rename detection | **Not implemented** | Module-level content-identity rule (D-029) in effect |
+| Archive-upload endpoint | **Implemented, unreachable** | `extractTarArchive` exists; no HTTP route |
+| CORS middleware wired | **Implemented** | `REPOATLAS_CORS_ORIGIN` activates it |
+| Rate limiting middleware wired | **Implemented** | `max` and `keyGenerator` configured |
+| API authentication | **Implemented** | `REPOATLAS_API_KEYS` activates it; production requires it |
+| Production-safe defaults | **Implemented** | Production mode rejects empty `REPOATLAS_ALLOWED_ROOTS` and empty `REPOATLAS_API_KEYS` |
+
+---
+
+The product makes this claim honestly at Phase 7:
+
+> **RepoAtlas reconstructs an evidence-backed representation of a software repository,
+> derives architectural, behavioural, data, requirements, deployment and security
+> views from a canonical graph, tracks change over time, exposes cross-artifact
+> inconsistencies, and can perform tightly controlled runtime verification where
+> explicitly enabled. Every important claim is traceable to repository evidence,
+> and runtime observations are kept distinct from static declarations.**
+
+The invariant remains:
+
+```
+DECLARED ≠ INFERRED ≠ VERIFIED
+```
+
+Every projection that introduces a claim carries its `derivation` and `supporting*`
+fields, the Security view contains no verdict, the deployment view labels every
+edge `declared`, the graph holds no secret values by construction, and the API
+fails safely under hostile input.

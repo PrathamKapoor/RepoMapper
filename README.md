@@ -24,9 +24,7 @@ repository → ingestion → analysis → evidence → canonical graph
 
 ## Status
 
-**STATUS: PARTIAL** - Phases 1 to 4 complete and verified. Usable and deployable for its
-stated scope; deliberately incomplete beyond it. Per-capability status is in
-[`docs/verification.md`](docs/verification.md).
+**STATUS: RELEASE CANDIDATE (Phase 7)** - Authentication, rate limiting, safe defaults, SSRF protection, multi-service fixtures, full pipeline verification, cross-artifact consistency, browser verification, and container smoke tests complete. Per-capability status is in [`docs/verification.md`](docs/verification.md).
 
 | | |
 |---|---|

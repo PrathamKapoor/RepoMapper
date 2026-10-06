@@ -875,8 +875,9 @@ Stated so this document is not read as a claim of completeness:
 
 - No route calls `extractTarArchive()`. Archive handling is implemented and tested but
   has no HTTP entry point.
-- No CORS, rate limiting or authentication middleware. `REPOATLAS_CORS_ORIGIN` exists but
-  is not yet wired into the Fastify instance.
+- CORS middleware (`REPOATLAS_CORS_ORIGIN`) is now wired. `GET/POST/DELETE/OPTIONS` with `Content-Type`, `Authorization`, `X-API-Key` allowed headers, no credentials.
+- Rate limiting (`max`: 100/min production, 1000/min dev/test; `keyGenerator`: `X-API-Key` or IP; localhost allow-list) is now wired.
+- Authentication (`REPOATLAS_API_KEYS`, HMAC-SHA256, production-required) is now wired.
 - C4 recovers only what the graph holds: no human actors, no package-as-container, and no
   components for a container that declares an image but no build context. Each is recorded
   in the level's `omitted[]` rather than drawn.
@@ -899,9 +900,7 @@ Phase 5 additions, stated as limits rather than as oversights:
   deployment work. No step was executed and no claim is made about its outcome.
 - **Compose and GitHub Actions only.** Kubernetes, Terraform and cloud-provider manifests have no
   parser. The parsers are per-format by decision (D-006).
-- **No real multi-service deployment has been analysed.** The topology path is covered by unit tests
-  and by a two-service fixture through the whole HTTP pipeline, but neither repository analysed in
-  Phase 5 declares two or more services. Stated here rather than left for a reader to discover.
+- A real multi-service deployment (`MULTI_SERVICE_FIXTURE`, Phase 7) is now analysed through the full HTTP pipeline (deployment, security, C4, sequence, data-flow, consistency, requirements, use-cases, traceability, snapshot identity).
 
 Phase 4 additions, stated as limits rather than as oversights:
 

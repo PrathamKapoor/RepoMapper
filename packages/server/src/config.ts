@@ -97,7 +97,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): ServerConfi
     );
   }
 
-  if (isProduction && apiKeys.size === 0) {
+  if (isProduction && apiKeys.length === 0) {
     throw new Error(
       'REPOATLAS_API_KEYS must be set in production mode. ' +
       'Without API keys, anyone who can reach the port can analyse repositories.'
