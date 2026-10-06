@@ -146,6 +146,24 @@ export const NODE_KINDS = [
   'network',
   'secret',
   /**
+   * Phase 6. A declared *volume* or host path a service mounts.
+   *
+   * A distinct kind from `deployment_component` because a named volume is not a unit that runs:
+   * reporting one as a container produced a node in the architecture view that could not start
+   * (D-039). It is a resource a service is given, which is what `mounts` states.
+   */
+  'volume',
+  /**
+   * Phase 6. A port a deployment declares.
+   *
+   * A node rather than an attribute because the three port concepts have to be kept apart and
+   * compared: the **container port** the image must listen on, the **host port** an operator
+   * published it as, and the **application listener** a `listen(4300)` call in code establishes.
+   * Collapsing them into one number is what produced `port 127` from `127.0.0.1:4300:4300`
+   * (D-075) and would let a published port be mistaken for a listening socket.
+   */
+  'port',
+  /**
    * A decision point in the control flow of an enclosing function.
    *
    * Created only from an explicit branch, loop or handler in source. Nothing infers a state
@@ -248,6 +266,31 @@ export const EDGE_KINDS = [
   'references_secret',
   'listens_on',
   'protected_by',
+  // Phase 6. Deployment-to-application reconciliation.
+  //
+  // These answer "what code does this service run?" and "where is this component deployed?"
+  // using the existing vocabulary wherever one fits, because a new relationship kind per concept
+  // would make the graph unreadable and would guarantee disagreement between views.
+  //
+  // `runs`         a service runs an entry point, established by resolving a CMD/ENTRYPOINT to
+  //                 code. `WEEKLY_INFERRED` at best — a command names a file, not a running process.
+  // `uses_config`  a service receives a named environment variable. Name only, never a value.
+  // `checks`       a declared healthcheck targets an endpoint or command RepoAtlas can identify.
+  //                 Says the check *exists* and *names* its target; never that it passed.
+  //
+  // `mounts` reuses the existing `contains` vocabulary rather than adding a kind: a mount *is* a
+  // containment claim, and a second containment relationship would let two projections disagree
+  // about who contains what. `exposes` carries the port relationship for the same reason — it
+  // already existed for endpoints, and a port a service publishes is the same claim.
+  //
+  // `communicates_with` is reused for a configured service address rather than introducing
+  // `connects_to`. The word `connects` would be a lie: nothing in a file establishes a
+  // connection, and the edge records the *address*, with `via: configured_address` saying so.
+  //
+  // `runs` is the only genuinely new relationship, and it exists because nothing in the existing
+  // vocabulary states it: `deploys` places code in a service, `contains` puts a file in a module,
+  // and none of them says what process starts.
+  'runs',
 ] as const;
 
 export type EdgeKind = (typeof EDGE_KINDS)[number];
@@ -714,3 +757,63 @@ export interface AnalysisResult {
 export const EVIDENCE_STATUSES = ['EXPLICIT', 'PARTIALLY_EVIDENCED', 'INFERRED', 'NOT_FOUND'] as const;
 
 export type EvidenceStatus = (typeof EVIDENCE_STATUSES)[number];
+
+// ---------------------------------------------------------------------------
+// Verification status (Phase 6)
+// ---------------------------------------------------------------------------
+
+/**
+ * How a deployment claim came to be known.
+ *
+ * This is deliberately **not** an extension of `Confidence`. Confidence answers "how strongly do
+ * we believe this relationship?", and every Phase 1-5 fact is a statement about a repository file.
+ * Verification status answers a different question — "did anyone observe this?" — and the honest
+ * answer is usually "no" for a fact we are otherwise entirely confident about.
+ *
+ * Getting these apart is the whole point. `depends_on: [db]` in a compose file is `DECLARED` at
+ * `EXPLICIT` confidence: we are certain the file says it, and we are equally certain it says
+ * nothing about whether `db` was reachable. Collapsing the two produces either "this is just a
+ * guess" (wrong, and useless) or "this dependency is certain" (worse).
+ *
+ *   DECLARED     a repository artifact states this outright
+ *   INFERRED      several observed facts support it; no single declaration establishes it
+ *   VERIFIED      RepoAtlas observed it through controlled verification
+ *   UNKNOWN       the repository does not provide enough evidence either way
+ *   UNSUPPORTED   this analysis is not implemented
+ *
+ * `UNSUPPORTED` is distinct from `UNKNOWN` on purpose. `UNKNOWN` is a fact about the repository.
+ * `UNSUPPORTED` is a fact about RepoAtlas, and reporting it as `UNKNOWN` would blame the
+ * repository for a gap in the tool — the same error in a different place.
+ */
+export const VERIFICATION_STATUSES = ['DECLARED', 'INFERRED', 'VERIFIED', 'UNKNOWN', 'UNSUPPORTED'] as const;
+
+export type VerificationStatus = (typeof VERIFICATION_STATUSES)[number];
+
+/** True only when a controlled verification actually observed the claim. */
+export function isVerified(status: VerificationStatus): boolean {
+  return status === 'VERIFIED';
+}
+
+/**
+ * Terminal states of a controlled verification run.
+ *
+ * A failed verification is not an `unknown` one. "The health check ran and failed" and "the health
+ * check could not be run" are different facts about the world, and collapsing them would make a
+ * broken service indistinguishable from an unverifiable one (D-086).
+ */
+export const VERIFICATION_OUTCOMES = [
+  /** The observation was made and matched the declaration. */
+  'succeeded',
+  /** The observation was made and did not match. */
+  'failed',
+  /** The observation did not complete within its bound. */
+  'timed_out',
+  /** Verification was not attempted because a precondition was not met. */
+  'blocked',
+  /** No verification mechanism is available in this environment. */
+  'unavailable',
+  /** Verification was requested but has not run. */
+  'not_run',
+] as const;
+
+export type VerificationOutcome = (typeof VERIFICATION_OUTCOMES)[number];

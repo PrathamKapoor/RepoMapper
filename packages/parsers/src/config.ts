@@ -193,6 +193,7 @@ function parseCompose(source: string, result: ParsedFile): void {
     const image = /^\s+image:\s*(\S+)/m.exec(block)?.[1] ?? null;
     const build = buildContextOf(block);
     const ports = containerPortsOf(block);
+    const buildFile = buildFileOf(block);
     result.markers.push({
       name: 'compose.service',
       line: service.line,
@@ -203,8 +204,45 @@ function parseCompose(source: string, result: ParsedFile): void {
         // Container ports, which is what the image has to listen on. The host side of a
         // published port is the operator's choice and says nothing about the image.
         publishedPorts: ports.join(','),
+        // Phase 6. Both are recorded so identity and reconciliation do not depend on where the
+        // service happens to sit in the file. A service's identity is its name; its declaring
+        // file is provenance, not identity (D-078).
+        ...(buildFile ? { buildFile } : {}),
       },
     });
+
+    // Phase 6: published ports keep the host side.
+    //
+    // Phase 5 kept only the container port, which was the right call for "what must the image
+    // listen on". It is the wrong answer to "what does this deployment expose", because
+    // `127.0.0.1:4300:4300` and `0.0.0.0:4300:4300` expose the same container port to
+    // *different* audiences, and Phase 6's security view has to be able to say which. The host
+    // side is recorded as a declaration about reachability scope — never as a fact that anything
+    // is reachable.
+    for (const published of publishedPortsOf(block)) {
+      result.markers.push({
+        name: 'compose.port_publish',
+        line: service.line,
+        attributes: {
+          service: service.service,
+          containerPort: published.containerPort,
+          ...(published.hostPort ? { hostPort: published.hostPort } : {}),
+          ...(published.hostIp ? { hostIp: published.hostIp } : {}),
+          ...(published.protocol ? { protocol: published.protocol } : {}),
+        },
+      });
+    }
+
+    // Phase 6: a command the service overrides. `command:` in compose replaces the image's CMD,
+    // which means a Dockerfile CMD is *not* necessarily what runs (D-079).
+    const command = commandOf(block);
+    if (command) {
+      result.markers.push({
+        name: 'compose.command',
+        line: lineOfKey(source, 'command'),
+        attributes: { service: service.service, value: command },
+      });
+    }
 
     // Phase 5. Each of the following is a *declaration* read from this service's own block.
     // Nothing here is inferred from the fact that another service exists: a service that shares
@@ -234,19 +272,57 @@ function parseCompose(source: string, result: ParsedFile): void {
       });
     }
 
-    for (const volume of declaredVolumeMounts(block)) {
+    // Phase 6. A service-address reference: `http://api:3000` inside this service's own
+    // configuration.
+    //
+    // This is the strongest service-to-service evidence a repository can state. It is still not
+    // a connection: it says the service is *configured to address* another service by the name
+    // compose gives it. Whether that address resolves, and whether a request succeeds, are
+    // runtime facts (D-083). The value is read only for the host and port, and the variable name
+    // travels with it so the reader can see which setting carries the address.
+    for (const address of serviceAddressesOf(block)) {
       result.markers.push({
-        name: 'compose.volume_mount',
-        line: lineOfKey(source, volume),
-        attributes: { service: service.service, volume },
+        name: 'compose.service_address',
+        line: lineOfKey(source, address.variable),
+        attributes: {
+          service: service.service,
+          target: address.target,
+          port: address.port,
+          variable: address.variable,
+        },
       });
     }
 
-    if (/^\s+healthcheck:/m.test(block)) {
+    for (const mount of declaredVolumeMounts(block)) {
+      result.markers.push({
+        name: 'compose.volume_mount',
+        line: lineOfKey(source, mount.volume),
+        attributes: {
+          service: service.service,
+          volume: mount.volume,
+          ...(mount.target ? { target: mount.target } : {}),
+          ...(mount.readOnly ? { readOnly: 'true' } : {}),
+          ...(mount.source ? { source: mount.source } : {}),
+        },
+      });
+    }
+
+    // Phase 6: a healthcheck records the *target* as well as its existence.
+    //
+    // `healthcheck: test: ["CMD", "curl", "-f", "http://localhost/api/health"]` names an
+    // endpoint. That is enough to check the endpoint exists in the application graph — and it is
+    // emphatically not enough to say the check passes (D-084).
+    const healthcheck = healthcheckOf(block);
+    if (healthcheck) {
       result.markers.push({
         name: 'compose.healthcheck',
         line: service.line,
-        attributes: { service: service.service },
+        attributes: {
+          service: service.service,
+          ...(healthcheck.kind ? { kind: healthcheck.kind } : {}),
+          ...(healthcheck.command ? { command: healthcheck.command } : {}),
+          ...(healthcheck.endpoint ? { endpoint: healthcheck.endpoint } : {}),
+        },
       });
     }
 
@@ -260,13 +336,26 @@ function parseCompose(source: string, result: ParsedFile): void {
     }
   }
 
-  for (const network of topLevelNetworks) {
-    result.markers.push({
-      name: 'compose.network_declared',
-      line: lineOfKey(source, network),
-      attributes: { network },
-    });
-  }
+for (const network of topLevelNetworks) {
+      result.markers.push({
+        name: 'compose.network_declared',
+        line: lineOfKey(source, network),
+        attributes: { network },
+      });
+    }
+
+    // Phase 6. A declared volume is a resource a service is given, not a unit that runs.
+    //
+    // Reporting named volumes as services produced containers in the architecture view that
+    // could not start (D-039), so `listTopLevelKeys('volumes')` was never read. It is read now,
+    // into its own node kind, so a mount has both endpoints: the service and the volume.
+    for (const volume of listTopLevelKeys(source, 'volumes')) {
+      result.markers.push({
+        name: 'compose.volume_declared',
+        line: lineOfKey(source, volume),
+        attributes: { volume },
+      });
+    }
 }
 
 /**
@@ -280,15 +369,58 @@ function parseCompose(source: string, result: ParsedFile): void {
  * Only the port is kept. `127.0.0.1:8080:8080` says a port is published on the loopback
  * interface; whether anything is listening, and from where, is not established by the file.
  */
-function containerPortsOf(block: string): string[] {
-  const found = new Set<string>();
-  const list = /^\s+ports:\s*$/m.exec(block);
-  const inline = /^\s+ports:\s*\[([^\]]*)\]/m.exec(block);
+/**
+ * Every published port, with the host side intact.
+ *
+ * Phase 6 split this from `containerPortsOf` because the two questions have different answers.
+ * "What must the image listen on" is the container port. "What does this deployment expose" needs
+ * the host binding too: `127.0.0.1:4300:4300` publishes to the loopback interface and
+ * `4300:4300` publishes on every interface, and those are materially different exposures. Neither
+ * says anything is *reachable* — only that the compose file asks for the binding.
+ */
+function publishedPortsOf(block: string): {
+  containerPort: string;
+  hostPort?: string;
+  hostIp?: string;
+  protocol?: string;
+}[] {
+  const found: { containerPort: string; hostPort?: string; hostIp?: string; protocol?: string }[] = [];
+  const seen = new Set<string>();
 
-  const candidates: string[] = [];
-  if (inline?.[1]) {
-    for (const part of inline[1].split(',')) candidates.push(part.trim().replace(/^["']|["']$/g, ''));
+  for (const candidate of portCandidates(block)) {
+    const [spec, protocol] = candidate.split('/');
+    const segments = (spec ?? '').split(':');
+    const containerPort = segments.at(-1) ?? '';
+    if (!/^\d+(?:-\d+)?$/.test(containerPort)) continue;
+
+    // `[host_ip:][host_port]:container_port[/protocol]` — the container port is always last.
+    const hostPort = segments.length >= 2 && /^\d+(?:-\d+)?$/.test(segments[segments.length - 2] ?? '')
+      ? segments[segments.length - 2]
+      : undefined;
+    const hostIp = segments.length >= 3 ? segments[0] : undefined;
+
+    const key = `${hostIp ?? ''}:${hostPort ?? ''}:${containerPort}/${protocol ?? ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    found.push({
+      containerPort,
+      ...(hostPort ? { hostPort } : {}),
+      ...(hostIp ? { hostIp } : {}),
+      ...(protocol ? { protocol } : {}),
+    });
   }
+  return found.sort((a, b) => `${a.hostIp ?? ''}${a.hostPort ?? ''}${a.containerPort}`.localeCompare(`${b.hostIp ?? ''}${b.hostPort ?? ''}${b.containerPort}`));
+}
+
+/** The raw port specifications written in a service's `ports:` block, list or inline form. */
+function portCandidates(block: string): string[] {
+  const candidates: string[] = [];
+  const inline = /^\s+ports:\s*\[([^\]]*)\]/m.exec(block)?.[1];
+  if (inline) {
+    for (const part of inline.split(',')) candidates.push(unquote(part));
+  }
+
+  const list = /^\s+ports:\s*$/m.exec(block);
   if (list) {
     const tail = block.slice((list.index ?? 0) + list[0].length);
     for (const line of tail.split('\n')) {
@@ -297,11 +429,19 @@ function containerPortsOf(block: string): string[] {
         if (line.trim().length > 0) break;
         continue;
       }
-      candidates.push(item[1].trim().replace(/^["']|["']$/g, ''));
+      candidates.push(unquote(item[1]));
     }
   }
+  return candidates;
+}
 
-  for (const candidate of candidates) {
+function unquote(value: string): string {
+  return value.trim().replace(/^["']|["']$/g, '');
+}
+
+function containerPortsOf(block: string): string[] {
+  const found = new Set<string>();
+  for (const candidate of portCandidates(block)) {
     const withoutProtocol = candidate.split('/')[0] ?? '';
     const segments = withoutProtocol.split(':');
     const container = segments.at(-1) ?? '';
@@ -490,23 +630,157 @@ function environmentReferences(block: string): string[] {
 }
 
 /**
- * Volumes a service mounts, in either the short (`- data:/var/lib`) or long
- * (`- type: volume\n  source: data`) form.
+ * A service-address reference inside a service's configuration.
  *
- * A named volume is not a container (D-039). It is recorded as a *mount* — the service and the
- * volume, with the declaration as evidence — and the projection decides what to draw.
+ * Reads `http://api:3000` out of a declared environment value and reports the host (`api`) and
+ * port as a reference to *another service*. This is the strongest service-to-service evidence a
+ * repository can state, and it is still not a connection: a compose file can name a service that
+ * does not exist, and whether the address resolves or a request succeeds are runtime facts
+ * (D-083).
+ *
+ * The value is never recorded on the marker, for the same reason no other environment value is
+ * (D-070) — a URL can carry a token in its userinfo or query string. Only the host, the port and
+ * the variable name travel, which is enough to ask "which setting addresses which service".
  */
-function declaredVolumeMounts(block: string): string[] {
-  const found = new Set<string>();
-  const short = /^\s+-\s+([A-Za-z0-9_.-]+):\/[^\s]*\s*$/gm;
-  for (const match of block.matchAll(short)) {
-    if (match[1]) found.add(match[1]);
+function serviceAddressesOf(block: string): { variable: string; target: string; port: string }[] {
+  const found: { variable: string; target: string; port: string }[] = [];
+
+  const record = (rawVariable: string, rawValue: string): void => {
+    const variable = rawVariable.trim();
+    const url = /https?:\/\/([^\s/@:'"]+)(?::(\d+))?/.exec(rawValue);
+    const host = url?.[1];
+    if (!host) return;
+
+    // Only a name-shaped host counts. An IP address, `localhost`, or anything with credentials
+    // in it is not a compose service reference, and treating it as one would invent a dependency
+    // on a service no file names.
+    if (!/^[a-z0-9][a-z0-9_.-]*$/i.test(host)) return;
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return;
+    if (host === 'localhost') return;
+    if (host.includes('%40') || rawValue.includes('@', url.index)) return;
+
+    found.push({ variable, target: host, port: url[2] ?? '' });
+  };
+
+  const inline = /^\s+environment:\s*\[([^\]]*)\]/m.exec(block)?.[1];
+  if (inline) {
+    for (const part of inline.split(',')) {
+      const [variable, ...rest] = unquote(part).split('=');
+      if (variable && rest.length > 0) record(variable, rest.join('='));
+    }
   }
-  const long = /^\s+source:\s*([A-Za-z0-9_.-]+)\s*$/gm;
-  for (const match of block.matchAll(long)) {
-    if (match[1]) found.add(match[1]);
+
+  const section = /^\s+environment:\s*$/m.exec(block);
+  if (section) {
+    const tail = block.slice(section.index + section[0].length);
+    for (const line of tail.split('\n')) {
+      if (line.trim().length === 0 || /^\s*#/.test(line)) continue;
+
+      const mapping = /^\s+([A-Za-z_][A-Za-z0-9_]*):\s*(.+)$/.exec(line);
+      // A key with no value at two-or-more spaces of indentation is the next section
+      // (`healthcheck:`, `restart:`), not an environment entry. Breaking on `KEY:` alone rather
+      // than on `KEY: value` is what lets the mapping form be read at all — the entries
+      // themselves are written as `KEY: value` at the same indentation.
+      if (!mapping && /^\s{2,}[A-Za-z0-9_.-]+:\s*(#.*)?$/.test(line)) break;
+      if (mapping?.[1] && mapping[2] !== undefined) {
+        record(mapping[1], unquote(mapping[2]));
+        continue;
+      }
+      const listItem = /^\s+-\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
+      if (listItem?.[1] && listItem[2] !== undefined) record(listItem[1], unquote(listItem[2]));
+    }
   }
-  return [...found];
+
+  return found;
+}
+
+/**
+ * Volumes a service mounts, with the container path and read-only flag.
+ *
+ * Read from the `volumes:` block only, never from the whole service body. The short form
+ * `- source:target[:ro]` is textually identical to a published port entry, so scanning the body
+ * reported `- "3000:3000"` under `ports:` as a bind mount named `(bind) "3000` — a mount of a
+ * string that is not a path. Scoping to the block that opens `volumes:` is what makes the two
+ * distinguishable at all.
+ */
+function declaredVolumeMounts(
+  block: string,
+): { volume: string; target?: string; readOnly?: boolean; source?: string }[] {
+  const found = new Map<string, { volume: string; target?: string; readOnly?: boolean; source?: string }>();
+
+  const add = (rawSource: string, rawTarget?: string, readOnly = false): void => {
+    const source = unquote(rawSource);
+    if (source.length === 0) return;
+    const target = rawTarget ? unquote(rawTarget) : undefined;
+    // `./repos` and `/var/lib/x` are host paths, not volumes this repository declares. Recorded
+    // under a distinct key so a bind mount is never reported as a declared volume.
+    const volume = /^[A-Za-z0-9_.-]+$/.test(source) ? source : `(bind) ${source}`;
+    const key = `${volume}|${target ?? ''}`;
+    found.set(key, {
+      volume,
+      ...(target ? { target } : {}),
+      ...(readOnly ? { readOnly: true } : {}),
+      ...(source !== volume ? { source } : {}),
+    });
+  };
+
+  const section = /^\s+volumes:\s*$/m.exec(block);
+  const tail = section ? block.slice(section.index + section[0].length) : '';
+  // A service with no `volumes:` has no mounts. Returning early keeps the port/mount confusion
+  // structurally impossible rather than relying on the pattern above to reject ports.
+  if (!section) return [];
+
+  let inEntry = false;
+  let entryIndent = -1;
+  const pending: { source: string; target?: string; readOnly: boolean }[] = [];
+
+  const flush = (): void => {
+    if (pending.length > 0) {
+      // A long-form entry with `source:` but no `target:` still names a volume.
+      const last = pending[pending.length - 1]!;
+      if (last.source.length > 0 && last.target === undefined) add(last.source, undefined, last.readOnly);
+      pending.length = 0;
+    }
+  };
+
+  for (const line of tail.split('\n')) {
+    if (line.trim().length === 0 || /^\s*#/.test(line)) continue;
+    const leading = /^\s*/.exec(line)?.[0].length ?? 0;
+    if (leading === 0) break;
+
+    if (entryIndent < 0) entryIndent = leading;
+
+    // Short form: `- source:target[:ro]`
+    const short = /^\s*-\s*([^:]+):([^:]+)(:ro)?\s*$/.exec(line);
+    if (short?.[1] !== undefined && short[2] !== undefined && leading === entryIndent) {
+      flush();
+      add(short[1], short[2], short[3] === ':ro');
+      inEntry = false;
+      continue;
+    }
+
+    if (!/^\s*-\s*\S/.test(line) || leading < entryIndent) continue;
+
+    if (!inEntry) {
+      flush();
+      inEntry = true;
+    }
+    // Long form keys.
+    const source = /^\s*source:\s*(.+)$/.exec(line)?.[1];
+    if (source !== undefined) {
+      pending.push({ source: unquote(source), readOnly: false });
+      continue;
+    }
+    const target = /^\s*target:\s*(\S+)\s*$/.exec(line)?.[1];
+    if (target !== undefined) {
+      const last = pending[pending.length - 1];
+      if (last) last.target = unquote(target);
+      continue;
+    }
+  }
+  flush();
+
+  return [...found.values()].sort((a, b) => `${a.volume}|${a.target ?? ''}`.localeCompare(`${b.volume}|${b.target ?? ''}`));
 }
 
 /**
@@ -524,6 +798,126 @@ function buildContextOf(block: string): string | null {
   const tail = block.slice(mapping.index + mapping[0].length);
   const context = /^\s+context:\s*(\S+)\s*$/m.exec(tail)?.[1];
   return context ?? null;
+}
+
+/**
+ * The Dockerfile a build uses, from `build.dockerfile`.
+ *
+ * Recorded because `context` alone is not enough to find the image's instructions. Compose's
+ * default is `<context>/Dockerfile`, but an explicit `dockerfile:` is ordinary in a monorepo, and
+ * an entrypoint can only be reconciled to application code through the Dockerfile the service
+ * actually builds from.
+ *
+ * The value is relative to the build context in Compose's own semantics, so it is stored as
+ * written and resolved against the context by the graph builder, which is the only place that
+ * knows the repository root.
+ */
+function buildFileOf(block: string): string | null {
+  const mapping = /^\s+build:\s*$/m.exec(block);
+  if (!mapping) return null;
+  const tail = block.slice(mapping.index + mapping[0].length);
+  return /^\s+dockerfile:\s*(\S+)\s*$/m.exec(tail)?.[1] ?? null;
+}
+
+/**
+ * A compose `command:` override, as a single normalised string.
+ *
+ * Recorded because a compose `command` *replaces* the image's `CMD`. Reading an entrypoint from a
+ * Dockerfile and attributing it to a service that overrides the command is how a deployment view
+ * ends up describing a process that never starts (D-079). The value is a command, not code, and is
+ * never executed.
+ */
+function commandOf(block: string): string | null {
+  const inlineArray = /^\s+command:\s*\[([^\]]*)\]/m.exec(block)?.[1];
+  if (inlineArray !== undefined) {
+    const parts = inlineArray
+      .split(',')
+      .map((part) => unquote(part))
+      .filter((part) => part.length > 0);
+    return parts.length > 0 ? parts.join(' ').slice(0, 200) : null;
+  }
+
+  const section = /^\s+command:\s*$/m.exec(block);
+  if (section) {
+    const tail = block.slice(section.index + section[0].length);
+    const parts: string[] = [];
+    for (const line of tail.split('\n')) {
+      const item = /^\s+-\s*(.+)$/.exec(line);
+      if (!item?.[1]) {
+        if (line.trim().length > 0) break;
+        continue;
+      }
+      parts.push(unquote(item[1]));
+    }
+    return parts.length > 0 ? parts.join(' ').slice(0, 200) : null;
+  }
+  const scalar = /^\s+command:\s*(.+)$/m.exec(block)?.[1];
+  return scalar ? unquote(scalar).slice(0, 200) : null;
+}
+
+/**
+ * A healthcheck's declared target.
+ *
+ * Both compose spellings occur: the exec array (`test: ["CMD", "curl", …]`) and the
+ * `CMD-SHELL` string. The URL inside is read as the *name of a target*, which is enough to ask
+ * whether that endpoint exists in the application graph.
+ *
+ * It is emphatically not a statement that the check runs or passes. Nothing in a file can
+ * establish that, and Phase 5's D-084 exists because this shape was previously reported without
+ * its target, leaving no way to tell a health check of a real endpoint from one naming a path
+ * nothing serves.
+ */
+function healthcheckOf(block: string): { kind?: string; command?: string; endpoint?: string } | null {
+  const section = /^\s+healthcheck:\s*$/m.exec(block);
+  if (!section) return null;
+
+  const tail = block.slice(section.index + section[0].length);
+  const inline = /^\s+test:\s*\[([^\]]*)\]/m.exec(tail)?.[1];
+  const parts: string[] = [];
+
+  if (inline !== undefined) {
+    for (const part of inline.split(',')) parts.push(unquote(part));
+  } else {
+    // `test: ["CMD", ...]` written as a list, or `test: curl …` as a scalar.
+    const list = /^\s+test:\s*$/m.exec(tail);
+    if (list) {
+      const listTail = tail.slice(list.index + list[0].length);
+      for (const line of listTail.split('\n')) {
+        const item = /^\s+-\s*(.+)$/.exec(line);
+        if (!item?.[1]) {
+          if (line.trim().length > 0) break;
+          continue;
+        }
+        parts.push(unquote(item[1]));
+      }
+    }
+    if (parts.length === 0) {
+      const scalar = /^\s+test:\s*(.+)$/m.exec(tail)?.[1];
+      if (scalar) parts.push(unquote(scalar));
+    }
+  }
+
+  if (parts.length === 0) return { kind: 'unknown' };
+
+  const kind = parts[0] === 'CMD' || parts[0] === 'NONE' ? parts[0] : parts[0] === 'CMD-SHELL' ? 'CMD-SHELL' : 'none';
+  if (kind === 'NONE') return { kind: 'NONE' };
+
+  const command = parts.slice(1).join(' ').slice(0, 200);
+  const endpoint = /https?:\/\/[^\s"'`)]+/.exec(command)?.[0];
+  return {
+    kind,
+    ...(command.length > 0 ? { command } : {}),
+    // Only the path is kept. A healthcheck written against an internal hostname names a target;
+    // the host part is the container's own address and says nothing about reachability from
+    // outside the deployment.
+    ...(endpoint ? { endpoint: endpointPath(endpoint) } : {}),
+  };
+}
+
+/** The path of a URL, with any query string removed. Never the host. */
+function endpointPath(url: string): string {
+  const withoutScheme = url.replace(/^https?:\/\/[^/]+/i, '');
+  return withoutScheme.length > 0 ? withoutScheme.split(/[?#]/)[0]!.slice(0, 120) : '/';
 }
 
 /**

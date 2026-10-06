@@ -3,6 +3,7 @@ import type { DiagnosticCollector } from './diagnostics.js';
 import type { EvidenceStore } from './evidence.js';
 import { SoftwareGraphBuilder } from './graph.js';
 import { nodeId, toPosixPath } from './ids.js';
+import { reconcileDeployment } from './reconciliation.js';
 import type {
   AttributeValue,
   CommitRecord,
@@ -407,6 +408,18 @@ export function buildGraph(input: GraphBuildInput): GraphBuildResult {
 // ------------------------------------------------------------------- markers
   addMarkerFacts(input, builder, moduleByPath, symbolIndex, counters);
 
+  // ------------------------------------------------------- deployment ↔ application
+  //
+  // Phase 6. Runs *after* every marker is read, because reconciliation needs both halves of the
+  // graph to exist first — which is the same ordering constraint Phase 2's D-010 taught about the
+  // symbol index, arriving in a new place.
+  //
+  // Doing this as a separate pass rather than inside the marker switch is deliberate: a mapping
+  // needs two facts, and the marker that supplies the second is usually in a *different file*
+  // (a compose service in one, its Dockerfile in another). Reading it during the marker walk would
+  // make the result depend on file order.
+  addReconciledRelationships(input, builder);
+
   // ---------------------------------------------------------------- return facts
   addReturnFacts(builder, evidence, input.parsed, symbolIndex);
 
@@ -426,6 +439,82 @@ export function buildGraph(input: GraphBuildInput): GraphBuildResult {
   }
 
   return { graph: builder.build(evidence), counters, truncated: builder.wasTruncated() };
+}
+
+/**
+ * Phase 6: adds the deployment↔application relationships to the graph.
+ *
+ * Reconciliation is a *pass*, not a marker handler, because every mapping it produces joins two
+ * facts that usually live in different files — a compose service in one, the Dockerfile it builds
+ * from in another. Handling each marker as it arrived would make the result depend on which file
+ * the analysis happened to walk first, which is the D-080 shape of bug in a new place.
+ *
+ * Nothing here is added when the graph holds no declared service. A repository with no compose
+ * file produces no reconciliation output and, importantly, no unresolved-mapping noise.
+ */
+function addReconciledRelationships(
+  input: GraphBuildInput,
+  builder: SoftwareGraphBuilder,
+): void {
+  const services = builder.nodesOfKind('deployment_component').filter(
+    (node) => node.attributes?.declaredAs === 'service',
+  );
+  if (services.length === 0) return;
+
+  // Phase 6. Build a temporary SoftwareGraph from the nodes and edges already registered,
+  // so reconciliation reads what the builder has produced without calling the unfinished
+  // `preview()` or `buildGraphPreview()` methods.
+  const previewGraph: SoftwareGraph = {
+    schemaVersion: 5,
+    nodes: builder.allNodes(),
+    edges: builder.allEdges(),
+    evidence: input.evidence.list(),
+  };
+
+  const modulePaths = [...input.files.map((file) => file.path)].filter(
+    (path) => builder.allNodes().some(
+      (node) => node.kind === 'module' && node.path === path,
+    ),
+  );
+  const moduleByPath = new Map<string, string>();
+  for (const path of modulePaths) {
+    const moduleNode = builder.allNodes().find((node) => node.kind === 'module' && node.path === path);
+    if (moduleNode) moduleByPath.set(path, moduleNode.id);
+  }
+
+  const result = reconcileDeployment({
+    graph: previewGraph,
+    parsed: input.parsed,
+    evidence: input.evidence,
+    moduleByPath,
+  });
+
+  for (const relationship of result.relationships) {
+    if (!builder.hasNode(relationship.from) || !builder.hasNode(relationship.to)) continue;
+    builder.addEdge({
+      from: relationship.from,
+      to: relationship.to,
+      kind: relationship.kind,
+      confidence: relationship.confidence,
+      evidence: relationship.evidence,
+      attributes: relationship.attributes,
+    });
+  }
+
+  for (const missing of result.unresolved) {
+    input.evidence.add({
+      kind: 'DERIVED',
+      path: '.',
+      startLine: 0,
+      symbol: missing.subject,
+      excerpt: `${missing.rule}: ${missing.reason}`,
+      producer: 'deployment-reconciliation',
+    });
+    input.diagnostics.info('DEPLOYMENT_MAPPING_UNRESOLVED', `${missing.subject}: ${missing.reason}`, {
+      path: '.',
+      detail: { rule: missing.rule, reason: missing.reason },
+    });
+  }
 }
 
 function indexSymbol(
@@ -583,8 +672,12 @@ function addMarkerFacts(
         case 'compose.depends_on':
         case 'compose.network':
         case 'compose.network_declared':
+        case 'compose.volume_declared':
         case 'compose.environment':
         case 'compose.volume_mount':
+        case 'compose.port_publish':
+        case 'compose.service_address':
+        case 'compose.command':
         case 'compose.healthcheck':
         case 'compose.restart_policy':
         case 'docker.expose':
@@ -1501,6 +1594,163 @@ function addDeploymentFact(
         evidence: [markerEvidence],
         confidence: 'EXPLICIT',
         attributes: { declaredIn: file.path, referencedByService: 'false' },
+      });
+      return;
+    }
+
+    case 'compose.volume_declared': {
+      // A declared volume is a resource, not a unit. Reporting one as a service produced a
+      // container in the architecture view that could not start (D-039); it now has its own kind
+      // so a `mounts` edge has a real endpoint on both sides.
+      const volume = String(marker.attributes.volume ?? '');
+      if (volume.length === 0) return;
+      const volumeId = nodeId('volume', volume);
+      if (builder.hasNode(volumeId)) return;
+      builder.addNode({
+        kind: 'volume',
+        name: volume,
+        qualifiedName: volume,
+        path: file.path,
+        startLine: marker.line,
+        evidence: [markerEvidence],
+        confidence: 'EXPLICIT',
+        attributes: { declaredIn: file.path, declared: true },
+      });
+      return;
+    }
+
+    case 'compose.volume_mount': {
+      const service = String(marker.attributes.service ?? '');
+      const volume = String(marker.attributes.volume ?? '');
+      if (service.length === 0 || volume.length === 0) return;
+      const from = nodeId('deployment_component', service);
+      if (!builder.hasNode(from)) return;
+
+      // A mount of a name the file never declares is a reference to something outside this
+      // repository. The node is created — the mount is stated — but `declared: false` records
+      // that the file did not define it, so a projection can tell the two apart.
+      const volumeId = nodeId('volume', volume);
+      if (!builder.hasNode(volumeId)) {
+        builder.addNode({
+          kind: 'volume',
+          name: volume,
+          qualifiedName: volume,
+          path: file.path,
+          startLine: marker.line,
+          evidence: [markerEvidence],
+          confidence: 'EXPLICIT',
+          attributes: { declaredIn: file.path, declared: false },
+        });
+      }
+
+      builder.addEdge({
+        from,
+        to: volumeId,
+        // Reuses `contains` rather than a `mounts` kind: a mount is a containment claim, and a
+        // second containment relationship would let two projections disagree about who contains
+        // what. `scope` is what distinguishes a volume mount from a module containing a file.
+        kind: 'contains',
+        // The mount is stated. Nothing establishes that anything was written to it, or that the
+        // host path existed when the service started.
+        confidence: 'EXPLICIT',
+        evidence: [markerEvidence],
+        attributes: {
+          scope: 'volume_mount',
+          declaredIn: file.path,
+          ...(typeof marker.attributes.target === 'string' ? { target: marker.attributes.target } : {}),
+          ...(marker.attributes.readOnly === 'true' ? { readOnly: true } : {}),
+          ...(typeof marker.attributes.source === 'string' ? { source: marker.attributes.source } : {}),
+        },
+      });
+      return;
+    }
+
+    case 'compose.port_publish': {
+      const service = String(marker.attributes.service ?? '');
+      const containerPort = String(marker.attributes.containerPort ?? '');
+      if (service.length === 0 || containerPort.length === 0) return;
+      const from = nodeId('deployment_component', service);
+      if (!builder.hasNode(from)) return;
+
+      // Phase 6. A published port is three separate facts — container port, host port, host
+      // binding — kept apart rather than collapsed into one number. Collapsing them is what
+      // produced `port 127` from `127.0.0.1:4300:4300` (D-075).
+      //
+      // The edge records a *request* to bind, never a bound socket. `hostIp` absent means every
+      // interface, which is a materially wider exposure than `127.0.0.1` and is why it is stored
+      // as an explicit `allInterfaces` flag rather than left to a reader's guess.
+      const portId = nodeId('port', `${service}:${containerPort}`);
+      if (!builder.hasNode(portId)) {
+        builder.addNode({
+          kind: 'port',
+          name: containerPort,
+          // The id is `<service>:<port>` so two services publishing the same container port are
+          // two facts, not one. They are separate sockets on separate containers.
+          qualifiedName: `${service}:${containerPort}`,
+          path: file.path,
+          startLine: marker.line,
+          evidence: [markerEvidence],
+          confidence: 'EXPLICIT',
+          attributes: {
+            declaredIn: file.path,
+            containerPort,
+            ...(typeof marker.attributes.hostPort === 'string' ? { hostPort: marker.attributes.hostPort } : {}),
+            ...(typeof marker.attributes.hostIp === 'string' ? { hostIp: marker.attributes.hostIp } : {}),
+            allInterfaces: typeof marker.attributes.hostIp !== 'string',
+            ...(typeof marker.attributes.protocol === 'string' ? { protocol: marker.attributes.protocol } : {}),
+            // No listener was observed. An application `listen()` call would be reconciled onto
+            // this node by `reconcilePorts`, which is the only place that may say otherwise.
+            observed: false,
+          },
+        });
+      }
+
+      builder.addEdge({
+        from,
+        to: portId,
+        kind: 'exposes',
+        confidence: 'EXPLICIT',
+        evidence: [markerEvidence],
+        attributes: {
+          declaredIn: file.path,
+          scope: 'deployment',
+          containerPort,
+          ...(typeof marker.attributes.hostPort === 'string' ? { hostPort: marker.attributes.hostPort } : {}),
+          ...(typeof marker.attributes.hostIp === 'string' ? { hostIp: marker.attributes.hostIp } : {}),
+          allInterfaces: typeof marker.attributes.hostIp !== 'string',
+          observed: false,
+        },
+      });
+      return;
+    }
+
+    case 'compose.service_address': {
+      const service = String(marker.attributes.service ?? '');
+      const target = String(marker.attributes.target ?? '');
+      if (service.length === 0 || target.length === 0) return;
+      const from = nodeId('deployment_component', service);
+      const to = nodeId('deployment_component', target);
+      if (!builder.hasNode(from) || !builder.hasNode(to)) return;
+
+      // A configuration value naming another service by its compose name. This is the strongest
+      // service-to-service evidence a repository states, and it is still an *address*, not a
+      // connection: the compose file can name a service that does not exist, and nothing here
+      // establishes that a request was made or succeeded (D-083).
+      builder.addEdge({
+        from,
+        to,
+        kind: 'communicates_with',
+        // The address is stated by the file. Its *use* is not: a value can be set and never read.
+        confidence: 'EXPLICIT',
+        evidence: [markerEvidence],
+        attributes: {
+          declaredIn: file.path,
+          via: 'configured_address',
+          ...(typeof marker.attributes.variable === 'string' ? { variable: marker.attributes.variable } : {}),
+          ...(typeof marker.attributes.port === 'string' && marker.attributes.port.length > 0
+            ? { port: marker.attributes.port }
+            : {}),
+        },
       });
       return;
     }

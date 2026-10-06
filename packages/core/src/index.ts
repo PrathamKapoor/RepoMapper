@@ -7,6 +7,8 @@ export * from './use-cases.js';
 export * from './traceability.js';
 export * from './snapshot.js';
 export * from './drift.js';
+export * from './reconciliation.js';
+export * from './verification.js';
 export * from './evidence.js';
 export * from './redact.js';
 export * from './limits.js';

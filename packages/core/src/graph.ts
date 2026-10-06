@@ -183,6 +183,18 @@ export class SoftwareGraphBuilder {
     return [...this.nodes.values()];
   }
 
+  /** Read-only view of nodes and edges so far. Used by reconciliation to reason about completed facts. */
+  preview(): SoftwareGraph {
+    const nodes = this.allNodes();
+    const edges = this.allEdges();
+    return {
+      schemaVersion: 5,
+      nodes,
+      edges,
+      evidence: [],
+    };
+  }
+
   /** Every edge registered so far, in insertion order. Same read-only contract as `allNodes`. */
   allEdges(): GraphEdge[] {
     return [...this.edges.values()];
