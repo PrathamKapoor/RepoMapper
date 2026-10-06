@@ -40,19 +40,19 @@ npm run verify     # lint -> typecheck -> build -> test
 | Lint | `npm run lint` | **0 problems.** Type-aware ESLint 9 with `typescript-eslint` 8 |
 | Typecheck | `npm run typecheck` | **0 errors.** `tsc --noEmit` over source *and* tests in all 6 packages |
 | Build | `npm run build` | **Success.** 5 backend packages via `tsc`; web bundled by Vite |
-"| Tests | `npm run test` | **654 passed, 22 files, 0 failed** |
+"| Tests | `npm run test` | **699 passed, 24 files, 0 failed** |
 
 ### Test breakdown
 
 | File | Tests | Covers |
 |---|---|---|
 | `packages/core/test/core.test.ts` | 42 | Confidence algebra, id stability, limits, redaction, evidence store, graph builder, diagnostics |
-| `packages/core/test/graph-builder.test.ts` | 59 | Module naming, import and callee resolution, every graph relationship kind, deployment attribution, base-image classification, test-to-endpoint attribution, query-expression and unclassified-statement identity, digests, determinism, limits |
+| `packages/core/test/graph-builder.test.ts` | 69 | Module naming, import and callee resolution, every graph relationship kind, deployment topology including a dependency declared above the service it names, networks, secret references and the name-only rule, deployment attribution, base-image classification, test-to-endpoint attribution, query-expression and unclassified-statement identity, digests, determinism, limits |
 | `packages/core/test/requirements.test.ts` | 28 | Requirement and use-case models: declared versus derived, status, evidence, step limits, determinism |
 | `packages/core/test/traceability.test.ts` | 15 | The requirement to use case to implementation to test chain, broken joints, cycle safety, determinism |
 | `packages/core/test/drift.test.ts` | 36 | Snapshot identity and serialisation, node/edge/evidence/confidence drift, truncation, rename rules, schema and extractor version incomparability, determinism |
 | `packages/ingest/test/ingest.test.ts` | 32 | Path containment, symlink escapes, allow-list, archive entries, language detection, binary sniffing, ignore stack, discovery limits |
-| `packages/parsers/test/parsers.test.ts` | 64 | TS entities, imports, calls, routes, inline route handlers, tests, control flow, syntax errors; Python entities, imports, continuations, docstrings, route decorators naming their handler; config, manifests, Markdown requirements, SQL including `ALTER TABLE` foreign keys, compose scoping and both `build:` forms, Dockerfile |
+| `packages/parsers/test/parsers.test.ts` | 73 | TS entities, imports, calls, routes, inline route handlers, tests, control flow, syntax errors; Python entities, imports, continuations, docstrings, route decorators naming their handler; config, manifests, Markdown requirements, SQL including `ALTER TABLE` foreign keys, compose scoping and both `build:` forms, compose in both dependency spellings, network membership, host-bound and ranged ports, Dockerfile instructions, workflow jobs and steps, and the assertion that no compose value reaches a marker |
 | `packages/parsers/test/sql.test.ts` | 52 | The statement analyser: single and multi-table reads, joins in every modifier form, comma lists with `AS` aliases, schema qualification, subqueries, `EXISTS`, derived tables, CTEs, read/write classification, unparseable and unsupported input, determinism |
 | `packages/parsers/test/returns.test.ts` | 38 | Return, throw, binding and HTTP-response records for TypeScript and Python: shapes, awaited calls, status chaining, status-only responses, constructors, `new Response`, unresolved returns |
 | `packages/artifacts/test/artifacts.test.ts` | 27 | Dependency, module, class and ER projections, mermaid rendering, cycle detection, omission log, gap analysis invariants |
@@ -64,6 +64,8 @@ npm run verify     # lint -> typecheck -> build -> test
 | `packages/server/test/api.test.ts` | 25 | Every Phase 1 endpoint, status codes, validation, graph integrity, persistence round trip, stored-analysis limit |
 | `packages/server/test/phase3-api.test.ts` | 22 | Requirements, use cases, consistency, traceability and lineage over HTTP: origins, statuses, validation, and the difference between a missing subject and a broken chain |
 | `packages/server/test/phase4-pipeline.test.ts` | 17 | Phase 4 end to end through the real pipeline: multi-table access reaching the graph, returns and responses reaching the sequence, lineage read/write separation, consistency over the new facts |
+| `packages/artifacts/test/phase5-views.test.ts` | 16 | Deployment and Security projections: declared topology drawn with graph support, ports stated as declared rather than bound, configured health checks reported with an unknown result, absence of a verdict on every Security element, and the disclaimer that names those verdict words in order to disclaim them |
+| `packages/server/test/phase5-api.test.ts` | 10 | Both views over HTTP through the real pipeline: the artifact catalogue, declared services and relationships, "nothing has been observed running" in the scope string, credential names returned and a compose value absent from the deployment payload, the security payload, and the graph itself |
 | `packages/server/test/drift-api.test.ts` | 15 | Snapshot identity over HTTP, drift detection through the real store, rename, ordering, validation, failed-analysis refusal, reproducibility |
 | `packages/web/test/presentation.test.ts` | 17 | The decisions behind the C4 and Drift views: which snapshot a change belongs to, report state classification, relationship support, default comparison |
 | `packages/web/test/phase3-presentation.test.ts` | 25 | The decisions behind the Phase 3 views: stated versus derived wording, requirement order, consistency headline and ordering, chain completeness, lineage hop and usage wording |
@@ -124,10 +126,106 @@ repository, Flask, and purpose-built fixtures — not by reading it. Each has a 
 | D-066 | Flask: **128** endpoints, **0** connected to a handler, sequence reported no interaction at all | analysing Flask as a second real repository |
 | D-067 | React reported a duplicate key `deployment_component:repoatlas` — every `container-without-code` finding named the same entity twice | the CDP browser check, over a container build |
 
+### Phase 5 defects found by probing the new code against real repositories
+
+Seven found, all by running the Phase 5 extraction and projection code against this repository,
+Flask, and purpose-built fixtures — not by reading it. Each has a regression test. The first two
+were found before the code existed in the graph, and both are the kind of defect that reads as a
+working feature.
+
+| Defect | Symptom as observed | Found by |
+|---|---|---|
+| D-075 | `"127.0.0.1:4300:4300"` reported container port **`127`** — a syntactically valid port number and a completely wrong fact | probing `parseCompose` with a host-bound port |
+| D-076 | A dependency or network written as a list entry (`- db`) was read as **none at all**, which reads as "declares nothing" rather than "declares this" | the same probe, after D-075 |
+| D-077 | `docker-compose.prod.yml` matched **no compose filename**, so the whole file was analysed as generic YAML | the same probe |
+| D-078 | Every environment variable became a `secret` node: this repository's own compose file produced **nine**, including `NODE_ENV`, `HOST` and `PORT` | running the new graph builder over this repository |
+| D-079 | **17 workflow steps read as 2.** Every step inherited its job's line, configuration nodes are keyed by path and line, so each step was the same node as the job | reading the phase-5 probe output for `.github/workflows/ci.yml` |
+| D-080 | A compose `depends_on` naming a service declared later in the same file produced **no edge at all**. Compose files are written in dependency order, not declaration order, so this is the normal shape | counting relationships in a two-service fixture against the dependencies it declared |
+| D-081 | **No deployment declaration ever attached to the service that made it.** Component ids were built by two different normalisations, so every service reported no health check and no configuration — reading as "declares nothing" | reading a single-service probe's `serviceDetail` output |
+
+**D-080 is the one worth naming.** `addEdge` correctly refused an edge whose endpoint did not yet
+exist, and refusing it is right. The defect was that the endpoint's existence depended on the order
+a human happened to write a YAML file. Every layer above reported success: no error, no warning, no
+empty view — the dependency was simply absent from a diagram whose whole job is to show
+dependencies.
+
+The pattern is the same one Phase 4 found (D-063 to D-066) and is worth stating again: **all seven
+presented as working.** In each case the code ran, the tests passed, and the output was plausible.
+They were found by asking the output a question the code was not designed to answer — *which facts
+in the file reached the graph?* — and counting.
+
 The pattern worth naming: **D-063, D-064, D-065 and D-066 all presented as a working feature.** In
 each case the code ran, the tests passed, and the artifact looked plausible. They were found by
 asking a question of the output that the code was not designed to answer — *which facts in the graph
 reached the picture?* — and comparing the count to the count in the graph.
+
+### 3a-bis. Phase 5 self-analysis — VERIFIED
+
+The same command re-run in **Phase 5** against the Phase 5 tree, with deployment and workflow
+extraction enabled:
+
+```
+Repository       RepoMapper  (C:\Projects\RepoMapper)
+Commit           ad228b1c6ffffe9578a2f5c18d849380f7fabdd5  branch=main
+Files            127 discovered, 121 analyzable, 8 skipped
+Graph            6060 nodes, 9238 edges, 12872 evidence records
+Explicit share   nodes 99.2%, edges 71.6%
+Duration         6926 ms
+
+Node kinds  condition=2015, constant=1933, test=855, function=612, configuration=224,
+            interface=127, module=121, requirement=46, type=39, package=25,
+            api_endpoint=22, table=21, class=14, deployment_component=2, repository=1,
+            commit=1, contributor=1
+Edge kinds  contains=4007, calls=2322, branches=1722, loops=293, configures=224,
+            imports=140, deploys=122, depends_on=111, returns=79, declared_in=68,
+            throws=50, re_exports=42, exposes=22, reads=18, writes=11, extends=3,
+            implements=3, authored_by=1
+```
+
+The two new projections, from the same run:
+
+```
+deployment         2 nodes / 0 edges
+    ! health checks are shown as configured. No check was executed and no result is known. (1)
+security           2 nodes / 0 edges
+    ! no credential-like variable name was referenced in the analysed files. This means no
+      such reference was found, not that the repository needs no secrets. (1)
+    ! this view reads declarations only. No vulnerability scan, no image inspection, no
+      policy evaluation and no runtime observation was performed. (1)
+```
+
+Deployment elements, verbatim:
+
+```
+repoatlas            declares image repoatlas:0.1.0 · declares container ports 4300
+                     (declared, not observed bound) · restart policy declared:
+                     unless-stopped · expects 1 environment variable(s) by name
+node:24-bookworm-slim  declares image node:24-bookworm-slim
+```
+
+Security elements, verbatim:
+
+```
+base_image   node:24-bookworm-slim        tag pinned
+ci_workflow  .github/workflows/ci.yml     2 job(s), 17 step(s), 0 naming deployment
+```
+
+Phase 5's own facts are visible in these numbers, and so is what this repository does **not**
+contain:
+
+| Observation | Why it is evidence of extraction rather than configuration |
+|---|---|
+| **17 workflow steps from one workflow file** | Where Phase 5's first implementation read 2 (D-079). The steps are read from `.github/workflows/ci.yml`, each on its own line, and the count matches the file. |
+| **`node:24-bookworm-slim` as a base image with `tag pinned`** | Read from the `FROM` line of `Dockerfile`, and reported as a base image rather than as a component that runs — it is what an image is built *from*. |
+| **0 `secret` nodes, 0 `network` nodes** | Correct for this repository. Its compose file declares ten environment variables and **none** is credential-like; it declares no `networks:` and no `depends_on:`. Reporting nine secrets would have been wrong (D-078), and drawing an implied `default` network would be asserting something no file states. |
+| **0 deployment relationships, stated rather than padded** | This repository declares one service and no dependency, so the view draws none. The omission log carries the reason. |
+| **Configuration 224, up from 197** | The 27 new nodes are compose, Dockerfile and workflow declarations — 61 markers became graph facts, of which some merge into one node per `path#line`. |
+
+**What the deployment view does not recover here, and says so.** This repository's compose file
+declares a single service, one volume and a health check, with no networks, no `depends_on` and no
+credential-like variable. The view reports exactly that. It does not infer a default compose
+network, does not infer that the container is reachable, and does not report the health check as
+passing.
 
 ---
 
@@ -586,6 +684,34 @@ and never reacted to `hashchange`. Fixed, with the `hashchange` listener now in
 `packages/web/src/app.tsx` — and deep links are worth having on their own, since an
 architecture or drift view is what a person wants to send to a colleague.
 
+### 4d-quater. Phase 5 in the container — VERIFIED
+
+Container rebuilt from the Phase 5 tree (image `repoatlas:phase5`) and run on Node **v24.21.0**
+against two repositories mounted read-only: this one, and `pallets/flask` cloned at depth 1. The
+allow-list was enforced throughout, so the container could not analyse anything outside `/repos`.
+
+| Check | Result |
+|---|---|
+| `docker build` | **Success** |
+| Container startup | `repoatlas listening`, `env: production`, `allowList: ["/repos"]`, no errors |
+| `GET /api/health` | 200 — `ok`, `pathAllowListEnforced: true`, `allowedRootCount: 1`, `node: v24.21.0` |
+| `POST /api/analyses` `{/repos/repoatlas-self}` | **201** — **6058 nodes, 9236 edges, 12871 evidence**, explicit share nodes 99.2% / edges 71.6%, 52 info diagnostics, 0 errors, 0 warnings |
+| `GET /api/meta` | 200 — **28 node kinds, 37 edge kinds, 4 confidence levels, 12 artifacts**: `dependency-graph, module-graph, class-diagram, er-diagram, c4-context, c4-container, c4-component, sequence, activity, data-flow, deployment, security` |
+| `GET .../artifacts` | 200 — all 12 listed with their scope strings |
+| `GET .../artifacts/deployment` | 200 — 2 units; `repoatlas` reads `declares image repoatlas:0.1.0 · declares container ports 4300 (declared, not observed bound)`; omission log records that no check was executed |
+| `GET .../artifacts/security` | 200 — `base_image node:24-bookworm-slim (tag pinned)` and `ci_workflow .github/workflows/ci.yml — 2 job(s), 17 step(s)` |
+| `POST /api/analyses` `{/repos/flask}` | **201** — **2480 nodes, 8077 edges, 6878 evidence**, 127 `api_endpoint` nodes |
+| `GET .../artifacts/deployment` (Flask) | 200 — `insufficientEvidence: true`, 0 nodes. Flask declares no compose file and no Dockerfile, and the view says so rather than drawing nothing silently |
+| `GET .../artifacts/security` (Flask) | 200 — 5 CI workflows read, `publish.yaml` with **2 steps naming deployment work**; `insufficientEvidence: true` |
+| Secret-value scan across both payloads | **No value found.** The full graph, artifacts, consistency and gap payloads were serialised and searched for `sk_live_`, `ghp_`, `AKIA`, `BEGIN … PRIVATE KEY` and `xox*` — none present (D-070) |
+| `POST` outside the allow-list | **403** `PATH_NOT_ALLOWED` — enforcement re-confirmed on the Phase 5 image |
+
+**Flask is the useful half of this run.** It is a Python web framework with no compose file and no
+Dockerfile, so the deployment view is honestly insufficient — and that is the correct answer rather
+than a failure. Its five workflows *are* read, which exercises the workflow parser on a repository
+this project did not write, and the two deployment-naming steps in `publish.yaml` are a claim about
+the step text rather than about anything that ran.
+
 ### 4d-ter. Phase 4 in the browser — VERIFIED for function, not for appearance
 
 Run against the **container** build with two analyses of the Phase 4 fixture, so the driver, the
@@ -625,6 +751,45 @@ and failures are drawn and that omissions are stated; it does not click an indiv
 assert the panel's contents. That panel is covered by the projection tests and by rendering
 inspection, not by the CDP driver.
 
+### 4d-quinary. Phase 5 in the browser — VERIFIED
+
+Driven against the **container** build with this repository analysed, so the driver, the server and
+the image are the ones being shipped. **57/57 passed.**
+
+| Check | Result |
+|---|---|
+| All twelve tabs render | pass — `Overview Architecture C4 Structure Behaviour Deployment Security Traceability Drift Evidence Gaps Diagnostics` |
+| The deployment view renders | pass — 2 units |
+| **The deployment view states that nothing was observed running** | pass — the scope string reaches the screen |
+| **A configured health check is not presented as a passing one** | pass — the page contains neither `health check passed` nor `healthy` |
+| **A declared port is presented as declared, not bound** | pass |
+| The deployment view reports what it could not represent | pass |
+| **A repository declaring no dependency draws no deployment relationship, and says so** | pass — 0 relationships declared, omission log present |
+| The security view renders | pass |
+| **No security element carries a verdict** | pass |
+| **The security view says no scan was performed** | pass |
+| **The security payload carries no credential value** | pass |
+| **Clicking an arrow opens the evidence panel** | pass |
+| **The evidence panel states how the relationship was established** | pass |
+| **The evidence panel lists evidence with an empty state** | pass |
+| **The evidence panel cites a source location** | pass |
+| **The architecture view opens the same evidence panel for its arrows** | pass |
+| Everything the Phase 4 run covered | pass — C4 levels, behaviour views, lineage, traceability, consistency, drift, the five other tabs |
+| No uncaught exceptions and no console errors | pass |
+
+**The per-arrow evidence panel is now browser-verified.** Phase 4 recorded it as *not* asserted by
+the driver, covered only by projection tests. It is now clicked in a real browser on two separate
+views, which is the property that matters: the same panel opens for a behaviour arrow and for a
+dependency-graph arrow (D-074).
+
+**A verification defect was found and fixed while doing this.** The Phase 4 check for a drawn return
+message asserted against `document.body.textContent`, which does not reach SVG label nodes. With
+this repository's much larger sequence artifact the check began failing — with 51 return messages
+in the artifact and 1265 rendered edges, and a `returns` label visibly on the canvas. The check was
+wrong, not the view: it now asserts on the labels React Flow actually drew. Recorded because a
+verification script that fails on correct behaviour is worse than one that is absent, since it
+teaches the reader to ignore failures.
+
 **Still not verified, and deliberately not claimed:** visual layout, styling and responsive
 behaviour at any viewport; React Flow zoom, pan and drag; and any browser other than the
 Chromium builds installed here. The driver asserts on DOM content and node counts, not on
@@ -638,12 +803,15 @@ Stated plainly. None of these are claimed as working.
 
 | Item | Status | Why |
 |---|---|---|
-| **Browser rendering of the UI** | **Partially verified** | Driven in real headless Chromium via the DevTools Protocol (`scripts/verify-browser.mjs`): **45/45** checks pass against the container build with two analyses and a real change between them, **43/43** with unchanged content. Rendering *and* the click paths are covered, including that return and failure messages present in the artifact reach the sequence view. **Still unverified:** visual layout and styling at any viewport, React Flow zoom and drag, any non-Chromium browser, and the per-arrow evidence panel's contents. See §4d-ter. |
-| **Return messages in a browser** | **Partially verified** | The sequence view is asserted to draw every return and failure message the artifact carries, and to state what it could not read. The evidence panel opened by clicking a single arrow is **not** asserted by the driver. Covered by projection tests only. |
+| **Browser rendering of the UI** | **Partially verified** | Driven in real headless Chromium via the DevTools Protocol (`scripts/verify-browser.mjs`): **57/57** checks pass in Phase 5 against the container build, including the two new views and the per-arrow evidence panel on two separate views. **Still unverified:** visual layout and styling at any viewport, React Flow zoom and drag, and any non-Chromium browser. See §4d-quinary. |
+| **Return messages in a browser** | **Verified** | The sequence view is asserted to draw every return and failure message the artifact carries, and to state what it could not read. The check now reads the labels React Flow drew rather than the document text — the earlier probe failed on a working view because `textContent` does not reach SVG labels (§4d-quinary). |
+| **Deployment diagram** | **Partially verified** | Implemented in Phase 5 (D-068) and verified in the container and in a real browser: services, base images, declared dependencies, network membership and per-service configuration are drawn, each relationship traced to a graph edge, and every qualifier kept honest — a port is `declared, not observed bound`, a health check is `configured, result unknown`. **Verified on** this repository (1 service, no networks, no dependencies) and on **Flask** (no compose file, honestly insufficient). **Not exercised on a real multi-service stack:** no repository analysed declares two or more services with `depends_on` and `networks:`, so the topology path rests on the fixture and unit tests. **Not claimed:** any runtime observation — reachability, health, successful deployment. |
+| **Security view** | **Partially verified** | Reports credential-like variable names, declared base images and CI workflow steps, with a test asserting that no element may carry a verdict (D-071). Verified over HTTP, in the container and in a real browser. **Not claimed and not implemented:** vulnerability scanning, image inspection, secret scanning with detection, or any assessment of whether anything is secure. |
 | **C4 rendering in a browser** | **Verified** | All three levels draw (1, 2 and 43 canvas nodes on the fixture; 2, 3 and 97 on this repository), each shows its omission table, and selecting an element opens its derivation, its evidence locations and the graph support of each relationship. |
 | **Drift rendering in a browser** | **Verified** | Identity table, change summary and individual changes with evidence on both sides render; a change row drills through to the entity inspector; the single-analysis empty state explains itself and is not presented as "nothing changed". |
 | **Git-backed facts** (commits, contributors, ownership) | **Verified** | Confirmed against real history: `branch=main`, HEAD resolved, and `commit`, `contributor` and `authored_by` entities produced. `modifies` edges from multi-commit history are covered by unit tests. **Exception:** inside the container, a bind-mounted repository owned by another user is refused by `git` as dubious ownership, so no history is read there (D-040). |
-| **Deployment diagram** | **Not implemented** | A repository states containers and images, not the topology between them at runtime. The C4 container and component levels are the closest honest substitute and are verified. |
+| **Runtime and live-system observation** | **Not implemented, deliberately** | Nothing in this product has been observed running. Every deployment fact is a `declared` statement read from a file (D-068), and each view says so in its scope string rather than letting a diagram imply otherwise. |
+| **Multi-service deployment topology on a real repository** | **Not verified** | No repository analysed in Phase 5 declares two or more services with `depends_on` and `networks:`. The topology path — dependency edges, network membership, the predeclaration fix in D-080 — is covered by unit tests and by a two-service fixture through the full HTTP pipeline, but not by a third-party codebase. |
 | **Business requirements and traceability** | **Partially verified** | Requirements stated in documents, use cases over evidenced entry points, and the requirement-to-use-case-to-implementation-to-test chain are implemented and verified (§4c-bis, §4d). **Not recovered:** requirements held in an issue tracker, and any requirement implied rather than stated. Both are reported as not recovered. |
 | **In-graph consistency checking** | **Partially verified** | The consistency engine compares every view built from one graph and reports unsupported inference, missing evidence, partial evidence and recorded agreement, with a class reserved for genuine contradiction (D-043). Verified by tests, over HTTP, in the browser and in the container. **Not implemented:** semantics-level contradiction detection, where two documents describe the same entity differently. |
 | **Symbol-level rename detection** | **Not implemented** | A class moved between files is reported as removed plus added. Only whole-file renames with unchanged content are proved (D-029). |
@@ -693,35 +861,42 @@ added before any claim about where time is spent.
 ## 7. Honest summary
 
 **Working and verified:** the pipeline from a repository path to a fully-cited knowledge
-graph; evidence and confidence on every fact; **ten artifact projections** — dependency,
-module, class and ER diagrams, three C4 levels, sequence, activity and data flow — each with
-honest omission reporting; **multi-table data access** with joins, subqueries, CTEs and correct
-read/write separation, and SQL this analyser cannot read reported as such rather than guessed;
-**return, failure and HTTP-response messages** in the sequence, each citing the statement that
-established it; requirements and use cases read from the repository, with a
-requirement-to-use-case-to-implementation-to-test chain; a cross-artifact consistency engine
-that reports absence as absence; gap analysis with auditable `NOT_FOUND` claims;
-immutable, content-addressed snapshots; deterministic drift detection over nodes, edges,
-citations and confidence, with rename proved rather than guessed and removals withheld when
-the target analysis was incomplete; SQLite persistence; the HTTP API with correct status
+graph; evidence and confidence on every fact; **twelve artifact projections** — dependency,
+module, class and ER diagrams, three C4 levels, sequence, activity, data flow, **deployment
+and security** — each with honest omission reporting; **multi-table data access** with joins,
+subqueries, CTEs and correct read/write separation, and SQL this analyser cannot read reported
+as such rather than guessed; **return, failure and HTTP-response messages** in the sequence,
+each citing the statement that established it; **compose, Dockerfile and CI workflow
+declarations read as `declared` facts**, with credential names held separately from ordinary
+configuration and no value able to reach the graph; requirements and use cases read from the
+repository, with a requirement-to-use-case-to-implementation-to-test chain; a cross-artifact
+consistency engine that reports absence as absence; gap analysis with auditable `NOT_FOUND`
+claims; immutable, content-addressed snapshots; deterministic drift detection over nodes,
+edges, citations and confidence, with rename proved rather than guessed and removals withheld
+when the target analysis was incomplete; SQLite persistence; the HTTP API with correct status
 codes and containment; the built web bundle and its served shell; a working container image
-verified through Phase 4; **654 passing tests**; clean lint and typecheck.
+verified through Phase 5; **699 passing tests**; clean lint and typecheck.
 
-Verified against two real repositories: **this one** (5568 nodes, 8532 edges; 19 HTTP responses,
-78 returns, 49 throws, 18 reads across 11 writes) and **`pallets/flask`** (2534 nodes, 8131 edges;
-128 endpoints all resolving to handlers, 240 failure sites, 23 returns).
+Verified against two real repositories: **this one** (6060 nodes, 9238 edges; 79 returns, 50
+throws, 18 reads across 11 writes, 17 workflow steps, a pinned base image) and
+**`pallets/flask`** (2480 nodes, 8077 edges; 127 endpoints, 240 failure sites, 5 CI workflows).
 
 **Partial and labelled as such:** language coverage (TS/JS solid, Python structural);
 call resolution (name-based, never labelled explicit); C4 component boundaries (derived from
 a declared build context, which is an inference); rename detection (whole-file, content-
-identical only); inline analysis (holds a connection); persistence (single-writer); the web
-UI (logic tested, rendering verified by CDP assertions rather than by pixels).
+identical only); **deployment topology on a real multi-service stack — no repository
+analysed declares one**, so the topology path rests on fixtures; **the security view, which
+reports what a repository references and makes no assessment**; inline analysis (holds a
+connection); persistence (single-writer); the web UI (logic tested, rendering verified by CDP
+assertions rather than by pixels).
 
-**Not built:** the deployment diagram; business requirements held outside the repository;
-semantics-level contradiction detection; symbol-level and Git-corroborated renames; the
-archive-upload endpoint; CORS; rate limiting; API authentication; **ORM and query-builder
-data access** (unsupported by decision, D-061); **column-level lineage**.
+**Not built:** business requirements held outside the repository; semantics-level contradiction
+detection; symbol-level and Git-corroborated renames; the archive-upload endpoint; CORS; rate
+limiting; API authentication; **ORM and query-builder data access** (unsupported by decision,
+D-061); **column-level lineage**; **vulnerability scanning, image inspection and secret
+scanning with detection** (out of scope by design, D-071); **Kubernetes, Terraform and
+cloud-provider manifests**.
 
-**Unknown:** visual layout, styling, zoom and drag in the browser, and non-Chromium browsers; the
-per-arrow evidence panel's rendered contents; multi-table SQL on a third-party application
-repository; performance at scale; memory profile; coverage percentage.
+**Unknown:** visual layout, styling, zoom and drag in the browser, and non-Chromium browsers;
+multi-table SQL on a third-party application repository; performance at scale; memory profile;
+coverage percentage.

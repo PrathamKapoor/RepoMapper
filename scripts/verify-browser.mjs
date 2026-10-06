@@ -124,7 +124,7 @@ let visit = 0;
  * against a page whose data had not arrived yet, which is how a broken view gets reported as
  * a working one.
  */
-const waitFor = async (expression, label, attempts = 120) => {
+const waitFor = async (expression, label, attempts = 240) => {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 250));
     // A navigation destroys the execution context mid-poll, so a transient evaluation error
@@ -140,7 +140,10 @@ const waitFor = async (expression, label, attempts = 120) => {
   throw new Error(`never became true: ${label ?? expression} at ${where} | saw: ${seen}`);
 };
 
-const goto = async (url, readyExpression = `document.querySelectorAll('.tabs button').length > 0`) => {
+const goto = async (
+  url,
+  readyExpression = `document.querySelectorAll('.tabs button').length > 0 && !document.body.textContent.includes('Loading analysis')`,
+) => {
   // A unique query makes every visit a distinct document load: a fragment-only change does
   // not reload, and each check must start from a fresh application. The query goes *before*
   // the fragment — appending it after would make it part of the route, and `#/c4/container`
@@ -167,8 +170,8 @@ try {
   await goto(`${baseUrl}/`, `document.body.textContent.includes('Entities')`);
   record('application loads and React mounts', await evaluate(`!!document.querySelector('h1')?.textContent?.includes('RepoAtlas')`));
   record(
-    'all ten tabs render',
-    (await evaluate(`document.querySelectorAll('.tabs button').length`)) === 10,
+    'all twelve tabs render',
+    (await evaluate(`document.querySelectorAll('.tabs button').length`)) === 12,
     `${await evaluate(`[...document.querySelectorAll('.tabs button')].map((b) => b.textContent).join(' ')`)}`,
   );
   record('stored analyses are listed', await evaluate(`document.querySelectorAll('.list button').length > 0`));
@@ -262,8 +265,13 @@ await goto(`${baseUrl}/#/behaviour`, `document.body.textContent.includes('Sequen
         truncated: /Showing \\d+ of \\d+ entities/.test(body),
         returns: count('returns'),
         throws: count('throws'),
-        shownReturns: /\\breturns\\b/.test(body),
-        shownThrows: /\\bthrows\\b/.test(body),
+        // Asserted on the labels React Flow actually drew, not on the page text. The document's
+        // textContent does not reach SVG label nodes, so the earlier probe reported a return
+        // message as undrawn while its label was on the canvas — a check failing on a working
+        // view.
+        drawnLabels: [...document.querySelectorAll('.react-flow__edge-textwrapper')].map((node) => node.textContent ?? ''),  // eslint-disable-line
+        renderedEdges: document.querySelectorAll('.react-flow__edge').length,
+        mentionsReturns: /return/.test(body),
         omissions: (artifact.omissions ?? []).length,
         statesOmissions: /not read|no recorded return/.test(body),
       };
@@ -274,18 +282,21 @@ await goto(`${baseUrl}/#/behaviour`, `document.body.textContent.includes('Sequen
     returnFacts.ok && returnFacts.drawn > 0,
     returnFacts.ok ? `${returnFacts.drawn} participants, ${returnFacts.drawnEdges} messages` : String(returnFacts.reason),
   );
+  const drawnReturnLabels = (returnFacts.drawnLabels ?? []).filter((label) => /\breturns\b|\bresponds\b/.test(label));
+  const drawnThrowLabels = (returnFacts.drawnLabels ?? []).filter((label) => /\bthrows\b/.test(label));
+
   record(
     'a return message in the graph is drawn in the sequence view',
-    returnFacts.ok && (returnFacts.returns === 0 || returnFacts.truncated || returnFacts.shownReturns),
+    returnFacts.ok && (returnFacts.returns === 0 || returnFacts.truncated || drawnReturnLabels.length > 0),
     returnFacts.ok
-      ? `${returnFacts.returns} return message(s) in the artefact${returnFacts.truncated ? ', view truncated' : ''}`
+      ? `${returnFacts.returns} return message(s) in the artefact${returnFacts.truncated ? ', view truncated' : ''}; ${drawnReturnLabels.length} drawn on the canvas of ${returnFacts.renderedEdges} edge(s)`
       : String(returnFacts.reason),
   );
   record(
     'a failure message in the graph is drawn in the sequence view',
-    returnFacts.ok && (returnFacts.throws === 0 || returnFacts.truncated || returnFacts.shownThrows),
+    returnFacts.ok && (returnFacts.throws === 0 || returnFacts.truncated || drawnThrowLabels.length > 0),
     returnFacts.ok
-      ? `${returnFacts.throws} failure message(s) in the artefact${returnFacts.truncated ? ', view truncated' : ''}`
+      ? `${returnFacts.throws} failure message(s) in the artefact${returnFacts.truncated ? ', view truncated' : ''}; ${drawnThrowLabels.length} drawn on the canvas`
       : String(returnFacts.reason),
   );
   record(
@@ -430,6 +441,148 @@ if (rowClicked) {
       }
     }
   }
+
+  // ---------------------------------------------------------------- Phase 5 views
+  // These two views exist to state what a repository *declares*. The checks below are about the
+  // wording reaching the screen, because wording is the entire claim: a view that rendered
+  // "port 4300" instead of "declared, not observed bound" would look identical and be wrong.
+  await goto(`${baseUrl}/#/deployment`, `document.body.textContent.includes('Nothing here has been observed running')`);
+  const deploymentFacts = await evaluate(`
+    (async () => {
+      const id = ${JSON.stringify(analysisId ?? '')};
+      const response = await fetch('/api/analyses/' + id + '/artifacts/deployment');
+      if (!response.ok) return { ok: false, reason: 'artifact request failed: ' + response.status };
+      const artifact = await response.json();
+      const body = document.body.textContent;
+      const components = (artifact.nodes ?? []).filter((n) => n.kind === 'deployment_component').length;
+      const details = (artifact.nodes ?? []).map((n) => n.detail ?? '');
+      return {
+        ok: true,
+        components,
+        edges: (artifact.edges ?? []).length,
+        drawn: document.querySelectorAll('.react-flow__node').length,
+        statesDeclarations: body.includes('Nothing here has been observed running'),
+        // A configured check must not read as a passing one.
+        healthcheckHonest: !body.includes('health check passed') && !body.includes('healthy'),
+        // Read from the artefact, not the page: the canvas draws a node's label, and the
+        // qualifier that makes a port honest lives in the detail the graph carries.
+        portHonest: details.some((d) => d.includes('declared, not observed bound')) || !details.some((d) => d.includes('container ports')),
+        omittedShown: body.includes('Not represented in this view'),
+      };
+    })()
+  `);
+  record('the deployment view renders', deploymentFacts.ok && deploymentFacts.drawn > 0, deploymentFacts.ok ? `${deploymentFacts.drawn} units` : String(deploymentFacts.reason));
+  record('the deployment view states that nothing was observed running', deploymentFacts.ok && deploymentFacts.statesDeclarations);
+  record('a configured health check is not presented as a passing one', deploymentFacts.ok && deploymentFacts.healthcheckHonest);
+  record('a declared port is presented as declared, not bound', deploymentFacts.ok && deploymentFacts.portHonest);
+  record('the deployment view reports what it could not represent', deploymentFacts.ok && deploymentFacts.omittedShown);
+  record(
+    'a repository declaring no dependency draws no deployment relationship, and says so',
+    deploymentFacts.ok &&
+      (deploymentFacts.edges > 0 || deploymentFacts.omittedShown),
+    deploymentFacts.ok ? `${deploymentFacts.edges} relationship/relationships declared` : String(deploymentFacts.reason),
+  );
+
+  await goto(`${baseUrl}/#/security`, `document.body.textContent.includes('does not assess whether anything is secure or insecure')`);
+  const securityFacts = await evaluate(`
+    (async () => {
+      const id = ${JSON.stringify(analysisId ?? '')};
+      const response = await fetch('/api/analyses/' + id + '/artifacts/security');
+      if (!response.ok) return { ok: false, reason: 'artifact request failed: ' + response.status };
+      const artifact = await response.json();
+      const nodes = (artifact.nodes ?? []).map((n) => \`\${n.label} \${n.detail ?? ''} \${n.derivation ?? ''}\`.toLowerCase());
+      return {
+        ok: true,
+        // No element may carry a verdict. The scope line does, in order to disclaim it, so this
+        // checks the elements a reader acts on.
+        verdictFree: nodes.every((text) => !/vulnerable|insecure|exploit|cve-|high risk/.test(text)),
+        disclaimsScan: (artifact.omitted ?? []).some((entry) => entry.reason.includes('No vulnerability scan')),
+        // The page must not be carrying a value. Any long opaque string in the graph payload
+        // would be one, so this reads the artefact the API actually served.
+        noValueLeak: !/sk_live_|ghp_|AKIA|BEGIN [A-Z ]*PRIVATE KEY/.test(JSON.stringify(artifact)),
+      };
+    })()
+  `);
+  record('the security view renders', securityFacts.ok, securityFacts.ok ? 'scope reached' : String(securityFacts.reason));
+  record('no security element carries a verdict', securityFacts.ok && securityFacts.verdictFree);
+  record('the security view says no scan was performed', securityFacts.ok && securityFacts.disclaimsScan);
+  record('the security payload carries no credential value', securityFacts.ok && securityFacts.noValueLeak);
+
+  // ---------------------------------------------------------------- per-arrow evidence
+  // Every view must open the same evidence panel for an arrow. Checked on the deployment view
+  // because a deployment arrow is a claim about a running system that is easiest to overstate,
+  // and because it is the one view whose relationships were previously invisible to this driver.
+  // ---------------------------------------------------------------- per-arrow evidence
+  // Every view must open the same evidence panel for an arrow. Checked on the behaviour view,
+  // which is the only one guaranteed to have edges here: a repository with one compose service
+  // and no networks declares no deployment relationship, and a check that demanded one would
+  // report a missing fact as a missing feature.
+  await goto(`${baseUrl}/#/behaviour`, `document.body.textContent.includes('Sequence')`);
+  await evaluate(`
+    (() => {
+      const button = [...document.querySelectorAll('button')].find((b) => b.textContent === 'Sequence');
+      if (button) button.click();
+      return !!button;
+    })()
+  `);
+  await waitFor(`document.querySelectorAll('.react-flow__edge').length > 0`, 'behaviour sequence edges');
+
+  const arrowClicked = await evaluate(`
+    (() => {
+      // React Flow binds its edge handler on the group, and the path inside it stops pointer
+      // events, so the click has to be dispatched on the group.
+      const edge = document.querySelector('.react-flow__edge');
+      if (!edge) return false;
+      edge.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      return true;
+    })()
+  `);
+  if (arrowClicked) {
+    await waitFor(`document.querySelector('[data-testid="interaction-panel"]') !== null`, 'evidence panel');
+  }
+  const arrowPanel = await evaluate(`
+    (() => {
+      const panel = document.querySelector('[data-testid="interaction-panel"]');
+      if (!panel) return { present: false };
+      const text = panel.textContent ?? '';
+      return {
+        present: true,
+        showsDerivation: /does not state|Recorded from|states/i.test(text),
+        showsEvidenceHeading: text.includes('Evidence ('),
+        citesTheFile: /\\.(ts|tsx|yml|yaml|sql|py)/.test(text),
+      };
+    })()
+  `);
+  record('clicking an arrow opens the evidence panel', arrowPanel.present, arrowClicked ? 'panel opened' : 'no clickable arrow');
+  record('the evidence panel states how the relationship was established', arrowPanel.present && arrowPanel.showsDerivation);
+  record('the evidence panel lists evidence with an empty state', arrowPanel.present && arrowPanel.showsEvidenceHeading);
+  record('the evidence panel cites a source location', arrowPanel.present && arrowPanel.citesTheFile);
+
+  // The panel is shared, so the architecture view must open the same one. A reader who can
+  // inspect an arrow in one view and not another would conclude the other is unsupported.
+  await goto(`${baseUrl}/#/architecture`, `document.body.textContent.includes('dependency-graph')`);
+  const architectureHasEdges = await evaluate(`
+    (() => {
+      const button = [...document.querySelectorAll('button')].find((b) => b.textContent === 'dependency-graph');
+      if (button) button.click();
+      return true;
+    })()
+  `);
+  if (architectureHasEdges) {
+    await waitFor(`document.querySelectorAll('.react-flow__edge').length > 0`, 'dependency graph edges');
+    await evaluate(`
+      (() => {
+        const edge = document.querySelector('.react-flow__edge');
+        if (edge) edge.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        return !!edge;
+      })()
+    `);
+    await waitFor(`document.querySelector('[data-testid="interaction-panel"]') !== null`, 'architecture evidence panel');
+  }
+  record(
+    'the architecture view opens the same evidence panel for its arrows',
+    await evaluate(`document.querySelector('[data-testid="interaction-panel"]') !== null`),
+  );
 
   // ---------------------------------------------------------------- other tabs
   for (const [tab, marker] of [

@@ -357,11 +357,22 @@ buildGraph(input)                                     packages/core/src/graph-bu
  │    └─ resolveCallee() → calls edge, STRONGLY_INFERRED (caller known)
  │                                     WEEKLY_INFERRED (module-level)
  │
-  ├─ PASS 8: markers → endpoints, tables, columns, tests, deployment components, config
-  │    └─ addDeploymentComponent()                 EXPLICIT deploys edge
-  │         └─ attributeBuildContext()              modules inside a compose `build:` context
-  │                                              → deploys edge, STRONGLY_INFERRED
-  │
+├─ PASS 8a: predeclare deployment components (Phase 5)
+   │    └─ predeclareDeploymentComponents()          every compose.service / docker.base_image node,
+   │                                              EXPLICIT, before any relationship is read
+   │
+   ├─ PASS 8b: markers → endpoints, tables, columns, tests, deployment components, config
+   │    ├─ addDeploymentComponent()                 EXPLICIT deploys edge
+   │    │    └─ attributeBuildContext()              modules inside a compose `build:` context
+   │    │                                           → deploys edge, STRONGLY_INFERRED
+   │    └─ addDeploymentFact()                      Phase 5 declarations that are not units
+   │         ├─ compose.depends_on       → depends_on, service → service, EXPLICIT, declared
+   │         ├─ compose.network          → joins_network, service → network, EXPLICIT
+   │         ├─ compose.network_declared → network node
+   │         ├─ compose.environment      → secret node IF the name looks credential-like
+   │         │                            → references_secret; otherwise configuration
+   │         └─ everything else         → configuration (port, user, healthcheck, step, …)
+   │
   ├─ PASS 9: git facts → commit, contributor, authored_by, modifies
   │
   └─ PASS 10: return facts (Phase 4)                addReturnFacts()
@@ -391,6 +402,17 @@ counts.
 **Pass 3 is why inheritance works at all.** Indexing during entity creation made
 resolution depend on file order, so a class extending a later-declared base silently lost
 its edge (D-010).
+
+**Pass 8a exists for the same reason, and it is the more surprising of the two.** Compose files are
+written in *dependency* order: `web` listing `depends_on: [db]` above the block that declares `db`
+is the normal shape. Reading markers in file order reached `depends_on` while the `db` component did
+not yet exist, and `addEdge` correctly refused an edge with a missing endpoint — so the dependency
+vanished with no error in the file, the graph, the projection or the test output. Every service
+declared after its own dependant was unreachable as a dependency target (D-080).
+
+The predeclared node is `EXPLICIT`, not a placeholder, because a merge takes the **weaker** of the
+two confidences (D-007). A component seeded `UNKNOWN` would stay `UNKNOWN` for ever and every
+projection would report a declared service as unknown.
 
 **`attributeBuildContext()` is the only rule that connects source code to a runtime unit.**
 A compose service declaring `build: ./api` states that the image is built from `api/`, so
@@ -437,6 +459,9 @@ projectAtlas(graph)                                   packages/artifacts/src/ind
   → buildSequence()           api_endpoint | cli_command | event_consumer, `calls` + `returns` + `throws` (Phase 4)
   → buildActivity()           function | test, `branches` | `loops` edges; ordered by source line
   → buildDataFlow()           `reads` | `writes` | `communicates_with` only
+  → buildDeployment()         Phase 5: deployment_component + network, `depends_on` | `joins_network`
+  │                            declared-relationship only; secret references counted, not drawn
+  → buildSecurity()           Phase 5: secret | base_image | ci_workflow elements, no relationships
   → checkConsistency()        compares every artifact above over one graph
        → projectionIntegrity        unsupported inference, per artifact
        → c4WithoutCode             container with no attributed module
@@ -463,6 +488,62 @@ projectAtlas(graph)                                   packages/artifacts/src/ind
 
 Every artifact reports `omitted[]`, `insufficientEvidence` and a `scope` string, so an
 incomplete view is never mistaken for a complete one (D-020).
+
+### 7d. Deployment and security wording (Phase 5)
+
+Two projections that exist mostly to be **careful with language**, so the rules are written out.
+
+```
+buildDeployment(context)                                packages/artifacts/src/deployment.ts
+  for each deployment_component:
+    detail  = "declares image <image>"
+             + "declares container ports <ports> (declared, not observed bound)"
+             + "health check configured, result unknown"
+             + "restart policy declared: <policy>"
+             + "expects N environment variable(s) by name"
+    derivation = "Declared as a compose service in <file>. This is a declaration;
+                  no container from it has been observed."
+  for each network node:
+    derivation = "Declared as a network in a compose file. What this network permits
+                  between the services on it is not stated by the repository."
+  edges — only declared ones, each carrying its own supportingEdgeIds:
+    depends_on      label "declares a dependency on"
+                    derivation "<file> lists this service under depends_on, stating a
+                                start ordering. It does not state that the dependency is
+                                reachable, started or healthy."
+    joins_network   label "joins network"
+                    derivation "<file> lists this service on this network. It does not
+                                state what the network permits between the services on it."
+  references_secret → counted in omitted[] and attributed to the Security view
+                      (checked BEFORE the endpoint test, so a credential is not filed as a
+                      lost relationship)
+
+buildSecurity(context)                                  packages/artifacts/src/security.ts
+  for each secret node:
+    detail     = "referenced from N place(s) · " + (covered ? "protected by an observed
+                                 check in this analysis" : "no check observed; static
+                                 reading cannot tell whether one exists")
+    derivation = "A repository file names `<name>`. The value was never read, and the
+                  graph holds the name only."
+  for each base image:  "tag pinned" | "tag not pinned to a version"
+    derivation includes "no advisory database is consulted"
+  for each workflow:    "N job(s), M step(s), K naming deployment"
+    derivation includes "No step was executed"
+```
+
+**The vocabulary is the product here.** Every word above is one a file can support. Nothing says
+`running`, `healthy`, `reachable`, `vulnerable`, `insecure`, `safe` or `exploit`, and a test asserts
+that no Security element contains any of them (D-071). The Security view's `scope` string *does*
+name two of those words, in order to disclaim them — which is why the test checks elements rather
+than the whole payload.
+
+**A deployment dependency edge is `EXPLICIT`.** This is not a contradiction of the care above: a
+compose file writing `depends_on: [db]` states the ordering outright. What it does not state is what
+that ordering produced, and that sentence is in the edge's `derivation` where a reader meets it.
+
+**Secret references are counted, not drawn, by the deployment view.** A `secret` node in a topology
+diagram reads as a thing the system depends on at runtime, which is exactly the claim the view must
+not make. The name belongs in the Security view, and the omission entry says so.
 
 ### 7c. Sequence walk and return messages (Phase 4)
 
@@ -560,16 +641,27 @@ describe the *claim that it is gone*, which is only assertable when the target a
 complete (D-028). A truncated target sets `removalConfidence: 'INDETERMINATE'` and attaches a
 `reason` to every removal.
 
-**Phase 4 moved both version constants, deliberately.**
+**Phase 5 moved both version constants, deliberately.**
 
 | Constant | Was | Now | Why |
 |---|---|---|---|
-| `GRAPH_SCHEMA_VERSION` | 3 | **4** | the graph gained `returns` and `throws` edges, `role`/`statement` on data-access edges, and the function attributes behind them. A sequence drawn from a version 3 graph and one drawn from a version 4 graph disagree about what an interaction hands back, so the two must not be diffed against each other |
-| `EXTRACTOR_VERSION` | 1.0.0 | **1.1.0** | unchanged source now produces different facts: the SQL scanner reads every table in a statement, and return, rejection and response records became graph facts |
+| `GRAPH_SCHEMA_VERSION` | 4 | **5** | the graph gained `network` and `secret` nodes and the `joins_network` and `references_secret` edges behind them. A deployment view drawn from a version 4 graph and one drawn from a version 5 graph disagree about what a compose file states, so the two must not be diffed against each other |
+| `EXTRACTOR_VERSION` | 1.1.0 | **1.2.0** | unchanged source now produces different facts: compose dependencies, networks, environment names, volume mounts, health checks, restart policies and container ports, Dockerfile instructions, and workflow jobs, steps and secret references |
 
-Both are part of the digest, so a snapshot taken under either old value no longer compares as though
-nothing changed. `incomparabilityReason()` reports which of the two differs rather than silently
-reinterpreting old data.
+The 1.2.0 bump also covers **corrected** extraction, not only added:
+
+| Defect | What it reported |
+|---|---|
+| D-075 | `"127.0.0.1:4300:4300"` → container port `127` |
+| D-076 | a dependency or network written as `- db` → no dependency at all |
+| D-077 | `docker-compose.prod.yml` → no compose file found |
+
+A snapshot taken before those fixes described different facts about identical content, so it must
+not compare as though nothing changed.
+
+Both constants are part of the digest, so a snapshot taken under any older value no longer compares
+as though nothing changed. `incomparabilityReason()` reports which of the two differs rather than
+silently reinterpreting old data.
 
 ---
 
@@ -788,6 +880,28 @@ Stated so this document is not read as a claim of completeness:
 - C4 recovers only what the graph holds: no human actors, no package-as-container, and no
   components for a container that declares an image but no build context. Each is recorded
   in the level's `omitted[]` rather than drawn.
+
+Phase 5 additions, stated as limits rather than as oversights:
+
+- **Nothing has been observed running.** Every deployment fact is a `declared` statement read from a
+  file. The view draws what is declared and labels it as declared; it does not say whether a
+  dependency is reachable, whether a health check passes, or whether a container is bound to its
+  port (D-068).
+- **The Security view makes no assessment.** No vulnerability scanning, no image inspection, no
+  secret detection, no policy evaluation. It reports what a repository *references* and says which
+  check, if any, this analysis observed (D-071).
+- **Only credential-like names become secrets.** A secret whose name does not match the pattern is
+  not reported as one. The alternative made this repository's ten environment variables into nine
+  noise nodes and would have buried the two that matter (D-069).
+- **Secret values are never read.** A credential in a compose file cannot reach the graph, the API,
+  the UI or a log, because no code path carries it (D-070).
+- **Workflow steps are read as text.** A step whose text matches `deploy` is recorded as *naming*
+  deployment work. No step was executed and no claim is made about its outcome.
+- **Compose and GitHub Actions only.** Kubernetes, Terraform and cloud-provider manifests have no
+  parser. The parsers are per-format by decision (D-006).
+- **No real multi-service deployment has been analysed.** The topology path is covered by unit tests
+  and by a two-service fixture through the whole HTTP pipeline, but neither repository analysed in
+  Phase 5 declares two or more services. Stated here rather than left for a reader to discover.
 
 Phase 4 additions, stated as limits rather than as oversights:
 

@@ -1308,15 +1308,121 @@ requires a naming convention, and a naming convention is not a statement in the 
 code carried a `constructor` branch whose pattern was byte-identical to the `call` pattern above it,
 so it could never fire — a test asserting constructor returns on the Python side would have been a
 test that could not fail.
+### D-068 - Deployment topology is drawn, and every edge in it says "declared"
+
+**Decision.** The Deployment view draws compose services, base images, `depends_on`, network
+membership and the configuration each service expects. Every relationship carries `declared: true`,
+and the view's scope string states that nothing has been observed running.
+
+**Why.** Phase 3 deferred a deployment view on the grounds that a repository states containers and
+images but not the topology between them at runtime. That was half right, and the half that was
+wrong matters: a repository states plenty about topology — which service depends on which, which
+network each joins, which port each publishes — and suppressing all of it because *runtime* topology
+is unknowable threw away real, cited facts along with the unsupportable ones.
+
+So the view draws what is declared and labels it as declared. `depends_on: [db]` is an explicit
+statement about ordering, and the edge is `EXPLICIT`. What it does not state — that the dependency is
+reachable, started or healthy — is written into the edge's `derivation` rather than left to the
+reader's assumption, because an arrow labelled only `depends_on` reads as a runtime fact in a
+diagram that has no other hedges in it.
+
+A health check is reported as `configured, result unknown`. `EXPOSE 4300` is `declared, not observed
+bound`. Nothing in the view says `healthy`, `running` or `reachable`, and a test asserts it.
+
+### D-069 - Only a credential-like name becomes a secret node
+
+**Decision.** An environment variable becomes a `secret` node if its name matches a credential
+pattern. Everything else stays `configuration`. Values are never read.
+
+**Why.** The first implementation created a `secret` node for every declared variable, so this
+repository's own compose file produced nine secret nodes: `NODE_ENV`, `HOST`, `PORT`,
+`REPOATLAS_LOG_LEVEL`. Every one is wrong, and together they bury the two that matter — a reader
+scanning a Security view full of noise stops trusting it, which is the exact failure this product
+exists to prevent.
+
+The test is a **name** test and supports only `this repository references a variable called
+STRIPE_SECRET_KEY`. It says nothing about what the variable holds or how it is managed, and the
+node's attributes record `referenceOnly: true` so no downstream projection can read it as a
+resolved secret.
+
+### D-070 - No secret value can reach the graph, by construction
+
+**Decision.** Compose and workflow parsers emit variable *names*. The evidence excerpt for a
+deployment marker is built from a whitelist of identifying attributes. Three tests assert the
+absence of the value string in the graph, the deployment payload and the security payload.
+
+**Why.** The extractor reads whole files, so the bytes of a credential pass through the parser
+whether or not a marker carries them. The guarantee therefore cannot rest on the parser being
+careful; it has to hold at every point between the file and the response. A fixture compose file
+containing `shhh-do-not-store-this` is analysed and the string is asserted absent from every
+payload a client can fetch. If a future parser starts emitting values, those tests fail rather than
+the guarantee quietly lapsing.
+
+### D-071 - The Security view contains no verdict, and a test holds it there
+
+**Decision.** The Security view reports credential-like names, declared base images and CI workflow
+steps. It has no `severity`, no `status`, no risk score. A test asserts that no element may contain
+`vulnerable`, `insecure`, `exploit`, `CVE-` or `high risk`.
+
+**Why.** Any of those words needs evidence this product does not collect: a vulnerability database,
+an image inspection, a policy engine, a running system. A single element labelled `vulnerable`
+would make the entire view untrustworthy, and it would be untrustworthy *correctly* — there is no
+observation behind the word. So the view states what it read and what it did not do, and the
+disclaimer lives in the omission log where a reader meets it while looking for what is missing.
+
+A reference with no observed check is reported as `no check observed; static reading cannot tell
+whether one exists`. That is a fact about this reader, and it is the only honest form of the claim.
+
+### D-072 - A network is recorded only where the file declares it, and the edge says what it does not
+
+**Decision.** A service's `networks:` entry becomes a `joins_network` edge only when the file also
+declares that network at the top level. The edge's derivation states that the file does not say what
+the network permits between the services on it.
+
+**Why.** An undeclared network name is a reference to something outside this repository. Creating a
+node for it would assert an existence that no analysed file evidences. Where a `compose.network`
+marker arrives without a top-level declaration the node is still created — the membership *is*
+stated — but its attributes record which file declared it, so the projection can distinguish the two
+cases rather than treating them alike.
+
+### D-073 - Components are created before relationships are read
+
+**Decision.** Deployment component nodes are predeclared in a pass before any marker is interpreted,
+so relationship construction does not depend on the order a file happens to be written in.
+
+**Why.** Compose files are written in dependency order, not declaration order: `web` listing
+`depends_on: [db]` above the block that declares `db` is the normal shape. Reading markers in file
+order reached `depends_on` before the `db` component existed, and `addEdge` — correctly — refused an
+edge with a missing endpoint. The dependency vanished with no error anywhere, in the file, in the
+graph, in the projection or in the test output. It was found by counting edges in a real fixture
+against the dependencies the fixture declared.
+
+The predeclared node is `EXPLICIT`, not a `UNKNOWN` placeholder: a merge takes the weaker of the two
+confidences (D-007), so a component seeded `UNKNOWN` would stay `UNKNOWN` for ever and every
+projection would report a declared service as unknown. A test asserts both the edge and the
+confidence.
+
+### D-074 - One evidence panel for every view
+
+**Decision.** The behaviour view's interaction panel is now a re-export of a shared implementation
+used by every view that draws an arrow.
+
+**Why.** An arrow is a claim, and a claim the reader cannot inspect is indistinguishable from a fact.
+Two panels with different fields would mean a relationship could be inspected on the sequence
+diagram and not on the dependency graph — and a reader who discovers that on the second view has
+every reason to conclude the second view is showing something it cannot support. The behaviour panel
+is kept as a re-export so existing imports and tests are unchanged, which is also why this was a
+refactor rather than a second component.
 
 ---
+
 ## Deferred, with reasons
 
 Recorded so these are not mistaken for oversights.
 
 | Item | Why deferred |
 |---|---|
-| C4 architecture, sequence, DFD, use-case, activity, deployment diagrams | **Partly resolved across Phases 2 and 3.** C4 levels 1-3 (D-033, D-034) plus the sequence, activity, data-flow, ER, use-case and traceability views are implemented as evidence-grounded projections. A dedicated deployment view remains deferred: a repository states containers and images, not the topology between them at runtime. |
+| C4 architecture, sequence, DFD, use-case, activity, deployment diagrams | **Resolved across Phases 2, 3 and 5.** C4 levels 1-3 (D-033, D-034), the sequence, activity, data-flow, ER, use-case and traceability views, and the deployment view (D-068) are all evidence-grounded projections. What no view claims is *runtime* topology — whether a dependency is reachable, healthy or running — because a repository cannot state it. Each view says so in its scope string rather than leaving a diagram to imply it. |
 | ORM and query-builder data access | **Unsupported by decision** (D-061). `reads` and `writes` come from table names in SQL the extractor read. Each framework would require guessing which call touches which store, and a declared table that nothing reads is already reported as missing evidence rather than as a finding against the repository. |
 | Column-level data lineage | Not implemented. Every lineage hop is table-level, because that is what a SQL statement names. A column-level edge would have to be inferred from a projection list the extractor does not yet resolve. |
 | Requirements and traceability | **Resolved in Phase 3** for what a repository can state: requirements read from documents, use cases over evidenced entry points, and the requirement -> use case -> implementation -> test chain (D-042, D-044, D-046). Business requirements held in an issue tracker, or implied by convention, remain out of reach and are reported as not recovered. |
@@ -1327,4 +1433,7 @@ Recorded so these are not mistaken for oversights.
 | Archive upload endpoint | Extraction, containment and limits are implemented and tested (`extractTarArchive`). The HTTP route is not built. |
 | Languages beyond TypeScript/JavaScript and Python | D-003/D-004 explain the current coverage and the path to widening it. |
 | Sequence-diagram renderer | D-022 explains why the current renderer cannot express one. The sequence *projection* exists and is verified; only the Mermaid rendering of lifelines and return arrows is outstanding. |
+| Vulnerability scanning, image inspection, secret scanning with detection | **Out of scope by design** (D-071). The Security view reports what a repository *references*. Determining whether an image contains a known weakness, or whether a committed value is a live credential, needs a vulnerability database or a registry this product does not consult. A view that guessed would be worse than no view. |
+| Kubernetes, Terraform and cloud-provider manifests | The parsers are per-format and deliberately so (D-006). Compose and GitHub Actions are read because their semantics are small and stable. Adding a format is a new parser with its own tests, not an extension of the existing one. |
+| Runtime and live-system observation | Not attempted. Every deployment fact is `declared`, and nothing in the analysis was observed running (D-068). |
 | API authentication and rate limiting | Absent so far. `REPOATLAS_ALLOWED_ROOTS` is the only boundary, and `/api/health` reports when it is not enforced. |

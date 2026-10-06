@@ -33,15 +33,16 @@ stated scope; deliberately incomplete beyond it. Per-capability status is in
 | Analyses real repositories | Yes — verified against this repository and `pallets/flask`, over HTTP and in a container |
 | Behaviour, data and traceability | Yes - sequence, activity, data flow and lineage; requirements, use cases, cross-artifact consistency |
 | Drift between two states | Yes — verified on a real change set, in a container too |
-| Tests | 654 passing (`npm run test`) |
+| Tests | 699 passing (`npm run test`) |
 | Lint / typecheck / build | Clean |
-| Container image | Builds and runs; verified through Phase 4, including multi-table SQL, returns and responses |
-| Artifacts | Dependency graph, module structure, class diagram, ER diagram, C4 x 3 levels, sequence, activity, data flow |
+| Container image | Builds and runs; verified through Phase 5, including multi-table SQL, returns, responses and the deployment/security views |
+| Artifacts | Dependency graph, module structure, class diagram, ER diagram, C4 x 3 levels, sequence, activity, data flow, **deployment**, **security** |
 | Data access | Joins, comma lists, subqueries, CTEs, `UPDATE…FROM`, `DELETE…USING`, several statements per literal — with read and write kept apart. **No ORM or query-builder support**, by decision |
 | Return messages | Yes — drawn from `return`/`await`/`throw`/response statements, each citing the statement that established it; never inferred from the existence of a call |
+| Deployment and security | **Partly verified.** Compose services, base images, dependencies, network membership, per-service configuration, Dockerfile instructions and CI workflow steps are read as *declarations*. Every one says so: a port is `declared, not observed bound`, a health check is `configured, result unknown`, and nothing claims to have been observed running. **No repository analysed declares a multi-service stack**, so the topology path rests on fixtures. The security view reports what a repository *references* and makes **no assessment** — no scanning, no image inspection, no verdict |
 | Requirements and use cases | Yes - read from documents and evidenced entry points, with a requirement-to-test chain; issues-tracker requirements are not recovered |
-| Browser rendering of the UI | **Partially verified** - driven in real headless Chromium, 45/45 checks against the container build with two analyses; layout, zoom and non-Chromium browsers are not verified |
-| Not built | Deployment diagram; issues-tracker requirements; semantics-level contradiction detection; symbol-level and Git-corroborated renames; archive-upload endpoint; API auth and rate limiting; column-level lineage |
+| Browser rendering of the UI | **Partially verified** - driven in real headless Chromium, 57/57 checks against the container build, including the per-arrow evidence panel on two views; layout, zoom and non-Chromium browsers are not verified |
+| Not built | Issues-tracker requirements; semantics-level contradiction detection; symbol-level and Git-corroborated renames; archive-upload endpoint; API auth and rate limiting; column-level lineage; vulnerability scanning and secret detection; Kubernetes/Terraform manifests |
 
 ## Quick start
 
@@ -146,7 +147,8 @@ repository-escaping `build:` context is ignored rather than honoured.
 | `GET` | `/api/analyses/:id/graph` | Filtered graph. `?kind=` node kinds, `?edgeKind=` relations, `?q=`, `?limit=`, `?edgeLimit=`, `?confidence=` |
 | `GET` | `/api/analyses/:id/nodes/:nodeId` | Entity with relationships, neighbours and evidence |
 | `GET` | `/api/analyses/:id/evidence` | Evidence records. `?path=` filters |
-| `GET` | `/api/analyses/:id/artifacts[/:kind]` | Artifact projections, with Mermaid. Kinds: `dependency-graph`, `module-graph`, `class-diagram`, `er-diagram`, `c4-context`, `c4-container`, `c4-component`, `sequence`, `activity`, `data-flow` |
+| `GET` | `/api/analyses/:id/artifacts[/:kind]` | Artifact projections, with Mermaid. Kinds: `dependency-graph`, `module-graph`, `class-diagram`, `er-diagram`, `c4-context`, `c4-container`, `c4-component`,
+`sequence`, `activity`, `data-flow`, `deployment`, `security` |
 | `GET` | `/api/analyses/:id/requirements` | Requirements, each labelled stated or derived, with its evidence |
 | `GET` | `/api/analyses/:id/use-cases[/:useCaseId]` | Use cases with steps, status and what is not evidenced |
 | `GET` | `/api/analyses/:id/consistency` | Cross-artifact findings: class, evidence expected, evidence found |
@@ -193,9 +195,9 @@ Gaps (no evidence found ≠ does not exist)
   ...
 ```
 
-The same tree in Phase 2 produces **2173 nodes, 3769 edges, 5280 evidence records**.
+The same tree in Phase 5 produces **6060 nodes, 9238 edges, 12872 evidence records**.
 
-Three things worth reading twice:
+Five things worth reading twice:
 
 - The ER diagram says `INSUFFICIENT EVIDENCE` because this repository has no SQL DDL. The
   view refuses to draw tables it cannot evidence rather than inventing them.
@@ -203,6 +205,13 @@ Three things worth reading twice:
   imported. That is **correct** — they are invoked through npm scripts, not imported.
 - C4 reports one container for this repository and no external system. It does not invent a
   database, a queue or a human actor, and it says why each is absent.
+- The deployment view reports this repository's service as
+  `declares image repoatlas:0.1.0 · declares container ports 4300 (declared, not observed
+  bound)`. The port is in a compose file; nobody watched a socket bind.
+- The security view reports **no secrets for this repository**, and says so as *"no
+  credential-like variable name was referenced"* rather than as reassurance. Its ten
+  environment variables are not credentials, and calling `NODE_ENV` one would bury the two
+  that would matter.
 
 Comparing two states of a real repository, after adding a module, renaming a file without
 touching its content, and editing a third file:

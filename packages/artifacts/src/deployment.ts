@@ -122,13 +122,18 @@ export function buildDeployment(context: ProjectionContext): Artifact {
     `${configuredHealthchecks.length} configured`,
   );
 
-  const orphanWorkflows = workflowModules(graph).filter(
-    (moduleId) => !graph.edges.some((edge) => edge.from === moduleId && edge.kind === 'references_secret'),
+  // A workflow that declares a job is described by this view; one that declares nothing is not
+// silently counted as fine. Matched on the configuration nodes rather than on module paths,
+  // because the graph strips a leading dot from a path and a path comparison here would miss
+  // every workflow file.
+  const declaredWorkflows = new Set(
+    configuration.filter((node) => String(node.attributes?.marker ?? '').startsWith('workflow.')).map((node) => node.path),
   );
+  const silentWorkflows = workflowModules(graph).filter((moduleId) => !declaredWorkflows.has(graph.nodes.find((n) => n.id === moduleId)?.path ?? ''));
   omission.recordCount(
-    'workflow files that reference no secret by name',
-    orphanWorkflows.length,
-    orphanWorkflows.slice(0, 3),
+    'workflow files whose jobs and steps this analysis did not read',
+    silentWorkflows.length,
+    silentWorkflows.slice(0, 3),
   );
 
   return {

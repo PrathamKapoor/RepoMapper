@@ -63,14 +63,20 @@ Provenance — commit, branch, path, timestamp, truncation — is recorded along
 deliberately **not** part of the identity, so re-analysing unchanged content produces the same
 snapshot id and "nothing changed" is decidable (`decisions.md`, D-026).
 
-Both version inputs are inside the digest, and Phase 4 moved both. `GRAPH_SCHEMA_VERSION` is now
-**4** because the graph gained `returns` and `throws` edges and the attributes behind them; a
-sequence drawn from a version 3 graph and one drawn from a version 4 graph disagree about what an
-interaction hands back, so the two must not be diffed against each other. `EXTRACTOR_VERSION` is
-now **1.1.0** because unchanged source now yields different facts — the SQL scanner reads every
-table in a statement, and return, rejection and response records became graph facts. A snapshot
-taken under either old value reports `comparable: false` with the reason, rather than being
-reinterpreted under the new semantics.
+Both version inputs are inside the digest, and each phase that changed what the model holds has
+moved both. `GRAPH_SCHEMA_VERSION` is now **5** because the graph gained `network` and `secret`
+nodes and the `joins_network` and `references_secret` edges behind them; a deployment view drawn
+from a version 4 graph and one drawn from a version 5 graph disagree about what a compose file
+states, so the two must not be diffed against each other. `EXTRACTOR_VERSION` is now **1.2.0**
+because unchanged source now yields different facts — Phase 4's SQL and return extraction, plus
+Phase 5's compose, Dockerfile and workflow reading. A snapshot taken under an older value reports
+`comparable: false` with the reason, rather than being reinterpreted under the new semantics.
+
+The version 1.2.0 bump also covers **corrected** extraction, not only added extraction. A published
+port read as `127` from `"127.0.0.1:4300:4300"`, a dependency written as a list entry was read as
+none, and `docker-compose.prod.yml` matched no filename at all. A snapshot taken before those fixes
+described different facts about identical content, so it must not compare as though nothing changed
+(D-075, D-076, D-077).
 
 `compareSnapshots()` walks two indexed graphs and reports what changed. Two rules give the
 report its meaning:
@@ -243,11 +249,13 @@ The ER projection is the clearest example of the policy: it draws inter-table
 relationships only when the graph holds an explicit edge, and records in `omitted` that
 foreign keys are **not inferred** in this phase. A guessed foreign key in an ER diagram is
 
-Ten projections are registered: dependency graph, module graph, class diagram, ER diagram,
-C4 at three levels, sequence, activity and data flow. Behaviour and data come last because
-they are the most inferential: a message arrow, a decision point and a data flow are claims
-about how the system *runs*, not about what it is made of. Each follows one rule, and each
-states its own exceptions:
+Twelve projections are registered: dependency graph, module graph, class diagram, ER diagram,
+C4 at three levels, sequence, activity, data flow, deployment and security. Behaviour and data
+come before deployment and security because they are the most inferential: a message arrow, a
+decision point and a data flow are claims about how the system *runs*, not about what it is made
+of. Deployment and security come **last** because they are the most conservative — they are built
+almost entirely from explicit declarations, so a repository that declares little yields little
+rather than a speculative diagram. Each follows one rule, and each states its own exceptions:
 
 - **Sequence** draws one arrow per `calls` relationship, and — since Phase 4 — a **return**, a
   **failure path** and an **HTTP response** for the calls that earned them. The walk is
@@ -267,6 +275,26 @@ states its own exceptions:
   graph does not hold, rather than an empty object that reads like an answer. Each hop carries the
   operation, the clause the table name appeared in, and the statement it came from, and the
   subject's own usage counts reads, writes and unclassified relationships separately.
+- **Deployment** draws compose services, base images, declared dependencies, network membership and
+  the configuration each service expects. Every one of those is a **declaration**, and the view
+  uses only words a file can support: a port is `declared, not observed bound`, a health check is
+  `configured, result unknown`, and a dependency edge states in its derivation that the file does
+  *not* say the dependency is reachable, started or healthy (`decisions.md`, D-068). Secret
+  references are counted and attributed to the Security view rather than drawn here, so a reader
+  cannot mistake them for relationships the view lost.
+- **Security** reports credential-like variable names, the base images declared and the CI workflow
+  steps read. It has no severity, no status and no score, and a test asserts that no element may
+  contain `vulnerable`, `insecure`, `exploit`, `CVE-` or `high risk` — those words need a
+  vulnerability database, an image inspection or a live system, none of which this product has
+  (`decisions.md`, D-071). A reference with no observed check is reported as `no check observed;
+  static reading cannot tell whether one exists`, which is a fact about the reader and the only
+  honest form of the claim.
+
+Only a credential-like **name** becomes a `secret` node. Every other variable stays
+`configuration`, because this repository's own compose file declares ten variables and none of them
+is a credential — reporting all ten would bury the two that would matter (`decisions.md`, D-069).
+Values are never read, and tests assert the absence of a credential string in the graph, the
+deployment payload, the security payload and the graph endpoint (D-070).
 
 `checkConsistency` is not an artifact but lives here, because it compares artifacts. It reads
 the same graph every projection reads, so it cannot see a different world from the views it
