@@ -11,7 +11,7 @@ function emptyGraph() {
     headCommit: null,
     branch: null,
     evidence: new EvidenceStore({ maxExcerptChars: 200 }),
-    diagnostics: { add: () => undefined, list: () => [], size: 0, truncated: false } as unknown as import('@repoatlas/core').DiagnosticCollector,
+    diagnostics: { add: () => undefined, list: () => [], size: 0, truncated: false },
     limits: { maxNodes: 10000, maxEdges: 20000 },
     includeGitHistory: false,
   };
