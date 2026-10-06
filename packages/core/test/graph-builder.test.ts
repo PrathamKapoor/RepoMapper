@@ -401,6 +401,25 @@ describe('deployment topology, networks and secret references', () => {
     attributes: { service: name, image: `repo/${name}:latest`, build: null, publishedPorts: '', ...extra },
   });
 
+  it('links a dependency declared above the service it names', () => {
+    // Compose files are written in dependency order, not declaration order, so this ordering is
+    // the normal one rather than a corner case. Reading markers in file order reached `depends_on`
+    // before the `db` component existed, and the edge was dropped without any error.
+    const { graph } = build([
+      composeFile([
+        { name: 'compose.depends_on', line: 4, attributes: { service: 'web', dependsOn: 'db' } },
+        service('web'),
+        service('db'),
+      ]),
+    ]);
+    const edge = graph.edges.find((e) => e.kind === 'depends_on' && e.attributes?.scope === 'deployment');
+    expect(edge?.from).toBe('deployment_component:web');
+    expect(edge?.to).toBe('deployment_component:db');
+    // Seeding the endpoint must not weaken the component it seeds.
+    expect(graph.nodes.find((n) => n.id === 'deployment_component:db')?.confidence).toBe('EXPLICIT');
+    expect(graph.nodes.find((n) => n.id === 'deployment_component:db')?.evidence.length).toBeGreaterThan(0);
+  });
+
   it('links services by a declared dependency, without claiming anything was started', () => {
     const { graph } = build([
       composeFile([service('web'), service('db'), { name: 'compose.depends_on', line: 4, attributes: { service: 'web', dependsOn: 'db' } }]),

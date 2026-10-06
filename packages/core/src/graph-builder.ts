@@ -529,6 +529,8 @@ function addMarkerFacts(
 ): void {
   const { evidence } = input;
 
+  predeclareDeploymentComponents(input, builder);
+
   for (const file of input.parsed) {
     const moduleId = moduleByPath.get(file.path);
     if (!moduleId) continue;
@@ -1299,6 +1301,56 @@ function addDeclaredDependency(
     evidence: [markerEvidence],
     attributes: { declaredIn: file.path, declared: true },
   });
+}
+
+/**
+ * Creates every deployment component node before any relationship is read.
+ *
+ * Compose files are written in dependency order, not declaration order: a `web` service
+ * routinely lists `depends_on: [db]` above the block that declares `db`. Reading markers in
+ * file order therefore reached `depends_on` while the `db` component did not yet exist, and
+ * `addEdge` correctly refused to create an edge with a missing endpoint — silently, since the
+ * whole dependency edge disappeared rather than surfacing as an error.
+ *
+ * Predeclaring the nodes makes relationship construction independent of the order a file happens
+ * to be written in. The nodes created here carry no evidence and are filled in by
+ * `addDeploymentComponent` as the real markers are read; this pass only guarantees that an
+ * endpoint exists when a relationship needs one.
+ */
+function predeclareDeploymentComponents(
+  input: GraphBuildInput,
+  builder: SoftwareGraphBuilder,
+): void {
+  for (const file of input.parsed) {
+    for (const marker of file.markers) {
+      if (marker.name !== 'compose.service' && marker.name !== 'docker.base_image') continue;
+
+      const name = String(marker.attributes.service ?? marker.attributes.image ?? '');
+      if (name.length === 0) continue;
+
+      const role = marker.name === 'compose.service' ? 'service' : 'base_image';
+      const componentId = nodeId('deployment_component', name);
+      if (builder.hasNode(componentId)) continue;
+
+      builder.addNode({
+        kind: 'deployment_component',
+        name,
+        qualifiedName: name,
+        path: file.path,
+        startLine: marker.line,
+        // EXPLICIT because that is what this marker is: the file states this service or image
+        // exists. This is the same evidence `addDeploymentComponent` will record, read earlier so
+        // its endpoint exists — not a placeholder guess. It must not be UNKNOWN: a merge takes
+        // the weaker of the two confidences (D-007), so a component seeded as UNKNOWN would stay
+        // UNKNOWN for ever even after the file declaring it had been read, and every projection
+        // would then report a declared service as unknown.
+        confidence: 'EXPLICIT',
+        attributes: { declaredAs: role },
+        // Evidence is added by `addDeploymentComponent`; a merge unions the two sets.
+        evidence: [],
+      });
+    }
+  }
 }
 
 function addDeploymentComponent(

@@ -63,9 +63,19 @@ export function buildDeployment(context: ProjectionContext): Artifact {
 
   const drawn = new Set(artifactNodes.map((node) => node.id));
   const artifactEdges: ArtifactEdge[] = [];
+  let omittedSecretReferences = 0;
 
   for (const edge of graph.edges) {
     if (!isDeploymentEdge(edge)) continue;
+
+    // Checked before the endpoint test. A secret node is deliberately not drawn here, so testing
+    // endpoints first would file every credential reference under "missing endpoint" and a reader
+    // would count credentials as relationships the view lost.
+    if (edge.kind === 'references_secret') {
+      omittedSecretReferences += 1;
+      continue;
+    }
+
     if (!drawn.has(edge.from) || !drawn.has(edge.to)) {
       // A dependency edge between a module and a package is a manifest statement about code
       // dependencies, not a statement about deployment topology. It belongs to the dependency
@@ -82,6 +92,17 @@ export function buildDeployment(context: ProjectionContext): Artifact {
     projected.derivation = deploymentDerivation(edge);
     projected.supportingEdgeIds = [edge.id];
     artifactEdges.push(projected);
+  }
+
+  if (omittedSecretReferences > 0) {
+    omission.recordCount(
+      'secret references, which the Security view reports by name. This view draws no secret node.',
+      omittedSecretReferences,
+      graph.edges
+        .filter((edge) => edge.kind === 'references_secret')
+        .slice(0, 3)
+        .map((edge) => edge.to),
+    );
   }
 
   // A compose file that declares a dependency between two services that never appear as

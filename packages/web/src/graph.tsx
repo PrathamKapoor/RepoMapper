@@ -41,7 +41,12 @@ const KIND_COLOURS: Record<string, string> = {
   table: '#db61a2',
   column: '#c9a0dc',
   configuration: '#6e7681',
-  deployment_component: '#f85149',
+deployment_component: '#f85149',
+  network: '#7ee787',
+  secret: '#ff7b72',
+  secret_reference: '#ff7b72',
+  base_image: '#ffa657',
+  ci_workflow: '#d2a8ff',
 };
 
 function colourFor(kind: string): string {
@@ -51,9 +56,15 @@ function colourFor(kind: string): string {
 export interface AtlasGraphProps {
   nodes: { id: string; label: string; kind: string; confidence: Confidence; detail?: string; path?: string }[];
   edges: { id: string; source: string; target: string; confidence: Confidence; label?: string; kind?: string }[];
-  /** Invoked when a node is clicked, to open the entity inspector. */
+/** Invoked when a node is clicked, to open the entity inspector. */
   onSelectNode?: (nodeId: string) => void;
-  /** Invoked when an arrow is clicked, to open the interaction evidence. */
+  /**
+   * Invoked when an arrow is clicked, to open the evidence explorer.
+   *
+   * Every view wires this to the same panel. A relationship must be inspectable wherever it is
+   * drawn — a reader who can click an arrow in one view and not in another would reasonably
+   * conclude the other view is showing something it cannot support.
+   */
   onSelectEdge?: (edgeId: string) => void;
   height?: number;
   /** Cap on rendered nodes; the UI states when it is truncated rather than silently cutting. */

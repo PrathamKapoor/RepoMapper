@@ -15,6 +15,7 @@ import { C4Tab } from './c4';
 import { DriftTab } from './drift';
 import { EntityDrawer } from './entity-drawer';
 import { GraphView } from './graph';
+import { EvidencePanel } from './evidence-panel';
 import { BehaviourTab, TraceabilityTab } from './phase3';
 import {
   ConfidenceBadge,
@@ -45,6 +46,8 @@ type TabId =
   | 'c4'
   | 'structure'
   | 'behaviour'
+  | 'deployment'
+  | 'security'
   | 'traceability'
   | 'drift'
   | 'evidence'
@@ -57,6 +60,8 @@ const TABS: { id: TabId; label: string }[] = [
   { id: 'c4', label: 'C4' },
   { id: 'structure', label: 'Structure' },
   { id: 'behaviour', label: 'Behaviour' },
+  { id: 'deployment', label: 'Deployment' },
+  { id: 'security', label: 'Security' },
   { id: 'traceability', label: 'Traceability' },
   { id: 'drift', label: 'Drift' },
   { id: 'evidence', label: 'Evidence' },
@@ -273,6 +278,12 @@ export function App(): React.ReactElement {
                   <ProjectionTab analysisId={selectedId} artifactKinds={['module-graph', 'class-diagram']} onSelectNode={selectNode} />
                 ) : null}
                 {tab === 'behaviour' ? <BehaviourTab analysisId={selectedId} onSelectNode={selectNode} /> : null}
+                {tab === 'deployment' ? (
+                  <ProjectionTab analysisId={selectedId} artifactKinds={['deployment']} onSelectNode={selectNode} />
+                ) : null}
+                {tab === 'security' ? (
+                  <ProjectionTab analysisId={selectedId} artifactKinds={['security']} onSelectNode={selectNode} />
+                ) : null}
                 {tab === 'traceability' ? <TraceabilityTab analysisId={selectedId} onSelectNode={selectNode} /> : null}
                 {tab === 'drift' ? (
                   <DriftTab analyses={analyses} analysisId={selectedId} onInspectNode={(id, nodeId) => setInspect({ analysisId: id, nodeId })} />
@@ -517,6 +528,7 @@ function ProjectionTab({
   const [artifact, setArtifact] = useState<Artifact | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [edge, setEdge] = useState<string | null>(null);
 
   useEffect(() => {
     if (!active) return;
@@ -553,7 +565,16 @@ function ProjectionTab({
           ))}
         </div>
       ) : null}
-      <GraphView artifact={artifact} loading={loading} error={error} onSelectNode={onSelectNode} />
+      <GraphView
+        artifact={artifact}
+        loading={loading}
+        error={error}
+        onSelectNode={onSelectNode}
+        onSelectEdge={setEdge}
+      />
+      {edge ? (
+        <EvidencePanel artifact={artifact} edgeId={edge} onSelectNode={onSelectNode} onClose={() => setEdge(null)} />
+      ) : null}
     </div>
   );
 }

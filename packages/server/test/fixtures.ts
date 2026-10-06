@@ -190,8 +190,65 @@ CREATE TABLE report_shares (
     image: node:22-alpine
 `,
 
-  '.gitignore': 'node_modules/\ndist/\n*.log\n',
+'.gitignore': 'node_modules/\ndist/\n*.log\n',
   'README.md': `# sample-service\n\nA sample service used in tests.\n`,
+};
+
+/**
+ * A project that declares a deployment topology and a credential reference.
+ *
+ * Phase 5 fixture. The compose file deliberately uses the forms that were previously read
+ * wrongly: a list-form `depends_on` and a host-bound port. It carries a credential-like variable
+ * so the security view has something to report, and an ordinary variable so it has something to
+ * *not* report.
+ */
+export const SAMPLE_DEPLOYED_PROJECT: FixtureTree = {
+  ...SAMPLE_TS_PROJECT,
+  'docker-compose.yml': `services:
+  api:
+    image: repo/api:1.0.0
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - db
+    networks:
+      - backend
+    environment:
+      STRIPE_SECRET_KEY: shhh-do-not-store-this
+      NODE_ENV: production
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health')"]
+      interval: 30s
+    restart: unless-stopped
+  db:
+    image: postgres:16
+    networks:
+      - backend
+  cache:
+    image: redis:7
+networks:
+  backend:
+`,
+  'Dockerfile': `FROM node:22-alpine
+WORKDIR /app
+USER app
+EXPOSE 3000
+CMD ["node", "dist/index.js"]
+`,
+  '.github/workflows/release.yml': `name: release
+on:
+  push:
+    tags: ['v*']
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t repo/api .
+      - run: npm publish
+        env:
+          NPM_TOKEN: \${{ secrets.NPM_TOKEN }}
+`,
 };
 
 /** A Python project exercising the Python extractor. */

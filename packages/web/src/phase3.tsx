@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { GraphView } from './graph';
 import {
   api,
-  type Artifact,
   type ConsistencyFinding,
   type ConsistencyReport,
   type Lineage,
@@ -25,6 +24,7 @@ import {
   traceView,
 } from './presentation';
 import { ConfidenceBadge, Empty, Notice, Stat, StatusBadge } from './ui';
+import { EvidencePanel } from './evidence-panel';
 
 /**
  * Behaviour and traceability views.
@@ -686,12 +686,6 @@ export function BehaviourTab({
 // Interaction evidence
 // ---------------------------------------------------------------------------
 
-const MESSAGE_KINDS: Record<string, string> = {
-  calls: 'call',
-  returns: 'return',
-  throws: 'error path',
-};
-
 /**
  * What one arrow in a behaviour view asserts, and why.
  *
@@ -700,100 +694,11 @@ const MESSAGE_KINDS: Record<string, string> = {
  * extraction was. Selecting the two endpoints instead would show what exists, not what the
  * repository says happens between them, so the evidence lives here rather than in a node panel.
  *
- * Nothing is invented to fill a gap: a call with no recorded return says so, and an empty evidence
- * list is stated as empty rather than hidden.
+ * Re-exported from the shared evidence explorer so behaviour, architecture and the Phase 5 views
+ * all open the same panel. Two panels with different fields would mean a relationship could be
+ * inspected in one view and not another, which is the ambiguity this product exists to remove.
  */
-export function InteractionPanel({
-  artifact,
-  edgeId,
-  onSelectNode,
-  onClose,
-}: {
-  artifact: Artifact | undefined;
-  edgeId: string;
-  onSelectNode: (nodeId: string) => void;
-  onClose: () => void;
-}): React.ReactElement | null {
-  const edge = artifact?.edges.find((candidate) => candidate.id === edgeId);
-  if (!edge) return null;
-
-  const label = (id: string): string => artifact?.nodes.find((node) => node.id === id)?.label ?? id;
-  const name = (id: string): string => (label(id).split('::').pop() ?? label(id));
-
-  return (
-    <div className="card" style={{ marginTop: 16 }} data-testid="interaction-panel">
-      <div className="row" style={{ justifyContent: 'space-between', alignItems: 'baseline' }}>
-        <h3 style={{ margin: 0 }}>
-          {MESSAGE_KINDS[edge.kind] ?? edge.kind}: {name(edge.source)} to {name(edge.target)}
-        </h3>
-        <button type="button" onClick={onClose}>
-          Close
-        </button>
-      </div>
-
-      <div className="row wrap" style={{ margin: '8px 0' }}>
-        <ConfidenceBadge value={edge.confidence} />
-        <span className="small dim">
-          {edge.kind === 'calls'
-            ? 'Recorded from a call site in the source.'
-            : edge.kind === 'returns'
-              ? 'Recorded from a return statement, an awaited call, or a response call in the handler.'
-              : edge.kind === 'throws'
-                ? 'Recorded from an explicit throw, rejection or raise inside the callee.'
-                : 'Recorded relationship.'}
-        </span>
-      </div>
-
-      {edge.derivation ? <p className="small">{edge.derivation}</p> : null}
-
-      <div className="row wrap small dim" style={{ margin: '6px 0' }}>
-        <button type="button" onClick={() => onSelectNode(edge.source)}>
-          {name(edge.source)}
-        </button>
-        <span>to</span>
-        <button type="button" onClick={() => onSelectNode(edge.target)}>
-          {name(edge.target)}
-        </button>
-      </div>
-
-      <h4 style={{ marginBottom: 4 }}>Evidence ({edge.evidence.length})</h4>
-      {edge.evidence.length === 0 ? (
-        <p className="small dim">
-          No source location is recorded for this arrow. The relationship exists in the graph, and this panel states
-          that rather than implying a citation it does not have.
-        </p>
-      ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>Location</th>
-              <th>Kind</th>
-              <th>Producer</th>
-            </tr>
-          </thead>
-          <tbody>
-            {edge.evidence.map((item) => (
-              <tr key={item.evidenceId}>
-                <td className="mono">
-                  {item.path}:{item.startLine}
-                  {item.endLine > item.startLine ? `-${item.endLine}` : ''}
-                </td>
-                <td className="mono small dim">{item.kind}</td>
-                <td className="mono small dim">{item.producer}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-
-      {edge.supportingEdgeIds && edge.supportingEdgeIds.length > 0 ? (
-        <p className="small dim" style={{ marginTop: 8 }}>
-          Justified by graph relationship: {edge.supportingEdgeIds.join(', ')}
-        </p>
-      ) : null}
-    </div>
-  );
-}
+export const InteractionPanel = EvidencePanel;
 
 // ---------------------------------------------------------------------------
 // Lineage
