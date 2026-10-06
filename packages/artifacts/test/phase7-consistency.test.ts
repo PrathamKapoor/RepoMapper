@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildGraph, EvidenceStore, type GraphBuildInput } from '@repoatlas/core';
+import { buildGraph, EvidenceStore, DiagnosticCollector, type GraphBuildInput } from '@repoatlas/core';
 import { projectAtlas, checkConsistency } from '@repoatlas/artifacts';
 
 function emptyGraph() {
@@ -11,7 +11,7 @@ function emptyGraph() {
     headCommit: null,
     branch: null,
     evidence: new EvidenceStore({ maxExcerptChars: 200 }),
-    diagnostics: { add: () => undefined, list: () => [], size: 0, truncated: false },
+    diagnostics: new DiagnosticCollector(),
     limits: { maxNodes: 10000, maxEdges: 20000 },
     includeGitHistory: false,
   };
