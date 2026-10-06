@@ -6,8 +6,10 @@ import { buildC4 } from './c4.js';
 import { checkConsistency, type ConsistencyReport } from './consistency.js';
 import { buildDataFlow } from './data-flow.js';
 import { buildDependencyGraph, buildModuleGraph } from './dependency-graph.js';
+import { buildDeployment } from './deployment.js';
 import { buildErDiagram } from './er-diagram.js';
 import { analyseGaps, type GapReport } from './gaps.js';
+import { buildSecurity } from './security.js';
 
 export * from './contract.js';
 export * from './dependency-graph.js';
@@ -18,6 +20,8 @@ export * from './c4.js';
 export * from './consistency.js';
 export * from './data-flow.js';
 export * from './gaps.js';
+export * from './deployment.js';
+export * from './security.js';
 
 /**
  * Artifact registry.
@@ -106,6 +110,22 @@ export const ARTIFACTS: readonly ArtifactDescriptor[] = [
     title: 'Data flow',
     minEdges: 0,
     build: (context) => buildDataFlow(context),
+  },
+  // Deployment and security come last because they are the most conservative views in the
+  // product: they are built almost entirely from explicit declarations, so a repository that
+  // declares little yields little rather than a speculative diagram. Both refuse to describe a
+  // running system or a security verdict, because nothing in the analysis supports either.
+  {
+    kind: 'deployment',
+    title: 'Deployment',
+    minEdges: 0,
+    build: (context) => buildDeployment(context),
+  },
+  {
+    kind: 'security',
+    title: 'Security',
+    minEdges: 0,
+    build: (context) => buildSecurity(context),
   },
 ];
 

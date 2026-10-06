@@ -763,7 +763,8 @@ function parseWorkflow(source: string, result: ParsedFile): void {
   if (currentJob) jobs.push(currentJob);
 
   for (const job of jobs) {
-    const block = job.body.join('\n');
+    const lines = job.body;
+    const block = lines.join('\n');
 
     // The job itself is the declared unit of CI work. Without it, the deployment view can say a
     // repository has CI but cannot name what that CI does, and a `secrets.X` reference has no job
@@ -776,19 +777,24 @@ function parseWorkflow(source: string, result: ParsedFile): void {
       attributes: {
         job: job.job,
         ...(runsOn.length > 0 ? { runsOn } : {}),
-        stepCount: String([...block.matchAll(/^\s+-\s+(?:name:\s*.+|run:|uses:)/gm)].length),
+        stepCount: String(countSteps(lines)),
       },
     });
 
-    const steps = [...block.matchAll(/^\s+-\s+(?:name:\s*(.+)|(run|uses):\s*(.+))/gm)];
-    for (const step of steps) {
+    // Each step carries **its own** line, not the job's. Configuration nodes are keyed by
+    // path#line, so a step recorded on the job's line is the same node as the job and every step
+    // after the first is silently dropped.
+    lines.forEach((raw, offset) => {
+      const step = /^\s*-\s+(?:name:\s*(.+)|(run|uses):\s*(.+))/.exec(raw);
+      if (!step) return;
+
       const stepName = (step[1] ?? '').trim();
       const kind = step[2];
       const body = (step[3] ?? '').trim();
       const uses = kind === 'uses';
       result.markers.push({
         name: 'workflow.step',
-        line: job.line,
+        line: job.line + offset + 1,
         attributes: {
           job: job.job,
           ...(stepName.length > 0 ? { step: stepName } : {}),
@@ -802,16 +808,25 @@ function parseWorkflow(source: string, result: ParsedFile): void {
           namesTest: /test|vitest|jest|pytest|spec/i.test(`${stepName} ${body}`) ? 'true' : 'false',
         },
       });
-    }
+    });
 
-    for (const secret of new Set([...block.matchAll(/secrets\.([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]!))) {
-      result.markers.push({
-        name: 'workflow.secret',
-        line: job.line,
-        attributes: { job: job.job, variable: secret },
-      });
-    }
+    // A secret reference is recorded on the line it appears on, so two jobs referencing the same
+    // name remain distinguishable and the graph can say where each reference lives.
+    lines.forEach((raw, offset) => {
+      for (const secret of new Set([...raw.matchAll(/secrets\.([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]!))) {
+        result.markers.push({
+          name: 'workflow.secret',
+          line: job.line + offset + 1,
+          attributes: { job: job.job, variable: secret },
+        });
+      }
+    });
   }
+}
+
+/** How many step lines a job body has. Counted rather than reported by the job marker alone. */
+function countSteps(lines: readonly string[]): number {
+  return lines.filter((line) => /^\s*-\s+(?:name:\s*.+|run:|uses:)/.test(line)).length;
 }
 
 /**
